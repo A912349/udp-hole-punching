@@ -106,6 +106,41 @@ def open_sealed(
     return cipher.decrypt_and_verify(b64decode(sealed["ciphertext"]), b64decode(sealed["tag"]))
 
 
+def seal_bytes(
+    private_key: ECC.EccKey,
+    destination_public_key: str,
+    payload: bytes,
+    aad: bytes,
+    *,
+    key: bytes | None = None,
+) -> bytes:
+    """Encrypt to the compact nonce+ciphertext+tag representation."""
+    cipher = ChaCha20_Poly1305.new(key=key if key is not None else shared_key(private_key, destination_public_key))
+    cipher.update(aad)
+    ciphertext, tag = cipher.encrypt_and_digest(payload)
+    return cipher.nonce + ciphertext + tag
+
+
+def open_sealed_bytes(
+    private_key: ECC.EccKey,
+    source_public_key: str,
+    sealed: bytes,
+    aad: bytes,
+    *,
+    key: bytes | None = None,
+) -> bytes:
+    """Decrypt the compact nonce+ciphertext+tag representation."""
+    nonce_size, tag_size = 12, 16
+    if len(sealed) < nonce_size + tag_size:
+        raise ProtocolError("truncated encrypted payload")
+    cipher = ChaCha20_Poly1305.new(
+        key=key if key is not None else shared_key(private_key, source_public_key),
+        nonce=sealed[:nonce_size],
+    )
+    cipher.update(aad)
+    return cipher.decrypt_and_verify(sealed[nonce_size:-tag_size], sealed[-tag_size:])
+
+
 @dataclass(frozen=True)
 class Packet:
     packet_type: str

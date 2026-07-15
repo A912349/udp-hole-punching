@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
+import hmac
 import ipaddress
 import json
 import os
@@ -31,6 +32,7 @@ import requests
 from mesh_protocol import (
     Packet,
     ProtocolError,
+    DEFAULT_TTL,
     b64decode,
     b64encode,
     create_packet,
@@ -42,7 +44,9 @@ from mesh_protocol import (
     import_private_key,
     node_id,
     open_sealed,
+    open_sealed_bytes,
     seal,
+    seal_bytes,
     shared_key,
 )
 
@@ -63,16 +67,22 @@ SYMMETRIC_SCAN_INITIAL_START = -1000
 SYMMETRIC_SCAN_INITIAL_END = 2000
 SYMMETRIC_SCAN_EXPAND = 2000
 SYMMETRIC_SCAN_DELAY = 0.0005
-MAX_TUN_PACKET = 1200
-# A full encrypted DATA datagram with this fragment payload is 1,187 bytes,
-# safely below the 1,200-byte UDP payload target used by the overlay.
-IP_FRAGMENT_PAYLOAD_SIZE = 650
+# Fast IP frames include the route header and an outer MAC, so an IPv4 packet
+# of this size occupies at most 1,196 UDP payload bytes. Keeping it in one
+# datagram avoids both JSON/Base64 overhead and all-or-nothing two-fragment
+# delivery of a TCP segment.
+MAX_TUN_PACKET = 1075
+IP_FRAGMENT_PAYLOAD_SIZE = MAX_TUN_PACKET
 IP_REASSEMBLY_TIMEOUT_SECONDS = 10
 IP_REASSEMBLY_LIMIT = 128
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000
 TUNSETIFF = 0x400454CA
+FAST_IP_MAGIC = b"MIP1"
+FAST_IP_HEADER = struct.Struct("!4sB16s16s12s")
+FAST_IP_MAC_SIZE = hashlib.sha256().digest_size
+FAST_IP_SEALED_MIN_SIZE = 12 + 16
 
 
 def parse_endpoint(value: str) -> tuple[str, int]:
@@ -413,6 +423,48 @@ class MeshNode:
         self.send_to_address(packet, address)
         return True
 
+    def send_fast_ip_frame(self, destination: str, frame: bytes) -> bool:
+        """Route an already authenticated compact IP frame without re-encoding it."""
+        with self.topology_lock:
+            hop = self.route_next_hop(destination, log_route=False)
+        if not hop:
+            return False
+        with self.topology_lock:
+            peer = self.neighbors.get(hop)
+        if not peer:
+            return False
+        address = peer.get("last_address") or parse_endpoint(peer["endpoint"])
+        try:
+            self.socket.sendto(frame, address)
+        except OSError:
+            return False
+        return True
+
+    def encode_fast_ip_frame(self, destination: str, plaintext: bytes) -> bytes | None:
+        peer = self.directory.get(destination)
+        if not peer:
+            return None
+        try:
+            source_bytes = bytes.fromhex(self.node_id)
+            destination_bytes = bytes.fromhex(destination)
+        except ValueError:
+            return None
+        packet_id = secrets.token_bytes(12)
+        header = FAST_IP_HEADER.pack(FAST_IP_MAGIC, DEFAULT_TTL, source_bytes, destination_bytes, packet_id)
+        sealed = seal_bytes(
+            self.private_key,
+            peer["public_key"],
+            plaintext,
+            f"{self.node_id}:{destination}".encode(),
+            key=self.shared_key_for(destination, peer["public_key"]),
+        )
+        authenticated = header + sealed
+        return authenticated + hmac.new(self.network_key, authenticated, hashlib.sha256).digest()
+
+    def send_fast_ip_payload(self, destination: str, plaintext: bytes) -> bool:
+        frame = self.encode_fast_ip_frame(destination, plaintext)
+        return frame is not None and self.send_fast_ip_frame(destination, frame)
+
     def send_hello(self, destination: str, packet_type: str = "HELLO"):
         packet = create_packet(packet_type, self.node_id, destination, {"public_key": self.public_key})
         self.send_packet(packet)
@@ -549,32 +601,15 @@ class MeshNode:
                 return
 
     def send_ip_packet(self, destination: str, data: bytes) -> bool:
-        peer = self.directory.get(destination)
-        if not peer:
+        if destination not in self.directory:
             self.log(f"unknown TUN destination {destination[:8]}")
             return False
         fragment_id = secrets.token_bytes(8)
         count = (len(data) + IP_FRAGMENT_PAYLOAD_SIZE - 1) // IP_FRAGMENT_PAYLOAD_SIZE
-        aad = f"{self.node_id}:{destination}".encode()
         for index in range(count):
             chunk = data[index * IP_FRAGMENT_PAYLOAD_SIZE:(index + 1) * IP_FRAGMENT_PAYLOAD_SIZE]
             plaintext = struct.pack("!8sHH", fragment_id, index, count) + chunk
-            packet = Packet(
-                "DATA",
-                self.node_id,
-                destination,
-                {
-                    "ip": seal(
-                        self.private_key,
-                        peer["public_key"],
-                        plaintext,
-                        aad,
-                        key=self.shared_key_for(destination, peer["public_key"]),
-                    )
-                },
-                secrets.token_hex(12),
-            )
-            if not self.send_packet(packet):
+            if not self.send_fast_ip_payload(destination, plaintext):
                 return False
         return True
 
@@ -643,6 +678,81 @@ class MeshNode:
                 self.deliver_ip_packet(source, data)
         except (KeyError, ValueError, ProtocolError) as error:
             self.log(f"drop IP fragment from {source[:8]}: {error}")
+
+    def handle_fast_ip_fragment(self, source: str, sealed: bytes):
+        peer = self.directory.get(source)
+        if not peer:
+            return
+        try:
+            plaintext = open_sealed_bytes(
+                self.private_key,
+                peer["public_key"],
+                sealed,
+                f"{source}:{self.node_id}".encode(),
+                key=self.shared_key_for(source, peer["public_key"]),
+            )
+            if len(plaintext) < 12:
+                raise ValueError("truncated fragment")
+            fragment_id, index, count = struct.unpack("!8sHH", plaintext[:12])
+            if not 0 < count <= (MAX_TUN_PACKET + IP_FRAGMENT_PAYLOAD_SIZE - 1) // IP_FRAGMENT_PAYLOAD_SIZE:
+                raise ValueError("invalid fragment count")
+            if index >= count:
+                raise ValueError("invalid fragment index")
+            self.expire_ip_reassembly()
+            key = (source, fragment_id)
+            state = self.ip_reassembly.get(key)
+            if state is None:
+                if len(self.ip_reassembly) >= IP_REASSEMBLY_LIMIT:
+                    self.ip_reassembly.popitem(last=False)
+                state = {"count": count, "chunks": {}, "received_at": time.monotonic()}
+                self.ip_reassembly[key] = state
+            if state["count"] != count:
+                raise ValueError("conflicting fragment count")
+            state["chunks"][index] = plaintext[12:]
+            state["received_at"] = time.monotonic()
+            self.ip_reassembly.move_to_end(key)
+            if len(state["chunks"]) == count:
+                data = b"".join(state["chunks"][part] for part in range(count))
+                self.ip_reassembly.pop(key, None)
+                self.deliver_ip_packet(source, data)
+        except (ValueError, ProtocolError) as error:
+            self.log(f"drop fast IP fragment from {source[:8]}: {error}")
+
+    def decode_fast_ip_frame(self, data: bytes) -> tuple[int, str, str, str, bytes]:
+        minimum_size = FAST_IP_HEADER.size + FAST_IP_SEALED_MIN_SIZE + FAST_IP_MAC_SIZE
+        if len(data) < minimum_size:
+            raise ProtocolError("truncated fast IP frame")
+        authenticated, received_mac = data[:-FAST_IP_MAC_SIZE], data[-FAST_IP_MAC_SIZE:]
+        expected_mac = hmac.new(self.network_key, authenticated, hashlib.sha256).digest()
+        if not hmac.compare_digest(received_mac, expected_mac):
+            raise ProtocolError("fast IP frame authentication failed")
+        magic, ttl, source, destination, packet_id = FAST_IP_HEADER.unpack(authenticated[:FAST_IP_HEADER.size])
+        if magic != FAST_IP_MAGIC or not 0 < ttl <= DEFAULT_TTL:
+            raise ProtocolError("invalid fast IP frame")
+        return ttl, source.hex(), destination.hex(), packet_id.hex(), authenticated[FAST_IP_HEADER.size:]
+
+    def forward_fast_ip_frame(self, data: bytes, destination: str, ttl: int) -> bool:
+        if ttl <= 1:
+            return False
+        authenticated = data[:-FAST_IP_MAC_SIZE]
+        magic, _, source, target, packet_id = FAST_IP_HEADER.unpack(authenticated[:FAST_IP_HEADER.size])
+        updated_header = FAST_IP_HEADER.pack(magic, ttl - 1, source, target, packet_id)
+        updated_authenticated = updated_header + authenticated[FAST_IP_HEADER.size:]
+        updated_frame = updated_authenticated + hmac.new(
+            self.network_key, updated_authenticated, hashlib.sha256
+        ).digest()
+        return self.send_fast_ip_frame(destination, updated_frame)
+
+    def handle_fast_ip_datagram(self, data: bytes, address: tuple[str, int]):
+        ttl, source, destination, packet_id, sealed = self.decode_fast_ip_frame(data)
+        if not self.remember(packet_id):
+            return
+        self.remember_neighbor_address(source, address)
+        if destination != self.node_id:
+            if self.args.role == "superpeer":
+                self.forward_fast_ip_frame(data, destination, ttl)
+            return
+        self.handle_fast_ip_fragment(source, sealed)
 
     def remember(self, packet_id: str) -> bool:
         if packet_id in self.seen:
@@ -860,6 +970,9 @@ class MeshNode:
         while not self.stop_event.is_set():
             try:
                 data, address = self.socket.recvfrom(65_535)
+                if data.startswith(FAST_IP_MAGIC):
+                    self.handle_fast_ip_datagram(data, address)
+                    continue
                 packet = decode_packet(data, self.network_key)
             except socket.timeout:
                 continue

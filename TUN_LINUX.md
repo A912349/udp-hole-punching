@@ -37,7 +37,7 @@ adds only the `10.77.0.0/24` route. It does not replace the Internet default
 route. If you omit this flag, configure the device manually:
 
 ```bash
-sudo ip link set dev mesh0 mtu 1200 up
+sudo ip link set dev mesh0 mtu 1075 up
 sudo ip addr add ASSIGNED_MESH_IP/24 dev mesh0
 ```
 
@@ -59,7 +59,7 @@ sudo python3 mesh_node.py \
 Configure its interface in another terminal:
 
 ```bash
-sudo ip link set dev mesh0 mtu 1200 up
+sudo ip link set dev mesh0 mtu 1075 up
 sudo ip addr add ASSIGNED_MESH_IP/24 dev mesh0
 ```
 
@@ -77,9 +77,9 @@ mesh route in reverse.
 
 - One `mesh_ip` represents one node; the coordinator rejects duplicate
   addresses.
-- IPv4 packets up to 1200 bytes are accepted and automatically split into
-  compact encrypted UDP fragments smaller than 1200 bytes on the wire. Each
-  fragment carries up to 650 bytes of IPv4 data to reduce UDP packet count.
+- IPv4 packets up to 1075 bytes use one compact binary encrypted UDP frame
+  (at most 1196 bytes on the wire). This fast data plane requires the updated
+  `mesh_node.py` on both endpoints and every forwarding superpeer.
 - This version still has no retransmission, congestion control, or routing of
   local LAN prefixes. Keep it for ping and small UDP/TCP smoke tests until the
   reliable transport layer is added.
