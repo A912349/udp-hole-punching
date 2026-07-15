@@ -6,6 +6,7 @@ receives or forwards overlay DATA packets.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import sqlite3
 import time
@@ -55,6 +56,9 @@ def init_db():
             );
             """
         )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(nodes)")}
+        if "mesh_ip" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN mesh_ip TEXT")
         connection.commit()
 
 
@@ -71,7 +75,9 @@ def log(message: str):
 
 
 def topology_version(rows) -> str:
-    source = "|".join(f"{row['node_id']}:{row['last_seen']}:{row['endpoint']}" for row in rows)
+    source = "|".join(
+        f"{row['node_id']}:{row['last_seen']}:{row['endpoint']}:{row['mesh_ip']}" for row in rows
+    )
     return hashlib.sha256(source.encode()).hexdigest()[:16]
 
 
@@ -79,7 +85,7 @@ def row_to_node(row):
     return {
         "node_id": row["node_id"], "public_key": row["public_key"],
         "nat_type": row["nat_type"], "role": row["role"], "endpoint": row["endpoint"],
-        "capacity": row["capacity"],
+        "capacity": row["capacity"], "mesh_ip": row["mesh_ip"],
     }
 
 
@@ -126,6 +132,12 @@ def register():
     if data["role"] == "superpeer" and data["nat_type"] != "cone":
         log(f"register rejected node={data.get('node_id')} reason=superpeer requires cone")
         return jsonify({"error": "only cone nodes may be superpeers"}), 400
+    mesh_ip = data.get("mesh_ip")
+    if mesh_ip:
+        try:
+            mesh_ip = str(ipaddress.IPv4Address(mesh_ip))
+        except ipaddress.AddressValueError:
+            return jsonify({"error": "invalid mesh_ip"}), 400
     try:
         if public_key_node_id(b64decode(data["public_key"])) != data["node_id"]:
             return jsonify({"error": "node_id does not match public_key"}), 400
@@ -134,18 +146,24 @@ def register():
     now = int(time.time())
     capacity = max(1, min(int(data.get("capacity", 1)), 1000))
     with closing(db()) as connection:
+        if mesh_ip:
+            owner = connection.execute(
+                "SELECT node_id FROM nodes WHERE mesh_ip = ? AND node_id != ?", (mesh_ip, data["node_id"])
+            ).fetchone()
+            if owner:
+                return jsonify({"error": "mesh_ip is already assigned"}), 409
         connection.execute(
-            """INSERT INTO nodes(node_id, public_key, nat_type, role, endpoint, capacity, last_seen, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO nodes(node_id, public_key, nat_type, role, endpoint, mesh_ip, capacity, last_seen, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,
-                 nat_type=excluded.nat_type, role=excluded.role, endpoint=excluded.endpoint,
-                 capacity=excluded.capacity, last_seen=excluded.last_seen""",
-            (data["node_id"], data["public_key"], data["nat_type"], data["role"], data["endpoint"], capacity, now, now),
+                  nat_type=excluded.nat_type, role=excluded.role, endpoint=excluded.endpoint,
+                  mesh_ip=excluded.mesh_ip, capacity=excluded.capacity, last_seen=excluded.last_seen""",
+            (data["node_id"], data["public_key"], data["nat_type"], data["role"], data["endpoint"], mesh_ip, capacity, now, now),
         )
         connection.commit()
     log(
         f"register node={data['node_id'][:8]} role={data['role']} nat={data['nat_type']} "
-        f"endpoint={data['endpoint']} capacity={capacity}"
+        f"endpoint={data['endpoint']} mesh_ip={mesh_ip or '-'} capacity={capacity}"
     )
     return jsonify({"status": "ok"})
 

@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
+import ipaddress
 import json
+import os
 import select
 import secrets
 import socket
@@ -54,6 +56,10 @@ SYMMETRIC_SCAN_INITIAL_START = -1000
 SYMMETRIC_SCAN_INITIAL_END = 2000
 SYMMETRIC_SCAN_EXPAND = 2000
 SYMMETRIC_SCAN_DELAY = 0.0005
+MAX_TUN_PACKET = 1200
+IFF_TUN = 0x0001
+IFF_NO_PI = 0x1000
+TUNSETIFF = 0x400454CA
 
 
 def parse_endpoint(value: str) -> tuple[str, int]:
@@ -62,6 +68,13 @@ def parse_endpoint(value: str) -> tuple[str, int]:
     if not host or not 1 <= port_number <= 65535:
         raise ValueError("endpoint must be HOST:PORT")
     return host, port_number
+
+
+def parse_mesh_ip(value: str) -> str:
+    try:
+        return str(ipaddress.IPv4Address(value))
+    except ipaddress.AddressValueError as error:
+        raise argparse.ArgumentTypeError("mesh IP must be an IPv4 address") from error
 
 
 def load_identity(state_dir: Path):
@@ -114,6 +127,7 @@ class MeshNode:
         self.services = dict(args.service or [])
         self.allowed_nodes = set(args.allow_node or ["*"])
         self.topology_lock = threading.RLock()
+        self.tun_fd: int | None = None
 
     @property
     def headers(self):
@@ -165,7 +179,7 @@ class MeshNode:
             "POST", "/v1/register", json={
                 "node_id": self.node_id, "public_key": self.public_key,
                 "nat_type": nat_type, "role": self.args.role,
-                "endpoint": endpoint, "capacity": self.args.capacity,
+                "endpoint": endpoint, "capacity": self.args.capacity, "mesh_ip": self.args.mesh_ip,
             },
         )
         for name, (host, port) in self.services.items():
@@ -372,6 +386,87 @@ class MeshNode:
         packet = Packet("DATA", self.node_id, destination, payload, packet_id or secrets.token_hex(12))
         return packet.packet_id if self.send_packet(packet) else None
 
+    def open_tun(self):
+        """Create a Linux TUN device; address and routes stay under operator control."""
+        if not self.args.tun_name:
+            return
+        if not self.args.mesh_ip:
+            raise RuntimeError("--tun-name requires --mesh-ip")
+        if os.name != "posix" or not Path("/dev/net/tun").exists():
+            raise RuntimeError("TUN is supported only on Linux with /dev/net/tun available")
+        import fcntl
+        import struct
+
+        fd = os.open("/dev/net/tun", os.O_RDWR)
+        try:
+            name = self.args.tun_name.encode("ascii")
+            if len(name) > 15:
+                raise ValueError("TUN interface name must be at most 15 ASCII characters")
+            assigned = fcntl.ioctl(fd, TUNSETIFF, struct.pack("16sH", name, IFF_TUN | IFF_NO_PI))
+        except Exception:
+            os.close(fd)
+            raise
+        actual_name = assigned[:16].split(b"\0", 1)[0].decode()
+        self.tun_fd = fd
+        self.log(f"TUN {actual_name} opened for mesh IP {self.args.mesh_ip}; configure it with iproute2")
+
+    def node_for_mesh_ip(self, address: str) -> str | None:
+        with self.topology_lock:
+            matches = [node_id for node_id, node in self.directory.items() if node.get("mesh_ip") == address]
+        return matches[0] if len(matches) == 1 else None
+
+    def handle_tun_packet(self, data: bytes):
+        if len(data) < 20 or data[0] >> 4 != 4:
+            self.log("drop non-IPv4 packet from TUN")
+            return
+        if len(data) > MAX_TUN_PACKET:
+            self.log(f"drop oversized TUN packet ({len(data)} bytes; MTU is {MAX_TUN_PACKET})")
+            return
+        source = str(ipaddress.IPv4Address(data[12:16]))
+        destination_ip = str(ipaddress.IPv4Address(data[16:20]))
+        if source != self.args.mesh_ip:
+            self.log(f"drop TUN packet with non-mesh source {source}")
+            return
+        destination = self.node_for_mesh_ip(destination_ip)
+        if not destination:
+            self.log(f"no mesh node owns TUN destination {destination_ip}")
+            return
+        self.log(f"TUN IPv4 {source}->{destination_ip} via {destination[:8]} bytes={len(data)}")
+        self.send_encrypted(destination, "IP_PACKET", {"data": b64encode(data)})
+
+    def tun_loop(self):
+        assert self.tun_fd is not None
+        while not self.stop_event.is_set():
+            try:
+                readable, _, _ = select.select([self.tun_fd], [], [], 1)
+                if readable:
+                    self.handle_tun_packet(os.read(self.tun_fd, MAX_TUN_PACKET + 1))
+            except OSError:
+                if not self.stop_event.is_set():
+                    self.log("TUN read failed")
+                return
+
+    def handle_ip_packet(self, source: str, body: dict[str, Any]):
+        if self.tun_fd is None:
+            self.log(f"drop IP packet from {source[:8]}: TUN is disabled")
+            return
+        try:
+            data = b64decode(body["data"])
+            if len(data) < 20 or len(data) > MAX_TUN_PACKET or data[0] >> 4 != 4:
+                raise ValueError("invalid IPv4 packet")
+            source_ip = str(ipaddress.IPv4Address(data[12:16]))
+            destination_ip = str(ipaddress.IPv4Address(data[16:20]))
+            with self.topology_lock:
+                expected_source_ip = self.directory.get(source, {}).get("mesh_ip")
+            if source_ip != expected_source_ip:
+                raise ValueError(f"packet source {source_ip} does not belong to sender")
+            if destination_ip != self.args.mesh_ip:
+                raise ValueError(f"packet destination {destination_ip} is not local mesh IP")
+            os.write(self.tun_fd, data)
+            self.log(f"TUN IPv4 delivered from {source[:8]} bytes={len(data)}")
+        except (KeyError, ValueError, OSError) as error:
+            self.log(f"drop IP packet from {source[:8]}: {error}")
+
     def remember(self, packet_id: str) -> bool:
         if packet_id in self.seen:
             return False
@@ -419,6 +514,8 @@ class MeshNode:
                     f"service response for request={request_id[:8]} {detail}"
                 )
                 event.set()
+        elif message_type == "IP_PACKET":
+            self.handle_ip_packet(packet.source, body)
 
     def handle_service_request(self, source: str, request_id: str, body: dict[str, Any]):
         name = body.get("service")
@@ -628,7 +725,10 @@ class MeshNode:
     def start(self):
         self.register_and_load_topology()
         self.establish_symmetric_transport()
+        self.open_tun()
         threading.Thread(target=self.receive_loop, daemon=True).start()
+        if self.tun_fd is not None:
+            threading.Thread(target=self.tun_loop, daemon=True).start()
         threading.Thread(target=self.keepalive_loop, daemon=True).start()
         threading.Thread(target=self.refresh_topology_loop, daemon=True).start()
         for peer_id in self.neighbors:
@@ -664,6 +764,9 @@ class MeshNode:
     def close(self):
         self.stop_event.set()
         self.socket.close()
+        if self.tun_fd is not None:
+            os.close(self.tun_fd)
+            self.tun_fd = None
 
 
 def parse_args():
@@ -675,6 +778,8 @@ def parse_args():
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--udp-port", type=int, default=0)
     parser.add_argument("--public-endpoint", help="Known public UDP endpoint HOST:PORT")
+    parser.add_argument("--mesh-ip", type=parse_mesh_ip, help="Unique IPv4 address assigned to this mesh node")
+    parser.add_argument("--tun-name", help="Create a Linux TUN interface for --mesh-ip")
     parser.add_argument("--capacity", type=int, default=1)
     parser.add_argument("--state-dir", default="mesh-state")
     parser.add_argument("--service", action="append", type=parse_service, help="Publish NAME=HOST:PORT")
