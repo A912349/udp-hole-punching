@@ -43,6 +43,7 @@ from mesh_protocol import (
     node_id,
     open_sealed,
     seal,
+    shared_key,
 )
 
 
@@ -63,7 +64,9 @@ SYMMETRIC_SCAN_INITIAL_END = 2000
 SYMMETRIC_SCAN_EXPAND = 2000
 SYMMETRIC_SCAN_DELAY = 0.0005
 MAX_TUN_PACKET = 1200
-IP_FRAGMENT_PAYLOAD_SIZE = 600
+# A full encrypted DATA datagram with this fragment payload is 1,187 bytes,
+# safely below the 1,200-byte UDP payload target used by the overlay.
+IP_FRAGMENT_PAYLOAD_SIZE = 650
 IP_REASSEMBLY_TIMEOUT_SECONDS = 10
 IP_REASSEMBLY_LIMIT = 128
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
@@ -140,6 +143,10 @@ class MeshNode:
         self.services = dict(args.service or [])
         self.allowed_nodes = set(args.allow_node or ["*"])
         self.topology_lock = threading.RLock()
+        # node_id -> (advertised public key, derived X25519 shared key).  The
+        # advertised key remains part of the cache key, so a future identity
+        # rotation cannot accidentally use a stale secret.
+        self.peer_shared_keys: dict[str, tuple[str, bytes]] = {}
         self.tun_fd: int | None = None
         self.ip_reassembly: OrderedDict[tuple[str, bytes], dict[str, Any]] = OrderedDict()
 
@@ -422,10 +429,25 @@ class MeshNode:
             "sealed": seal(
                 self.private_key, peer["public_key"],
                 json.dumps({"type": message_type, "body": body}, separators=(",", ":")).encode(), aad,
+                key=self.shared_key_for(destination, peer["public_key"]),
             )
         }
         packet = Packet("DATA", self.node_id, destination, payload, packet_id or secrets.token_hex(12))
         return packet.packet_id if self.send_packet(packet) else None
+
+    def shared_key_for(self, peer_id: str, public_key: str) -> bytes:
+        """Return the static X25519 secret cached for one advertised identity."""
+        with self.topology_lock:
+            cached = self.peer_shared_keys.get(peer_id)
+        if cached is not None and cached[0] == public_key:
+            return cached[1]
+        derived = shared_key(self.private_key, public_key)
+        with self.topology_lock:
+            cached = self.peer_shared_keys.get(peer_id)
+            if cached is not None and cached[0] == public_key:
+                return cached[1]
+            self.peer_shared_keys[peer_id] = (public_key, derived)
+        return derived
 
     def open_tun(self):
         """Create a Linux TUN device; address and routes stay under operator control."""
@@ -541,7 +563,15 @@ class MeshNode:
                 "DATA",
                 self.node_id,
                 destination,
-                {"ip": seal(self.private_key, peer["public_key"], plaintext, aad)},
+                {
+                    "ip": seal(
+                        self.private_key,
+                        peer["public_key"],
+                        plaintext,
+                        aad,
+                        key=self.shared_key_for(destination, peer["public_key"]),
+                    )
+                },
                 secrets.token_hex(12),
             )
             if not self.send_packet(packet):
@@ -580,7 +610,13 @@ class MeshNode:
         if not peer:
             return
         try:
-            plaintext = open_sealed(self.private_key, peer["public_key"], sealed, f"{source}:{self.node_id}".encode())
+            plaintext = open_sealed(
+                self.private_key,
+                peer["public_key"],
+                sealed,
+                f"{source}:{self.node_id}".encode(),
+                key=self.shared_key_for(source, peer["public_key"]),
+            )
             if len(plaintext) < 12:
                 raise ValueError("truncated fragment")
             fragment_id, index, count = struct.unpack("!8sHH", plaintext[:12])
@@ -638,6 +674,7 @@ class MeshNode:
             raw = open_sealed(
                 self.private_key, peer["public_key"], packet.payload["sealed"],
                 f"{packet.source}:{self.node_id}".encode(),
+                key=self.shared_key_for(packet.source, peer["public_key"]),
             )
             message = json.loads(raw)
         except (KeyError, ValueError, ProtocolError):

@@ -70,16 +70,37 @@ def shared_key(private_key: ECC.EccKey, peer_public_key: str) -> bytes:
     )
 
 
-def seal(private_key: ECC.EccKey, destination_public_key: str, payload: bytes, aad: bytes) -> dict[str, str]:
-    cipher = ChaCha20_Poly1305.new(key=shared_key(private_key, destination_public_key))
+def seal(
+    private_key: ECC.EccKey,
+    destination_public_key: str,
+    payload: bytes,
+    aad: bytes,
+    *,
+    key: bytes | None = None,
+) -> dict[str, str]:
+    """Encrypt a payload, optionally using a previously derived peer key.
+
+    Mesh nodes use static X25519 identities, so the shared secret is unchanged
+    for a given pair of public keys.  Supplying the cached key avoids an X25519
+    calculation on every data-plane packet while preserving the wire format.
+    """
+    cipher = ChaCha20_Poly1305.new(key=key if key is not None else shared_key(private_key, destination_public_key))
     cipher.update(aad)
     ciphertext, tag = cipher.encrypt_and_digest(payload)
     return {"nonce": b64encode(cipher.nonce), "ciphertext": b64encode(ciphertext), "tag": b64encode(tag)}
 
 
-def open_sealed(private_key: ECC.EccKey, source_public_key: str, sealed: dict[str, str], aad: bytes) -> bytes:
+def open_sealed(
+    private_key: ECC.EccKey,
+    source_public_key: str,
+    sealed: dict[str, str],
+    aad: bytes,
+    *,
+    key: bytes | None = None,
+) -> bytes:
     cipher = ChaCha20_Poly1305.new(
-        key=shared_key(private_key, source_public_key), nonce=b64decode(sealed["nonce"])
+        key=key if key is not None else shared_key(private_key, source_public_key),
+        nonce=b64decode(sealed["nonce"]),
     )
     cipher.update(aad)
     return cipher.decrypt_and_verify(b64decode(sealed["ciphertext"]), b64decode(sealed["tag"]))
