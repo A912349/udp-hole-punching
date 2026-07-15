@@ -78,7 +78,8 @@ def log(message: str):
 
 def topology_version(rows) -> str:
     source = "|".join(
-        f"{row['node_id']}:{row['last_seen']}:{row['endpoint']}:{row['mesh_ip']}" for row in rows
+        f"{row['node_id']}:{row['public_key']}:{row['nat_type']}:{row['role']}:"
+        f"{row['endpoint']}:{row['mesh_ip']}:{row['capacity']}" for row in rows
     )
     return hashlib.sha256(source.encode()).hexdigest()[:16]
 

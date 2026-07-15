@@ -17,6 +17,7 @@ import select
 import secrets
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -62,6 +63,10 @@ SYMMETRIC_SCAN_INITIAL_END = 2000
 SYMMETRIC_SCAN_EXPAND = 2000
 SYMMETRIC_SCAN_DELAY = 0.0005
 MAX_TUN_PACKET = 1200
+IP_FRAGMENT_PAYLOAD_SIZE = 600
+IP_REASSEMBLY_TIMEOUT_SECONDS = 10
+IP_REASSEMBLY_LIMIT = 128
+UDP_BUFFER_BYTES = 4 * 1024 * 1024
 IFF_TUN = 0x0001
 IFF_NO_PI = 0x1000
 TUNSETIFF = 0x400454CA
@@ -113,6 +118,8 @@ class MeshNode:
         self.private_key, self.node_id, self.public_key = load_identity(Path(args.state_dir))
         self.network_key = hashlib.sha256(args.network_token.encode()).digest()
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_BUFFER_BYTES)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_BUFFER_BYTES)
         self.socket.bind((args.bind, args.udp_port))
         self.socket.settimeout(1)
         self.stop_event = threading.Event()
@@ -134,6 +141,7 @@ class MeshNode:
         self.allowed_nodes = set(args.allow_node or ["*"])
         self.topology_lock = threading.RLock()
         self.tun_fd: int | None = None
+        self.ip_reassembly: OrderedDict[tuple[str, bytes], dict[str, Any]] = OrderedDict()
 
     @property
     def headers(self):
@@ -378,9 +386,9 @@ class MeshNode:
         return hop
 
     def send_packet(self, packet: Packet):
-        is_sync_packet = packet.packet_type in {"HELLO", "HELLO_ACK"}
+        is_quiet_packet = packet.packet_type in {"HELLO", "HELLO_ACK", "DATA"}
         with self.topology_lock:
-            hop = self.route_next_hop(packet.destination, log_route=not is_sync_packet)
+            hop = self.route_next_hop(packet.destination, log_route=not is_quiet_packet)
         if not hop:
             self.log(f"no route to {packet.destination[:8]}")
             return False
@@ -390,7 +398,7 @@ class MeshNode:
             self.log(f"missing neighbor state for {hop[:8]}")
             return False
         address = peer.get("last_address") or parse_endpoint(peer["endpoint"])
-        if not is_sync_packet:
+        if not is_quiet_packet:
             self.log(
                 f"send {packet.packet_type} {packet.source[:8]}->{packet.destination[:8]} via {hop[:8]} "
                 f"to {address[0]}:{address[1]}"
@@ -503,8 +511,8 @@ class MeshNode:
         if not destination:
             self.log(f"no mesh node owns TUN destination {destination_ip}")
             return
-        self.log(f"TUN IPv4 {source}->{destination_ip} via {destination[:8]} bytes={len(data)}")
-        self.send_encrypted(destination, "IP_PACKET", {"data": b64encode(data)})
+        if not self.send_ip_packet(destination, data):
+            self.log(f"could not send TUN packet to {destination_ip}")
 
     def tun_loop(self):
         assert self.tun_fd is not None
@@ -518,12 +526,41 @@ class MeshNode:
                     self.log("TUN read failed")
                 return
 
-    def handle_ip_packet(self, source: str, body: dict[str, Any]):
+    def send_ip_packet(self, destination: str, data: bytes) -> bool:
+        peer = self.directory.get(destination)
+        if not peer:
+            self.log(f"unknown TUN destination {destination[:8]}")
+            return False
+        fragment_id = secrets.token_bytes(8)
+        count = (len(data) + IP_FRAGMENT_PAYLOAD_SIZE - 1) // IP_FRAGMENT_PAYLOAD_SIZE
+        aad = f"{self.node_id}:{destination}".encode()
+        for index in range(count):
+            chunk = data[index * IP_FRAGMENT_PAYLOAD_SIZE:(index + 1) * IP_FRAGMENT_PAYLOAD_SIZE]
+            plaintext = struct.pack("!8sHH", fragment_id, index, count) + chunk
+            packet = Packet(
+                "DATA",
+                self.node_id,
+                destination,
+                {"ip": seal(self.private_key, peer["public_key"], plaintext, aad)},
+                secrets.token_hex(12),
+            )
+            if not self.send_packet(packet):
+                return False
+        return True
+
+    def expire_ip_reassembly(self):
+        cutoff = time.monotonic() - IP_REASSEMBLY_TIMEOUT_SECONDS
+        while self.ip_reassembly:
+            _, state = next(iter(self.ip_reassembly.items()))
+            if state["received_at"] >= cutoff:
+                break
+            self.ip_reassembly.popitem(last=False)
+
+    def deliver_ip_packet(self, source: str, data: bytes):
         if self.tun_fd is None:
             self.log(f"drop IP packet from {source[:8]}: TUN is disabled")
             return
         try:
-            data = b64decode(body["data"])
             if len(data) < 20 or len(data) > MAX_TUN_PACKET or data[0] >> 4 != 4:
                 raise ValueError("invalid IPv4 packet")
             source_ip = str(ipaddress.IPv4Address(data[12:16]))
@@ -535,9 +572,41 @@ class MeshNode:
             if destination_ip != self.args.mesh_ip:
                 raise ValueError(f"packet destination {destination_ip} is not local mesh IP")
             os.write(self.tun_fd, data)
-            self.log(f"TUN IPv4 delivered from {source[:8]} bytes={len(data)}")
-        except (KeyError, ValueError, OSError) as error:
+        except (ValueError, OSError) as error:
             self.log(f"drop IP packet from {source[:8]}: {error}")
+
+    def handle_ip_fragment(self, source: str, sealed: dict[str, str]):
+        peer = self.directory.get(source)
+        if not peer:
+            return
+        try:
+            plaintext = open_sealed(self.private_key, peer["public_key"], sealed, f"{source}:{self.node_id}".encode())
+            if len(plaintext) < 12:
+                raise ValueError("truncated fragment")
+            fragment_id, index, count = struct.unpack("!8sHH", plaintext[:12])
+            if not 0 < count <= (MAX_TUN_PACKET + IP_FRAGMENT_PAYLOAD_SIZE - 1) // IP_FRAGMENT_PAYLOAD_SIZE:
+                raise ValueError("invalid fragment count")
+            if index >= count:
+                raise ValueError("invalid fragment index")
+            self.expire_ip_reassembly()
+            key = (source, fragment_id)
+            state = self.ip_reassembly.get(key)
+            if state is None:
+                if len(self.ip_reassembly) >= IP_REASSEMBLY_LIMIT:
+                    self.ip_reassembly.popitem(last=False)
+                state = {"count": count, "chunks": {}, "received_at": time.monotonic()}
+                self.ip_reassembly[key] = state
+            if state["count"] != count:
+                raise ValueError("conflicting fragment count")
+            state["chunks"][index] = plaintext[12:]
+            state["received_at"] = time.monotonic()
+            self.ip_reassembly.move_to_end(key)
+            if len(state["chunks"]) == count:
+                data = b"".join(state["chunks"][part] for part in range(count))
+                self.ip_reassembly.pop(key, None)
+                self.deliver_ip_packet(source, data)
+        except (KeyError, ValueError, ProtocolError) as error:
+            self.log(f"drop IP fragment from {source[:8]}: {error}")
 
     def remember(self, packet_id: str) -> bool:
         if packet_id in self.seen:
@@ -562,6 +631,9 @@ class MeshNode:
             if not peer:
                 self.log(f"drop DATA from unknown source {packet.source[:8]}")
                 return
+        if "ip" in packet.payload:
+            self.handle_ip_fragment(packet.source, packet.payload["ip"])
+            return
         try:
             raw = open_sealed(
                 self.private_key, peer["public_key"], packet.payload["sealed"],
@@ -587,7 +659,7 @@ class MeshNode:
                 )
                 event.set()
         elif message_type == "IP_PACKET":
-            self.handle_ip_packet(packet.source, body)
+            self.deliver_ip_packet(packet.source, b64decode(body["data"]))
 
     def handle_service_request(self, source: str, request_id: str, body: dict[str, Any]):
         name = body.get("service")
@@ -762,10 +834,11 @@ class MeshNode:
             if packet.destination != self.node_id:
                 if self.args.role == "superpeer":
                     try:
-                        self.log(
-                            f"forward {packet.packet_type} {packet.source[:8]}->{packet.destination[:8]} "
-                            f"ttl={packet.ttl}"
-                        )
+                        if packet.packet_type != "DATA":
+                            self.log(
+                                f"forward {packet.packet_type} {packet.source[:8]}->{packet.destination[:8]} "
+                                f"ttl={packet.ttl}"
+                            )
                         self.send_packet(packet.decrement_ttl())
                     except ProtocolError:
                         pass

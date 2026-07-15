@@ -77,7 +77,8 @@ mesh route in reverse.
 
 - One `mesh_ip` represents one node; the coordinator rejects duplicate
   addresses.
-- Only IPv4 packets no larger than 1200 bytes are accepted.
-- This version has no fragmentation, retransmission, congestion control, or
-  routing of local LAN prefixes. Keep it for ping and small UDP/TCP smoke
-  tests until the reliable transport layer is added.
+- IPv4 packets up to 1200 bytes are accepted and automatically split into
+  compact encrypted UDP fragments smaller than 1200 bytes on the wire.
+- This version still has no retransmission, congestion control, or routing of
+  local LAN prefixes. Keep it for ping and small UDP/TCP smoke tests until the
+  reliable transport layer is added.
