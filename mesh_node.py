@@ -67,12 +67,6 @@ SYMMETRIC_SCAN_INITIAL_START = -1000
 SYMMETRIC_SCAN_INITIAL_END = 2000
 SYMMETRIC_SCAN_EXPAND = 2000
 SYMMETRIC_SCAN_DELAY = 0.0005
-# Fast IP frames include the route header and an outer MAC, so an IPv4 packet
-# of this size occupies at most 1,196 UDP payload bytes. Keeping it in one
-# datagram avoids both JSON/Base64 overhead and all-or-nothing two-fragment
-# delivery of a TCP segment.
-MAX_TUN_PACKET = 1075
-IP_FRAGMENT_PAYLOAD_SIZE = MAX_TUN_PACKET
 IP_REASSEMBLY_TIMEOUT_SECONDS = 10
 IP_REASSEMBLY_LIMIT = 128
 UDP_BUFFER_BYTES = 4 * 1024 * 1024
@@ -83,6 +77,14 @@ FAST_IP_MAGIC = b"MIP1"
 FAST_IP_HEADER = struct.Struct("!4sB16s16s12s")
 FAST_IP_MAC_SIZE = hashlib.sha256().digest_size
 FAST_IP_SEALED_MIN_SIZE = 12 + 16
+# 1400 bytes of UDP payload fits ordinary 1500-byte IPv4 paths (the outer IP
+# and UDP headers add 28 bytes) without fragmentation.  The fast frame has
+# 121 bytes of overlay overhead: route header, AEAD nonce/tag, fragment
+# header and HMAC.  A TUN packet therefore occupies exactly one UDP datagram.
+FAST_UDP_PAYLOAD_LIMIT = 1400
+FAST_IP_FRAME_OVERHEAD = FAST_IP_HEADER.size + FAST_IP_SEALED_MIN_SIZE + 12 + FAST_IP_MAC_SIZE
+MAX_TUN_PACKET = FAST_UDP_PAYLOAD_LIMIT - FAST_IP_FRAME_OVERHEAD
+IP_FRAGMENT_PAYLOAD_SIZE = MAX_TUN_PACKET
 
 
 def parse_endpoint(value: str) -> tuple[str, int]:
@@ -140,6 +142,7 @@ class MeshNode:
         self.neighbors: dict[str, dict[str, Any]] = {}
         self.directory: dict[str, dict[str, Any]] = {}
         self.links: list[dict[str, Any]] = []
+        self.route_cache: dict[str, str] = {}
         self.topology_version = ""
         self.seen: OrderedDict[str, float] = OrderedDict()
         self.pending: dict[str, tuple[threading.Event, dict[str, Any]]] = {}
@@ -326,11 +329,14 @@ class MeshNode:
                 if key in previous_state.get(node["node_id"], {}):
                     merged[key] = previous_state[node["node_id"]][key]
             neighbors[node["node_id"]] = merged
+        links = topology["backbone_links"]
+        route_cache = self.build_route_cache(directory, neighbors, links)
         with self.topology_lock:
             previous_version = self.topology_version
             previous_neighbors = set(self.neighbors)
             self.directory, self.neighbors = directory, neighbors
-            self.links = topology["backbone_links"]
+            self.links = links
+            self.route_cache = route_cache
             self.topology_version = topology["topology_version"]
         neighbor_ids = set(neighbors)
         added = sorted(n[:8] for n in (neighbor_ids - previous_neighbors))
@@ -353,22 +359,15 @@ class MeshNode:
                     self.start_symmetric_scan(peer_id, peer["endpoint"])
         return previous_version != self.topology_version or bool(added or removed)
 
-    def send_to_address(self, packet: Packet, address: tuple[str, int]):
-        try:
-            self.socket.sendto(encode_packet(packet, self.network_key), address)
-        except OSError:
-            pass
-
-    def route_next_hop(self, destination: str, log_route: bool = True) -> str | None:
-        if destination in self.neighbors:
-            if not self.neighbor_usable(destination):
-                self.log(f"route neighbor down for {destination[:8]}")
-                return None
-            if log_route:
-                self.log(f"route {destination[:8]} -> direct")
-            return destination
+    def build_route_cache(
+        self,
+        directory: dict[str, dict[str, Any]],
+        neighbors: dict[str, dict[str, Any]],
+        links: list[dict[str, Any]],
+    ) -> dict[str, str]:
+        """Build shortest-path next hops once per topology update, not per frame."""
         adjacency: dict[str, list[tuple[str, float]]] = {}
-        for link in self.links:
+        for link in links:
             left, right, cost = link["a"], link["b"], float(link.get("cost", 1.0))
             adjacency.setdefault(left, []).append((right, cost))
             adjacency.setdefault(right, []).append((left, cost))
@@ -377,29 +376,52 @@ class MeshNode:
         costs = {self.node_id: 0.0}
         while queue:
             cost, current = heapq.heappop(queue)
-            if current == destination:
-                break
             if cost != costs.get(current):
                 continue
             for candidate, edge_cost in adjacency.get(current, []):
-                if current == self.node_id and candidate in self.neighbors and not self.neighbor_usable(candidate):
-                    continue
                 candidate_cost = cost + edge_cost
                 if candidate_cost < costs.get(candidate, float("inf")):
                     costs[candidate] = candidate_cost
                     previous[candidate] = current
                     heapq.heappush(queue, (candidate_cost, candidate))
-        if destination not in previous:
+        routes: dict[str, str] = {}
+        for destination in directory:
+            if destination == self.node_id:
+                continue
+            if destination in neighbors:
+                routes[destination] = destination
+                continue
+            if destination not in previous:
+                continue
+            hop = destination
+            while previous[hop] != self.node_id:
+                parent = previous[hop]
+                if parent is None:
+                    break
+                hop = parent
+            if previous.get(hop) == self.node_id:
+                routes[destination] = hop
+        return routes
+
+    def send_to_address(self, packet: Packet, address: tuple[str, int]):
+        try:
+            self.socket.sendto(encode_packet(packet, self.network_key), address)
+        except OSError:
+            pass
+
+    def route_next_hop(self, destination: str, log_route: bool = True) -> str | None:
+        hop = self.route_cache.get(destination)
+        if hop is None and destination in self.neighbors:
+            hop = destination
+        if hop is None:
             self.log(f"route miss for {destination[:8]}")
             return None
-        hop = destination
-        while previous[hop] != self.node_id:
-            hop = previous[hop]
-            if previous[hop] is None:
-                self.log(f"route trace broken for {destination[:8]}")
-                return None
-        if hop != destination and log_route:
-            self.log(f"route {destination[:8]} -> next hop {hop[:8]}")
+        if not self.neighbor_usable(hop):
+            self.log(f"route neighbor down for {hop[:8]}")
+            return None
+        if log_route:
+            path = "direct" if hop == destination else f"next hop {hop[:8]}"
+            self.log(f"route {destination[:8]} -> {path}")
         return hop
 
     def send_packet(self, packet: Packet):
