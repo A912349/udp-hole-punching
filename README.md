@@ -30,25 +30,29 @@ export MESH_NETWORK_TOKEN='длинный-случайный-секрет-мин
 python3 server.py
 ```
 
-На Android через Termux:
+Обычный узел запускается одной командой. По умолчанию он запрашивает роль
+`auto`, получает постоянный mesh-IP от coordinator и при наличии cone NAT может
+быть выбран superpeer:
 
 ```bash
-pkg update
-pkg install python
-python -m pip install -r requirements.txt
-python mesh_node.py --server http://SERVER_IP:8001 --network-token "$MESH_NETWORK_TOKEN" \
-  --role superpeer --nat-type auto --state-dir state-superpeer --capacity 100
+python3 mesh_node.py \
+  --server http://SERVER_IP:8001 \
+  --network-token "$MESH_NETWORK_TOKEN" \
+  --state-dir state-node
 ```
 
-Публичный IP и port forwarding для superpeer не требуются: узел получит свой
-внешний endpoint через STUN и сохранит NAT mapping keepalive-пакетами.
-У каждого устройства должен быть свой `--state-dir`.
+Для Linux TUN добавьте `--tun-name mesh0 --tun-auto-configure`. У каждого
+устройства должен быть свой `--state-dir`. Если устройство никогда не должно
+передавать чужой трафик, добавьте `--no-relay`.
+
+Явная роль нужна только для операционного управления: `--role superpeer
+--capacity 100` закрепляет relay, а `--role client` запрещает promotion.
 
 Обычный узел, публикующий локальный TCP-сервис:
 
 ```bash
 python mesh_node.py --server http://SERVER_IP:8001 --network-token "$MESH_NETWORK_TOKEN" \
-  --role client --nat-type auto --state-dir state-home \
+  --state-dir state-home \
   --service web=127.0.0.1:8080
 ```
 
@@ -58,7 +62,7 @@ python mesh_node.py --server http://SERVER_IP:8001 --network-token "$MESH_NETWOR
 ```bash
 cat request.bin | python mesh_node.py \
   --server http://SERVER_IP:8001 --network-token "$MESH_NETWORK_TOKEN" \
-  --role client --nat-type auto --state-dir state-client \
+  --state-dir state-client \
   --call NODE_ID:web > response.bin
 ```
 

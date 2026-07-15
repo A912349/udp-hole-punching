@@ -21,6 +21,7 @@ DATABASE_PATH = os.environ.get("MESH_DATABASE", "mesh.db")
 NETWORK_TOKEN = os.environ.get("MESH_NETWORK_TOKEN")
 MAX_SUPERPEER_DEGREE = 6
 CLIENT_SUPERPEERS = 3
+AUTO_SUPERPEERS = max(1, int(os.environ.get("MESH_AUTO_SUPERPEERS", "2")))
 NODE_TTL_SECONDS = int(os.environ.get("MESH_NODE_TTL_SECONDS", "45"))
 MESH_IP_NETWORK = ipaddress.IPv4Network(os.environ.get("MESH_IP_NETWORK", "10.77.0.0/24"))
 
@@ -43,6 +44,8 @@ def init_db():
                 nat_type TEXT NOT NULL,
                 role TEXT NOT NULL,
                 endpoint TEXT NOT NULL,
+                requested_role TEXT NOT NULL DEFAULT 'auto',
+                relay_capable INTEGER NOT NULL DEFAULT 1,
                 capacity INTEGER NOT NULL DEFAULT 1,
                 last_seen INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
@@ -61,6 +64,13 @@ def init_db():
         columns = {row[1] for row in connection.execute("PRAGMA table_info(nodes)")}
         if "mesh_ip" not in columns:
             connection.execute("ALTER TABLE nodes ADD COLUMN mesh_ip TEXT")
+        if "requested_role" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN requested_role TEXT")
+            connection.execute(
+                "UPDATE nodes SET requested_role = CASE WHEN role = 'superpeer' THEN 'superpeer' ELSE 'auto' END"
+            )
+        if "relay_capable" not in columns:
+            connection.execute("ALTER TABLE nodes ADD COLUMN relay_capable INTEGER NOT NULL DEFAULT 1")
         connection.commit()
 
 
@@ -102,6 +112,47 @@ def allocate_mesh_ip(connection: sqlite3.Connection) -> str:
     raise RuntimeError("mesh address pool is exhausted")
 
 
+def assign_role(
+    connection: sqlite3.Connection,
+    node_id: str,
+    requested_role: str,
+    nat_type: str,
+    relay_capable: bool,
+    capacity: int,
+    now: int,
+) -> str:
+    """Keep manual roles fixed and elect stable cone nodes for auto relays."""
+    if requested_role == "superpeer":
+        return "superpeer"
+    if requested_role == "client" or nat_type != "cone" or not relay_capable:
+        return "client"
+
+    cutoff = now - NODE_TTL_SECONDS
+    rows = connection.execute(
+        """SELECT node_id, nat_type, requested_role, relay_capable, capacity, created_at
+           FROM nodes WHERE last_seen >= ? AND node_id != ?""",
+        (cutoff, node_id),
+    ).fetchall()
+    manual_relays = [row for row in rows if row["requested_role"] == "superpeer"]
+    slots = max(0, AUTO_SUPERPEERS - len(manual_relays))
+    if slots == 0:
+        return "client"
+
+    existing = connection.execute("SELECT created_at FROM nodes WHERE node_id = ?", (node_id,)).fetchone()
+    candidates = [
+        row for row in rows
+        if row["requested_role"] == "auto" and row["nat_type"] == "cone" and row["relay_capable"]
+    ]
+    candidates.append({
+        "node_id": node_id,
+        "capacity": capacity,
+        "created_at": existing["created_at"] if existing else now,
+    })
+    candidates.sort(key=lambda row: (-int(row["capacity"]), int(row["created_at"]), row["node_id"]))
+    elected = {row["node_id"] for row in candidates[:slots]}
+    return "superpeer" if node_id in elected else "client"
+
+
 def backbone_links(superpeers):
     """Deterministic near-full mesh; replaceable by future graph optimizer."""
     ids = [row["node_id"] for row in superpeers]
@@ -119,14 +170,26 @@ def backbone_links(superpeers):
 
 
 def access_links(nodes, superpeers):
-    """Attach each client to several superpeers; graph optimization is deferred."""
+    """Spread clients across relays while retaining primary and backup paths."""
     links = []
-    ranked = sorted(superpeers, key=lambda row: (-row["capacity"], row["node_id"]))
-    for row in nodes:
+    assigned = {row["node_id"]: 0 for row in superpeers}
+    for row in sorted(nodes, key=lambda item: item["node_id"]):
         if row["role"] != "client":
             continue
-        for superpeer in ranked[:CLIENT_SUPERPEERS]:
-            links.append({"a": row["node_id"], "b": superpeer["node_id"], "cost": 1.0})
+        ranked = sorted(
+            superpeers,
+            key=lambda relay: (
+                assigned[relay["node_id"]] / max(1, relay["capacity"]),
+                -relay["capacity"],
+                relay["node_id"],
+            ),
+        )
+        for index, superpeer in enumerate(ranked[:CLIENT_SUPERPEERS]):
+            assigned[superpeer["node_id"]] += 1
+            links.append({
+                "a": row["node_id"], "b": superpeer["node_id"],
+                "cost": 1.0 + index * 0.1,
+            })
     return links
 
 
@@ -140,7 +203,7 @@ def register():
         return jsonify({"error": "missing required fields"}), 400
     if data["nat_type"] not in {"cone", "symmetric"}:
         return jsonify({"error": "invalid nat_type"}), 400
-    if data["role"] not in {"superpeer", "client"}:
+    if data["role"] not in {"auto", "superpeer", "client"}:
         return jsonify({"error": "invalid role"}), 400
     if data["role"] == "superpeer" and data["nat_type"] != "cone":
         log(f"register rejected node={data.get('node_id')} reason=superpeer requires cone")
@@ -158,6 +221,7 @@ def register():
         return jsonify({"error": "invalid public_key"}), 400
     now = int(time.time())
     capacity = max(1, min(int(data.get("capacity", 1)), 1000))
+    relay_capable = bool(data.get("relay_capable", True))
     with closing(db()) as connection:
         existing = connection.execute("SELECT mesh_ip FROM nodes WHERE node_id = ?", (data["node_id"],)).fetchone()
         mesh_ip = requested_mesh_ip or (existing["mesh_ip"] if existing else None) or allocate_mesh_ip(connection)
@@ -167,20 +231,30 @@ def register():
             ).fetchone()
             if owner:
                 return jsonify({"error": "mesh_ip is already assigned"}), 409
+        assigned_role = assign_role(
+            connection, data["node_id"], data["role"], data["nat_type"], relay_capable, capacity, now
+        )
         connection.execute(
-            """INSERT INTO nodes(node_id, public_key, nat_type, role, endpoint, mesh_ip, capacity, last_seen, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """INSERT INTO nodes(node_id, public_key, nat_type, role, requested_role, relay_capable, endpoint, mesh_ip, capacity, last_seen, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,
                   nat_type=excluded.nat_type, role=excluded.role, endpoint=excluded.endpoint,
+                  requested_role=excluded.requested_role, relay_capable=excluded.relay_capable,
                   mesh_ip=excluded.mesh_ip, capacity=excluded.capacity, last_seen=excluded.last_seen""",
-            (data["node_id"], data["public_key"], data["nat_type"], data["role"], data["endpoint"], mesh_ip, capacity, now, now),
+            (
+                data["node_id"], data["public_key"], data["nat_type"], assigned_role, data["role"],
+                int(relay_capable), data["endpoint"], mesh_ip, capacity, now, now,
+            ),
         )
         connection.commit()
     log(
-        f"register node={data['node_id'][:8]} role={data['role']} nat={data['nat_type']} "
+        f"register node={data['node_id'][:8]} requested={data['role']} assigned={assigned_role} nat={data['nat_type']} "
         f"endpoint={data['endpoint']} mesh_ip={mesh_ip or '-'} capacity={capacity}"
     )
-    return jsonify({"status": "ok", "mesh_ip": mesh_ip, "mesh_network": str(MESH_IP_NETWORK)})
+    return jsonify({
+        "status": "ok", "mesh_ip": mesh_ip, "mesh_network": str(MESH_IP_NETWORK),
+        "assigned_role": assigned_role,
+    })
 
 
 @app.get("/v1/bootstrap/<node_id>")

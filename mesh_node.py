@@ -130,6 +130,7 @@ def parse_service(value: str) -> tuple[str, tuple[str, int]]:
 class MeshNode:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.requested_role = args.role
         self.private_key, self.node_id, self.public_key = load_identity(Path(args.state_dir))
         self.network_key = hashlib.sha256(args.network_token.encode()).digest()
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -207,7 +208,8 @@ class MeshNode:
             "node_id": self.node_id,
             "public_key": self.public_key,
             "nat_type": self.nat_type,
-            "role": self.args.role,
+            "role": self.requested_role,
+            "relay_capable": not self.args.no_relay,
             "endpoint": self.endpoint,
             "capacity": self.args.capacity,
             "mesh_ip": self.args.mesh_ip,
@@ -221,14 +223,20 @@ class MeshNode:
         if self.args.mesh_ip and self.args.mesh_ip != assigned_ip:
             raise RuntimeError(f"coordinator assigned unexpected mesh IP {assigned_ip}")
         self.args.mesh_ip = assigned_ip
+        assigned_role = registration.get("assigned_role")
+        if assigned_role not in {"client", "superpeer"}:
+            raise RuntimeError("coordinator returned invalid assigned_role")
+        if self.args.role != assigned_role:
+            self.args.role = assigned_role
+            self.log(f"assigned mesh role {assigned_role}")
 
     def register_and_load_topology(self):
         endpoint, nat_type = self.detect_endpoint()
         self.socket.settimeout(1)
-        if self.args.role == "superpeer" and nat_type != "cone":
+        if self.requested_role == "superpeer" and nat_type != "cone":
             raise RuntimeError("superpeer requires a cone NAT")
         self.endpoint, self.nat_type = endpoint, nat_type
-        self.log(f"registering role={self.args.role} nat_type={nat_type} endpoint={endpoint}")
+        self.log(f"registering requested_role={self.requested_role} nat_type={nat_type} endpoint={endpoint}")
         self.register_self()
         self.log(f"mesh IP {self.args.mesh_ip}")
         for name, (host, port) in self.services.items():
@@ -413,16 +421,56 @@ class MeshNode:
         hop = self.route_cache.get(destination)
         if hop is None and destination in self.neighbors:
             hop = destination
-        if hop is None:
-            self.log(f"route miss for {destination[:8]}")
-            return None
-        if not self.neighbor_usable(hop):
-            self.log(f"route neighbor down for {hop[:8]}")
-            return None
+        if hop is None or not self.neighbor_usable(hop):
+            failed_hop = hop
+            hop = self.find_live_next_hop(destination)
+            if hop is None:
+                if failed_hop:
+                    self.log(f"route neighbor down for {failed_hop[:8]}")
+                else:
+                    self.log(f"route miss for {destination[:8]}")
+                return None
+            self.route_cache[destination] = hop
+            if failed_hop and failed_hop != hop:
+                self.log(f"route failover {destination[:8]} {failed_hop[:8]}->{hop[:8]}")
         if log_route:
             path = "direct" if hop == destination else f"next hop {hop[:8]}"
             self.log(f"route {destination[:8]} -> {path}")
         return hop
+
+    def find_live_next_hop(self, destination: str) -> str | None:
+        """Recompute one path while excluding down direct links."""
+        adjacency: dict[str, list[tuple[str, float]]] = {}
+        for link in self.links:
+            left, right, cost = link["a"], link["b"], float(link.get("cost", 1.0))
+            adjacency.setdefault(left, []).append((right, cost))
+            adjacency.setdefault(right, []).append((left, cost))
+        queue = [(0.0, self.node_id)]
+        previous: dict[str, str | None] = {self.node_id: None}
+        costs = {self.node_id: 0.0}
+        while queue:
+            cost, current = heapq.heappop(queue)
+            if current == destination:
+                break
+            if cost != costs.get(current):
+                continue
+            for candidate, edge_cost in adjacency.get(current, []):
+                if current == self.node_id and candidate in self.neighbors and not self.neighbor_usable(candidate):
+                    continue
+                candidate_cost = cost + edge_cost
+                if candidate_cost < costs.get(candidate, float("inf")):
+                    costs[candidate] = candidate_cost
+                    previous[candidate] = current
+                    heapq.heappush(queue, (candidate_cost, candidate))
+        if destination not in previous:
+            return None
+        hop = destination
+        while previous[hop] != self.node_id:
+            parent = previous[hop]
+            if parent is None:
+                return None
+            hop = parent
+        return hop if self.neighbor_usable(hop) else None
 
     def send_packet(self, packet: Packet):
         is_quiet_packet = packet.packet_type in {"HELLO", "HELLO_ACK", "DATA"}
@@ -1120,7 +1168,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Two-tier UDP home-service mesh node")
     parser.add_argument("--server", required=True, help="Control-plane base URL")
     parser.add_argument("--network-token", required=True, help="Shared control/overlay network token")
-    parser.add_argument("--role", choices=("superpeer", "client"), default="client")
+    parser.add_argument("--role", choices=("auto", "superpeer", "client"), default="auto")
+    parser.add_argument("--no-relay", action="store_true", help="Never allow automatic superpeer assignment")
     parser.add_argument("--nat-type", choices=("auto", "cone", "symmetric"), default="auto")
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--udp-port", type=int, default=0)

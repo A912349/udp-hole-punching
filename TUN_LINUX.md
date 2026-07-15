@@ -25,7 +25,6 @@ running:
 sudo python3 mesh_node.py \
   --server http://COORDINATOR_IP:8001 \
   --network-token 'change-this-to-a-long-random-secret-12345' \
-  --role client \
   --nat-type auto \
   --state-dir state-home \
   --tun-name mesh0 \
@@ -49,7 +48,6 @@ Start it with its own identity directory and overlay address:
 sudo python3 mesh_node.py \
   --server http://COORDINATOR_IP:8001 \
   --network-token 'change-this-to-a-long-random-secret-12345' \
-  --role client \
   --nat-type auto \
   --state-dir state-linux-client \
   --tun-name mesh0 \
