@@ -21,6 +21,8 @@ DATABASE_PATH = os.environ.get("MESH_DATABASE", "mesh.db")
 NETWORK_TOKEN = os.environ.get("MESH_NETWORK_TOKEN")
 MAX_SUPERPEER_DEGREE = 6
 CLIENT_SUPERPEERS = 3
+NODE_TTL_SECONDS = int(os.environ.get("MESH_NODE_TTL_SECONDS", "45"))
+MESH_IP_NETWORK = ipaddress.IPv4Network(os.environ.get("MESH_IP_NETWORK", "10.77.0.0/24"))
 
 app = Flask(__name__)
 
@@ -89,6 +91,16 @@ def row_to_node(row):
     }
 
 
+def allocate_mesh_ip(connection: sqlite3.Connection) -> str:
+    """Allocate a persistent DHCP-like mesh address, reserving the first host."""
+    assigned = {row[0] for row in connection.execute("SELECT mesh_ip FROM nodes WHERE mesh_ip IS NOT NULL")}
+    for candidate in list(MESH_IP_NETWORK.hosts())[1:]:
+        address = str(candidate)
+        if address not in assigned:
+            return address
+    raise RuntimeError("mesh address pool is exhausted")
+
+
 def backbone_links(superpeers):
     """Deterministic near-full mesh; replaceable by future graph optimizer."""
     ids = [row["node_id"] for row in superpeers]
@@ -132,10 +144,10 @@ def register():
     if data["role"] == "superpeer" and data["nat_type"] != "cone":
         log(f"register rejected node={data.get('node_id')} reason=superpeer requires cone")
         return jsonify({"error": "only cone nodes may be superpeers"}), 400
-    mesh_ip = data.get("mesh_ip")
-    if mesh_ip:
+    requested_mesh_ip = data.get("mesh_ip")
+    if requested_mesh_ip:
         try:
-            mesh_ip = str(ipaddress.IPv4Address(mesh_ip))
+            requested_mesh_ip = str(ipaddress.IPv4Address(requested_mesh_ip))
         except ipaddress.AddressValueError:
             return jsonify({"error": "invalid mesh_ip"}), 400
     try:
@@ -146,6 +158,8 @@ def register():
     now = int(time.time())
     capacity = max(1, min(int(data.get("capacity", 1)), 1000))
     with closing(db()) as connection:
+        existing = connection.execute("SELECT mesh_ip FROM nodes WHERE node_id = ?", (data["node_id"],)).fetchone()
+        mesh_ip = requested_mesh_ip or (existing["mesh_ip"] if existing else None) or allocate_mesh_ip(connection)
         if mesh_ip:
             owner = connection.execute(
                 "SELECT node_id FROM nodes WHERE mesh_ip = ? AND node_id != ?", (mesh_ip, data["node_id"])
@@ -165,7 +179,7 @@ def register():
         f"register node={data['node_id'][:8]} role={data['role']} nat={data['nat_type']} "
         f"endpoint={data['endpoint']} mesh_ip={mesh_ip or '-'} capacity={capacity}"
     )
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "mesh_ip": mesh_ip, "mesh_network": str(MESH_IP_NETWORK)})
 
 
 @app.get("/v1/bootstrap/<node_id>")
@@ -177,7 +191,8 @@ def bootstrap(node_id):
         if not current:
             log(f"bootstrap unknown node={node_id[:8]}")
             return jsonify({"error": "unknown node"}), 404
-        nodes = connection.execute("SELECT * FROM nodes ORDER BY node_id").fetchall()
+        cutoff = int(time.time()) - NODE_TTL_SECONDS
+        nodes = connection.execute("SELECT * FROM nodes WHERE last_seen >= ? ORDER BY node_id", (cutoff,)).fetchall()
         superpeers = [row for row in nodes if row["role"] == "superpeer"]
         links = backbone_links(superpeers) + access_links(nodes, superpeers)
         neighbor_ids = {

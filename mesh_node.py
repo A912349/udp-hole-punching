@@ -15,7 +15,9 @@ import json
 import os
 import select
 import secrets
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -45,6 +47,9 @@ from mesh_protocol import (
 
 KEEPALIVE_SECONDS = 10
 TOPOLOGY_REFRESH_SECONDS = 5
+NODE_HEARTBEAT_SECONDS = 15
+LINK_TIMEOUT_SECONDS = 30
+LINK_BOOTSTRAP_GRACE_SECONDS = 35
 SEEN_PACKET_LIMIT = 10_000
 MAX_SERVICE_REQUEST = 32_000
 MAX_SERVICE_RESPONSE = 48_000
@@ -111,6 +116,7 @@ class MeshNode:
         self.socket.bind((args.bind, args.udp_port))
         self.socket.settimeout(1)
         self.stop_event = threading.Event()
+        self.started_at = time.monotonic()
         self.neighbors: dict[str, dict[str, Any]] = {}
         self.directory: dict[str, dict[str, Any]] = {}
         self.links: list[dict[str, Any]] = []
@@ -168,6 +174,26 @@ class MeshNode:
         response.raise_for_status()
         return response.json()
 
+    def registration_payload(self) -> dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "public_key": self.public_key,
+            "nat_type": self.nat_type,
+            "role": self.args.role,
+            "endpoint": self.endpoint,
+            "capacity": self.args.capacity,
+            "mesh_ip": self.args.mesh_ip,
+        }
+
+    def register_self(self):
+        registration = self.control_request("POST", "/v1/register", json=self.registration_payload())
+        assigned_ip = registration.get("mesh_ip")
+        if not assigned_ip:
+            raise RuntimeError("coordinator did not assign mesh_ip")
+        if self.args.mesh_ip and self.args.mesh_ip != assigned_ip:
+            raise RuntimeError(f"coordinator assigned unexpected mesh IP {assigned_ip}")
+        self.args.mesh_ip = assigned_ip
+
     def register_and_load_topology(self):
         endpoint, nat_type = self.detect_endpoint()
         self.socket.settimeout(1)
@@ -175,13 +201,8 @@ class MeshNode:
             raise RuntimeError("superpeer requires a cone NAT")
         self.endpoint, self.nat_type = endpoint, nat_type
         self.log(f"registering role={self.args.role} nat_type={nat_type} endpoint={endpoint}")
-        self.control_request(
-            "POST", "/v1/register", json={
-                "node_id": self.node_id, "public_key": self.public_key,
-                "nat_type": nat_type, "role": self.args.role,
-                "endpoint": endpoint, "capacity": self.args.capacity, "mesh_ip": self.args.mesh_ip,
-            },
-        )
+        self.register_self()
+        self.log(f"mesh IP {self.args.mesh_ip}")
         for name, (host, port) in self.services.items():
             self.log(f"publishing service {name} -> {host}:{port}")
             self.control_request(
@@ -272,7 +293,14 @@ class MeshNode:
         """Atomic topology replacement; future graph updates call this method."""
         directory = {node["node_id"]: node for node in topology.get("directory", topology["neighbors"])}
         directory[self.node_id] = topology["self"]
-        neighbors = {node["node_id"]: node for node in topology["neighbors"]}
+        previous_state = self.neighbors
+        neighbors = {}
+        for node in topology["neighbors"]:
+            merged = dict(node)
+            for key in ("last_address", "last_rx", "link_up"):
+                if key in previous_state.get(node["node_id"], {}):
+                    merged[key] = previous_state[node["node_id"]][key]
+            neighbors[node["node_id"]] = merged
         with self.topology_lock:
             previous_version = self.topology_version
             previous_neighbors = set(self.neighbors)
@@ -308,6 +336,9 @@ class MeshNode:
 
     def route_next_hop(self, destination: str, log_route: bool = True) -> str | None:
         if destination in self.neighbors:
+            if not self.neighbor_usable(destination):
+                self.log(f"route neighbor down for {destination[:8]}")
+                return None
             if log_route:
                 self.log(f"route {destination[:8]} -> direct")
             return destination
@@ -326,6 +357,8 @@ class MeshNode:
             if cost != costs.get(current):
                 continue
             for candidate, edge_cost in adjacency.get(current, []):
+                if current == self.node_id and candidate in self.neighbors and not self.neighbor_usable(candidate):
+                    continue
                 candidate_cost = cost + edge_cost
                 if candidate_cost < costs.get(candidate, float("inf")):
                     costs[candidate] = candidate_cost
@@ -409,6 +442,45 @@ class MeshNode:
         actual_name = assigned[:16].split(b"\0", 1)[0].decode()
         self.tun_fd = fd
         self.log(f"TUN {actual_name} opened for mesh IP {self.args.mesh_ip}; configure it with iproute2")
+        if self.args.tun_auto_configure:
+            self.configure_tun(actual_name)
+
+    def ip_command(self) -> str:
+        """Find iproute2 in Linux or the Termux prefix inherited by root."""
+        candidates = [shutil.which("ip"), str(Path(sys.executable).with_name("ip")), "/sbin/ip", "/usr/sbin/ip"]
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        raise RuntimeError("iproute2 command 'ip' was not found")
+
+    def run_ip(self, ip: str, *arguments: str):
+        try:
+            subprocess.run([ip, *arguments], check=True, text=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+            detail = error.stderr.strip() or error.stdout.strip() or str(error)
+            raise RuntimeError(f"ip {' '.join(arguments)} failed: {detail}") from error
+
+    def configure_tun(self, name: str):
+        """Opt-in host route setup for the mesh subnet, without touching default routes."""
+        assert self.args.mesh_ip is not None
+        network = ipaddress.IPv4Network(f"{self.args.mesh_ip}/{self.args.mesh_prefix}", strict=False)
+        ip = self.ip_command()
+        self.run_ip(ip, "link", "set", "dev", name, "mtu", str(MAX_TUN_PACKET), "up")
+        self.run_ip(ip, "addr", "replace", f"{self.args.mesh_ip}/{self.args.mesh_prefix}", "dev", name)
+        route = ["route", "replace", str(network), "dev", name, "scope", "link", "src", self.args.mesh_ip]
+        self.run_ip(ip, *route, "table", "main")
+
+        # Android policy routing often selects an rmnet table before main. Add
+        # the same narrow route there; default routes remain untouched.
+        result = subprocess.run([ip, "route", "get", "1.1.1.1"], text=True, capture_output=True)
+        table_marker = " table "
+        if result.returncode == 0 and table_marker in result.stdout:
+            table = result.stdout.split(table_marker, 1)[1].split()[0]
+            if table not in {"main", "local"}:
+                self.run_ip(ip, *route, "table", table)
+                self.log(f"TUN route {network} added to main and {table}")
+                return
+        self.log(f"TUN route {network} added to main")
 
     def node_for_mesh_ip(self, address: str) -> str | None:
         with self.topology_lock:
@@ -664,6 +736,16 @@ class MeshNode:
             neighbor = self.neighbors.get(source)
             if neighbor is not None:
                 neighbor["last_address"] = address
+                neighbor["last_rx"] = time.monotonic()
+
+    def neighbor_usable(self, peer_id: str) -> bool:
+        peer = self.neighbors.get(peer_id)
+        if peer is None:
+            return False
+        last_rx = peer.get("last_rx")
+        if last_rx is None:
+            return time.monotonic() - self.started_at < LINK_BOOTSTRAP_GRACE_SECONDS
+        return time.monotonic() - last_rx <= LINK_TIMEOUT_SECONDS
 
     def receive_loop(self):
         while not self.stop_event.is_set():
@@ -705,6 +787,24 @@ class MeshNode:
             for peer_id in peers:
                 self.send_hello(peer_id)
 
+    def heartbeat_loop(self):
+        while not self.stop_event.wait(NODE_HEARTBEAT_SECONDS):
+            try:
+                self.register_self()
+            except requests.RequestException as error:
+                self.log(f"coordinator heartbeat failed: {error}")
+
+    def link_health_loop(self):
+        while not self.stop_event.wait(KEEPALIVE_SECONDS):
+            with self.topology_lock:
+                peers = tuple(self.neighbors.items())
+            for peer_id, peer in peers:
+                usable = self.neighbor_usable(peer_id)
+                if peer.get("link_up") != usable:
+                    peer["link_up"] = usable
+                    state = "up" if usable else "down"
+                    self.log(f"link {peer_id[:8]} {state}")
+
     def refresh_topology(self) -> bool:
         """Fetch the current graph before routing traffic from a new neighbor."""
         topology = self.control_request("GET", f"/v1/bootstrap/{self.node_id}")
@@ -730,6 +830,8 @@ class MeshNode:
         if self.tun_fd is not None:
             threading.Thread(target=self.tun_loop, daemon=True).start()
         threading.Thread(target=self.keepalive_loop, daemon=True).start()
+        threading.Thread(target=self.heartbeat_loop, daemon=True).start()
+        threading.Thread(target=self.link_health_loop, daemon=True).start()
         threading.Thread(target=self.refresh_topology_loop, daemon=True).start()
         for peer_id in self.neighbors:
             self.send_hello(peer_id)
@@ -778,8 +880,10 @@ def parse_args():
     parser.add_argument("--bind", default="0.0.0.0")
     parser.add_argument("--udp-port", type=int, default=0)
     parser.add_argument("--public-endpoint", help="Known public UDP endpoint HOST:PORT")
-    parser.add_argument("--mesh-ip", type=parse_mesh_ip, help="Unique IPv4 address assigned to this mesh node")
+    parser.add_argument("--mesh-ip", type=parse_mesh_ip, help="Optional static mesh IPv4 address; omitted uses coordinator lease")
     parser.add_argument("--tun-name", help="Create a Linux TUN interface for --mesh-ip")
+    parser.add_argument("--mesh-prefix", type=int, default=24, choices=range(1, 31), help="CIDR prefix for --mesh-ip")
+    parser.add_argument("--tun-auto-configure", action="store_true", help="Configure TUN address and mesh-only routes")
     parser.add_argument("--capacity", type=int, default=1)
     parser.add_argument("--state-dir", default="mesh-state")
     parser.add_argument("--service", action="append", type=parse_service, help="Publish NAME=HOST:PORT")

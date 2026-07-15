@@ -7,16 +7,14 @@ delivery and fragmentation.
 ## Requirements
 
 - Run the updated `server.py` once so it adds the `mesh_ip` database column.
-- Assign a unique mesh IPv4 address to every participating node.
+- The coordinator assigns and persists a unique mesh IPv4 address for every
+  node identity. A manual `--mesh-ip` is optional only when a fixed address is
+  required.
 - Run `mesh_node.py` as root, or grant it `CAP_NET_ADMIN`, to create `/dev/net/tun`.
 - Use Linux on both endpoints. Android/Termux needs a later `VpnService` layer.
 
-The examples use the private overlay subnet `10.77.0.0/24`:
-
-```text
-home node:    10.77.0.10
-mobile Linux: 10.77.0.20
-```
+The default private overlay subnet is `10.77.0.0/24`. The assigned address is
+printed as `mesh IP ...` at node startup.
 
 ## Start the home node
 
@@ -30,15 +28,17 @@ sudo python3 mesh_node.py \
   --role client \
   --nat-type auto \
   --state-dir state-home \
-  --mesh-ip 10.77.0.10 \
-  --tun-name mesh0
+  --tun-name mesh0 \
+  --tun-auto-configure
 ```
 
-In a second terminal on the same machine, configure the device:
+`--tun-auto-configure` brings up the device, applies the coordinator lease, and
+adds only the `10.77.0.0/24` route. It does not replace the Internet default
+route. If you omit this flag, configure the device manually:
 
 ```bash
 sudo ip link set dev mesh0 mtu 1200 up
-sudo ip addr add 10.77.0.10/24 dev mesh0
+sudo ip addr add ASSIGNED_MESH_IP/24 dev mesh0
 ```
 
 ## Start the second Linux node
@@ -52,21 +52,21 @@ sudo python3 mesh_node.py \
   --role client \
   --nat-type auto \
   --state-dir state-linux-client \
-  --mesh-ip 10.77.0.20 \
-  --tun-name mesh0
+  --tun-name mesh0 \
+  --tun-auto-configure
 ```
 
 Configure its interface in another terminal:
 
 ```bash
 sudo ip link set dev mesh0 mtu 1200 up
-sudo ip addr add 10.77.0.20/24 dev mesh0
+sudo ip addr add ASSIGNED_MESH_IP/24 dev mesh0
 ```
 
 After both nodes have refreshed topology, test the overlay:
 
 ```bash
-ping -I mesh0 10.77.0.10
+ping -I mesh0 PEER_ASSIGNED_MESH_IP
 ```
 
 Expected node logs include `TUN IPv4 ...` on the sending node and `TUN IPv4
