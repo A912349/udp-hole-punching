@@ -732,7 +732,7 @@ func (n *node) usable(p *peer) bool {
 	return p != nil && (p.lastRX.IsZero() || time.Since(p.lastRX) < linkTimeout)
 }
 func (n *node) send(p protocol.Packet) bool {
-	hop, q := n.nextHop(p.Destination)
+	_, q := n.nextHop(p.Destination)
 	if !n.usable(q) {
 		return false
 	}
