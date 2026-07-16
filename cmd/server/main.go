@@ -73,6 +73,14 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
+	// SQLite permits one writer. Keep one process-local connection and make it
+	// wait for an external lock instead of failing concurrent heartbeat and
+	// topology requests with SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	if _, e = db.Exec("PRAGMA busy_timeout = 10000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL"); e != nil {
+		log.Fatal(e)
+	}
 	s := &server{db: db, token: os.Getenv("MESH_NETWORK_TOKEN"), ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)), auto: envInt("MESH_AUTO_SUPERPEERS", 2), sessions: map[string]map[string]*rendezvousPeer{}}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
@@ -120,6 +128,11 @@ func (s *server) init() error {
 		columns[name] = true
 	}
 	if err = rows.Err(); err != nil {
+		return err
+	}
+	// Migration statements below must run after the schema cursor releases the
+	// sole connection from the pool.
+	if err = rows.Close(); err != nil {
 		return err
 	}
 	if !columns["mesh_ip"] {
