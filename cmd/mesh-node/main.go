@@ -15,6 +15,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"io"
 	"log"
 	"net"
@@ -125,35 +126,42 @@ type fastFrame struct {
 	data []byte
 	addr *net.UDPAddr
 }
+type deliverFrame struct {
+	source string
+	data   []byte
+}
 type fastStats struct {
 	receivedPackets, receivedBytes   atomic.Uint64
 	queueDrops                       atomic.Uint64
 	sentPackets, sentBytes           atomic.Uint64
 	deliveredPackets, deliveredBytes atomic.Uint64
+	deliveryDrops                    atomic.Uint64
 }
 type node struct {
-	c         config
-	id        *protocol.Identity
-	key       []byte
-	conn      *net.UDPConn
-	packet    *ipv4.PacketConn
-	client    *http.Client
-	mu        sync.RWMutex
-	dir       map[string]*peer
-	neighbors map[string]*peer
-	links     []edge
-	routes    map[string]string
-	meshNodes map[netip.Addr]string
-	seen      map[string]time.Time
-	pending   map[string]chan serviceResult
-	services  map[string]string
-	allow     map[string]bool
-	stop      context.CancelFunc
-	tun       *os.File
-	startedAt time.Time
-	fastQueue chan fastFrame
-	fastPool  sync.Pool
-	stats     fastStats
+	c            config
+	id           *protocol.Identity
+	key          []byte
+	conn         *net.UDPConn
+	packet       *ipv4.PacketConn
+	client       *http.Client
+	mu           sync.RWMutex
+	dir          map[string]*peer
+	neighbors    map[string]*peer
+	links        []edge
+	routes       map[string]string
+	meshNodes    map[netip.Addr]string
+	seen         map[string]struct{}
+	pending      map[string]chan serviceResult
+	services     map[string]string
+	allow        map[string]bool
+	stop         context.CancelFunc
+	tun          *os.File
+	startedAt    time.Time
+	fastQueue    chan fastFrame
+	fastPool     sync.Pool
+	macPool      sync.Pool
+	deliverQueue chan deliverFrame
+	stats        fastStats
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -222,7 +230,7 @@ func parse() config {
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
-	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = up to 4, max 16)")
+	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = up to 2, max 16)")
 	f.DurationVar(&c.statsInterval, "stats-interval", 0, "log fast-path throughput and queue statistics (0 = off)")
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
@@ -301,7 +309,7 @@ func newNode(c config) (*node, error) {
 		neighbors:          map[string]*peer{},
 		routes:             map[string]string{},
 		meshNodes:          map[netip.Addr]string{},
-		seen:               map[string]time.Time{},
+		seen:               map[string]struct{}{},
 		pending:            map[string]chan serviceResult{},
 		services:           map[string]string{},
 		allow:              map[string]bool{"*": true},
@@ -312,6 +320,7 @@ func newNode(c config) (*node, error) {
 		symmetricConnected: map[string]bool{},
 		symmetricBurstAt:   map[string]time.Time{},
 	}
+	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
 	for _, v := range c.allows {
 		if v != "" {
 			if len(n.allow) == 1 {
@@ -534,6 +543,7 @@ func (n *node) start() error {
 		return e
 	}
 	n.startFastWorkers(ctx)
+	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
 	go n.periodic(ctx, keepAlive, n.helloAll)
 	go n.periodic(ctx, refresh, func() {
@@ -875,7 +885,7 @@ func (n *node) startFastWorkers(ctx context.Context) {
 	workers := n.c.fastWorkers
 	if workers <= 0 {
 		workers = runtime.GOMAXPROCS(0)
-		workers = min(workers, 4)
+		workers = min(workers, 2)
 	}
 	workers = min(workers, 16)
 	n.fastQueue = make(chan fastFrame, fastQueueSize)
@@ -895,6 +905,29 @@ func (n *node) startFastWorkers(ctx context.Context) {
 				}
 			}
 		}()
+	}
+}
+
+func (n *node) startDeliverWorker(ctx context.Context) {
+	n.deliverQueue = make(chan deliverFrame, fastQueueSize)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case frame := <-n.deliverQueue:
+				n.deliver(frame.source, frame.data)
+			}
+		}
+	}()
+}
+
+func (n *node) enqueueDeliver(source string, data []byte) {
+	select {
+	case n.deliverQueue <- deliverFrame{source: source, data: data}:
+	default:
+		n.stats.deliveryDrops.Add(1)
+		n.debugf("drop IP packet from %s: TUN queue full", source[:8])
 	}
 }
 
@@ -934,13 +967,14 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			txPackets := current.sentPackets - previous.sentPackets
 			txBytes := current.sentBytes - previous.sentBytes
 			drops := current.queueDrops - previous.queueDrops
+			tunDrops := current.deliveryDrops - previous.deliveryDrops
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			seconds := interval.Seconds()
-			n.logf("fast stats %s: rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queue=%d/%d drops=%d heap=%.1f MiB goroutines=%d",
+			n.logf("fast stats %s: rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d heap=%.1f MiB goroutines=%d",
 				interval, float64(rxPackets)/seconds, float64(rxBytes*8)/seconds/1e6,
 				float64(txPackets)/seconds, float64(txBytes*8)/seconds/1e6,
-				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), drops,
+				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), len(n.deliverQueue), cap(n.deliverQueue), drops, tunDrops,
 				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
 			previous = current
 		}
@@ -952,13 +986,14 @@ type fastStatsSnapshot struct {
 	queueDrops                       uint64
 	sentPackets, sentBytes           uint64
 	deliveredPackets, deliveredBytes uint64
+	deliveryDrops                    uint64
 }
 
 func (n *node) fastStatsSnapshot() fastStatsSnapshot {
 	return fastStatsSnapshot{
 		receivedPackets: n.stats.receivedPackets.Load(), receivedBytes: n.stats.receivedBytes.Load(),
 		queueDrops: n.stats.queueDrops.Load(), sentPackets: n.stats.sentPackets.Load(), sentBytes: n.stats.sentBytes.Load(),
-		deliveredPackets: n.stats.deliveredPackets.Load(), deliveredBytes: n.stats.deliveredBytes.Load(),
+		deliveredPackets: n.stats.deliveredPackets.Load(), deliveredBytes: n.stats.deliveredBytes.Load(), deliveryDrops: n.stats.deliveryDrops.Load(),
 	}
 }
 
@@ -1042,15 +1077,13 @@ func (n *node) receive(ctx context.Context) {
 		}
 	}
 }
-func (n *node) remember(id string) bool { return n.rememberAt(id, time.Now()) }
-
-func (n *node) rememberAt(id string, now time.Time) bool {
+func (n *node) remember(id string) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if _, ok := n.seen[id]; ok {
 		return false
 	}
-	n.seen[id] = now
+	n.seen[id] = struct{}{}
 	if len(n.seen) > 10000 {
 		for k := range n.seen {
 			delete(n.seen, k)
@@ -1059,13 +1092,11 @@ func (n *node) rememberAt(id string, now time.Time) bool {
 	}
 	return true
 }
-func (n *node) touch(id string, a net.Addr) { n.touchAt(id, a, time.Now()) }
-
-func (n *node) touchAt(id string, a net.Addr, now time.Time) {
+func (n *node) touch(id string, a net.Addr) {
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
 		p.last = a
-		p.lastRX = now
+		p.lastRX = time.Now()
 		p.up = true
 	}
 	n.mu.Unlock()
@@ -1256,6 +1287,17 @@ func (n *node) handleLegacyIPFragment(source string, sealed map[string]string) {
 }
 
 func (n *node) acceptIPFragment(source string, plain []byte) {
+	// The current sender emits one fragment for every packet up to maxTUN.
+	// Avoid a mutex, a clock read, reassembly bookkeeping and a goroutine per
+	// packet on this overwhelmingly common path.
+	if len(plain) >= 12 && binary.BigEndian.Uint16(plain[8:10]) == 0 && binary.BigEndian.Uint16(plain[10:12]) == 1 {
+		n.enqueueDeliver(source, plain[12:])
+		return
+	}
+	n.acceptIPFragmentAt(source, plain, time.Now())
+}
+
+func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 	if len(plain) < 12 {
 		return
 	}
@@ -1267,7 +1309,7 @@ func (n *node) acceptIPFragment(source string, plain []byte) {
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	cutoff := time.Now().Add(-10 * time.Second)
+	cutoff := now.Add(-10 * time.Second)
 	for id, state := range n.reassembly {
 		if state.receivedAt.Before(cutoff) {
 			delete(n.reassembly, id)
@@ -1290,7 +1332,7 @@ func (n *node) acceptIPFragment(source string, plain []byte) {
 		return
 	}
 	state.chunks[index] = append([]byte(nil), plain[12:]...)
-	state.receivedAt = time.Now()
+	state.receivedAt = now
 	if len(state.chunks) != int(count) {
 		return
 	}
@@ -1303,7 +1345,7 @@ func (n *node) acceptIPFragment(source string, plain []byte) {
 		packet = append(packet, chunk...)
 	}
 	delete(n.reassembly, stateID)
-	go n.deliver(source, packet)
+	n.enqueueDeliver(source, packet)
 }
 func (n *node) serviceRequest(src, rid string, b map[string]any) {
 	name, _ := b["service"].(string)
@@ -1389,6 +1431,15 @@ func (n *node) close() {
 	}
 }
 
+func (n *node) networkMAC(data, dst []byte) []byte {
+	h := n.macPool.Get().(hash.Hash)
+	h.Reset()
+	h.Write(data)
+	result := h.Sum(dst)
+	n.macPool.Put(h)
+	return result
+}
+
 // Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment | HMAC.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
 	if len(data) < fastHeader+28+fastMAC {
@@ -1396,10 +1447,8 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		return
 	}
 	auth, mac := data[:len(data)-fastMAC], data[len(data)-fastMAC:]
-	h := hmac.New(sha256.New, n.key)
-	h.Write(auth)
 	var expectedMAC [fastMAC]byte
-	if !hmac.Equal(mac, h.Sum(expectedMAC[:0])) {
+	if !hmac.Equal(mac, n.networkMAC(auth, expectedMAC[:0])) {
 		n.debugf("drop fast frame from %s: HMAC failed", a)
 		return
 	}
@@ -1407,21 +1456,20 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	src := hex.EncodeToString(auth[5:21])
 	dst := hex.EncodeToString(auth[21:37])
 	pid := hex.EncodeToString(auth[37:49])
-	now := time.Now()
-	if ttl < 1 || ttl > protocol.DefaultTTL || !n.rememberAt(pid, now) {
+	if ttl < 1 || ttl > protocol.DefaultTTL || !n.remember(pid) {
 		n.debugf("drop fast frame %s->%s: invalid TTL or duplicate", src[:8], dst[:8])
 		return
 	}
-	n.touchAt(src, a, now)
+	// HELLO frames refresh the endpoint and liveness every keepAlive period.
+	// Updating it on every data packet only adds a contended lock and a clock
+	// read to the fast path.
 	if dst != n.id.ID {
 		if n.c.role == "superpeer" && ttl > 1 {
 			// Reserve space for the new MAC while copying: the old frame's
 			// backing array belongs to the UDP read buffer and cannot be reused.
 			auth = append(make([]byte, 0, len(auth)+fastMAC), auth...)
 			auth[4]--
-			h := hmac.New(sha256.New, n.key)
-			h.Write(auth)
-			n.sendFast(dst, h.Sum(auth))
+			n.sendFast(dst, n.networkMAC(auth, auth))
 		}
 		return
 	}
@@ -1532,9 +1580,7 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	copy(pkt[21:], target)
 	copy(pkt[37:], packetID)
 	pkt = append(pkt, sealed...)
-	h := hmac.New(sha256.New, n.key)
-	h.Write(pkt)
-	return n.sendFast(dst, h.Sum(pkt))
+	return n.sendFast(dst, n.networkMAC(pkt, pkt))
 }
 func (n *node) deliver(src string, p []byte) {
 	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
