@@ -935,10 +935,11 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			drops := current.queueDrops - previous.queueDrops
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
-			n.logf("fast stats %s: rx=%d pps %.2f Mbps tx=%d pps %.2f Mbps tun=%d pps queue=%d/%d drops=%d heap=%.1f MiB goroutines=%d",
-				interval, rxPackets, float64(rxBytes*8)/interval.Seconds()/1e6,
-				txPackets, float64(txBytes*8)/interval.Seconds()/1e6,
-				current.deliveredPackets-previous.deliveredPackets, len(n.fastQueue), cap(n.fastQueue), drops,
+			seconds := interval.Seconds()
+			n.logf("fast stats %s: rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queue=%d/%d drops=%d heap=%.1f MiB goroutines=%d",
+				interval, float64(rxPackets)/seconds, float64(rxBytes*8)/seconds/1e6,
+				float64(txPackets)/seconds, float64(txBytes*8)/seconds/1e6,
+				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), drops,
 				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
 			previous = current
 		}
