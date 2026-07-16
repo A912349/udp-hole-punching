@@ -222,7 +222,7 @@ func parse() config {
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
-	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = CPU count, max 16)")
+	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = up to 4, max 16)")
 	f.DurationVar(&c.statsInterval, "stats-interval", 0, "log fast-path throughput and queue statistics (0 = off)")
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
@@ -875,6 +875,7 @@ func (n *node) startFastWorkers(ctx context.Context) {
 	workers := n.c.fastWorkers
 	if workers <= 0 {
 		workers = runtime.GOMAXPROCS(0)
+		workers = min(workers, 4)
 	}
 	workers = min(workers, 16)
 	n.fastQueue = make(chan fastFrame, fastQueueSize)
@@ -1041,13 +1042,15 @@ func (n *node) receive(ctx context.Context) {
 		}
 	}
 }
-func (n *node) remember(id string) bool {
+func (n *node) remember(id string) bool { return n.rememberAt(id, time.Now()) }
+
+func (n *node) rememberAt(id string, now time.Time) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if _, ok := n.seen[id]; ok {
 		return false
 	}
-	n.seen[id] = time.Now()
+	n.seen[id] = now
 	if len(n.seen) > 10000 {
 		for k := range n.seen {
 			delete(n.seen, k)
@@ -1056,11 +1059,13 @@ func (n *node) remember(id string) bool {
 	}
 	return true
 }
-func (n *node) touch(id string, a net.Addr) {
+func (n *node) touch(id string, a net.Addr) { n.touchAt(id, a, time.Now()) }
+
+func (n *node) touchAt(id string, a net.Addr, now time.Time) {
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
 		p.last = a
-		p.lastRX = time.Now()
+		p.lastRX = now
 		p.up = true
 	}
 	n.mu.Unlock()
@@ -1402,11 +1407,12 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	src := hex.EncodeToString(auth[5:21])
 	dst := hex.EncodeToString(auth[21:37])
 	pid := hex.EncodeToString(auth[37:49])
-	if ttl < 1 || ttl > protocol.DefaultTTL || !n.remember(pid) {
+	now := time.Now()
+	if ttl < 1 || ttl > protocol.DefaultTTL || !n.rememberAt(pid, now) {
 		n.debugf("drop fast frame %s->%s: invalid TTL or duplicate", src[:8], dst[:8])
 		return
 	}
-	n.touch(src, a)
+	n.touchAt(src, a, now)
 	if dst != n.id.ID {
 		if n.c.role == "superpeer" && ttl > 1 {
 			// Reserve space for the new MAC while copying: the old frame's
