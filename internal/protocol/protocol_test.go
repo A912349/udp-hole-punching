@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/sha256"
 	"testing"
 )
@@ -70,4 +71,28 @@ func TestSealedPayloadRoundTrip(t *testing.T) {
 	if !bytes.Equal(fastOpened, plain) {
 		t.Fatalf("fast frame got %q, want %q", fastOpened, plain)
 	}
+	sequence, err := NewNonceSequence()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := SealBytesWithSequence(mustAEAD(t, leftKey), sequence, plain, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := SealBytesWithSequence(mustAEAD(t, leftKey), sequence, plain, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(first[:12], second[:12]) {
+		t.Fatal("nonce sequence reused a nonce")
+	}
+}
+
+func mustAEAD(t *testing.T, key []byte) cipher.AEAD {
+	t.Helper()
+	aead, err := NewAEAD(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return aead
 }

@@ -3,16 +3,19 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -134,14 +137,62 @@ func SealBytes(key, plaintext, aad []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, a.NonceSize())
-	if _, err = rand.Read(nonce); err != nil {
+	return SealBytesWithAEAD(a, plaintext, aad)
+}
+
+// SealBytesWithAEAD avoids recreating the ChaCha20-Poly1305 state for every
+// TUN frame when callers already cache a peer's static session key.
+func SealBytesWithAEAD(a cipher.AEAD, plaintext, aad []byte) ([]byte, error) {
+	// One allocation holds nonce and encrypted payload. The ciphertext is
+	// appended after the nonce, so the nonce remains intact while Seal reads it.
+	frame := make([]byte, a.NonceSize(), a.NonceSize()+len(plaintext)+a.Overhead())
+	if _, err := rand.Read(frame); err != nil {
 		return nil, err
 	}
 	// Fast TUN frames are binary on the wire. Do not route them through the
 	// JSON helper: Base64 encode + decode here used to allocate and copy every
 	// packet twice under load.
-	return a.Seal(nonce, nonce, plaintext, aad), nil
+	return a.Seal(frame, frame[:a.NonceSize()], plaintext, aad), nil
+}
+
+// NonceSequence produces unique 96-bit ChaCha20-Poly1305 nonces for one
+// sender/key pair: a random 64-bit per-session prefix and a packet counter.
+// It avoids an operating-system randomness syscall for every data-plane frame.
+type NonceSequence struct {
+	prefix  [8]byte
+	counter atomic.Uint32
+}
+
+func NewNonceSequence() (*NonceSequence, error) {
+	sequence := &NonceSequence{}
+	if _, err := rand.Read(sequence.prefix[:]); err != nil {
+		return nil, err
+	}
+	return sequence, nil
+}
+
+func (s *NonceSequence) Next() ([]byte, error) {
+	count := s.counter.Add(1)
+	if count == 0 {
+		return nil, fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
+	}
+	nonce := make([]byte, chacha20poly1305.NonceSize)
+	copy(nonce, s.prefix[:])
+	binary.BigEndian.PutUint32(nonce[8:], count)
+	return nonce, nil
+}
+
+func SealBytesWithSequence(a cipher.AEAD, sequence *NonceSequence, plaintext, aad []byte) ([]byte, error) {
+	if a.NonceSize() != chacha20poly1305.NonceSize {
+		return nil, fmt.Errorf("%w: unsupported nonce size", ErrProtocol)
+	}
+	nonce, err := sequence.Next()
+	if err != nil {
+		return nil, err
+	}
+	frame := make([]byte, len(nonce), len(nonce)+len(plaintext)+a.Overhead())
+	copy(frame, nonce)
+	return a.Seal(frame, nonce, plaintext, aad), nil
 }
 func OpenBytes(key, sealed, aad []byte) ([]byte, error) {
 	if len(sealed) < 28 {
@@ -151,8 +202,17 @@ func OpenBytes(key, sealed, aad []byte) ([]byte, error) {
 	if e != nil {
 		return nil, e
 	}
-	return a.Open(nil, sealed[:12], sealed[12:], aad)
+	return OpenBytesWithAEAD(a, sealed, aad)
 }
+
+func OpenBytesWithAEAD(a cipher.AEAD, sealed, aad []byte) ([]byte, error) {
+	if len(sealed) < a.NonceSize()+a.Overhead() {
+		return nil, fmt.Errorf("%w: truncated encrypted payload", ErrProtocol)
+	}
+	return a.Open(nil, sealed[:a.NonceSize()], sealed[a.NonceSize():], aad)
+}
+
+func NewAEAD(key []byte) (cipher.AEAD, error) { return chacha20poly1305.New(key) }
 
 type Packet struct {
 	Type        string         `json:"type"`

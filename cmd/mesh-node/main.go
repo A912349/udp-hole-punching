@@ -2,8 +2,10 @@
 package main
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -47,6 +49,8 @@ const (
 	fastHeader            = 49
 	maxTUN                = 1279
 )
+
+var fastMagicBytes = []byte(fastMagic)
 
 type config struct {
 	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile string
@@ -94,6 +98,8 @@ type serviceResult struct {
 type cachedKey struct {
 	public string
 	key    []byte
+	aead   cipher.AEAD
+	nonces *protocol.NonceSequence
 }
 type reassembly struct {
 	count      uint16
@@ -831,12 +837,12 @@ func (n *node) receive(ctx context.Context) {
 			}
 			continue
 		}
-		d := append([]byte(nil), b[:l]...)
-		if strings.HasPrefix(string(d), fastMagic) {
-			n.fast(d, a)
+		datagram := b[:l]
+		if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
+			n.fast(datagram, a)
 			continue
 		}
-		p, e := protocol.DecodePacket(d, n.key)
+		p, e := protocol.DecodePacket(datagram, n.key)
 		if e != nil || !n.remember(p.ID) {
 			continue
 		}
@@ -941,11 +947,45 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 	}
 	k, e := protocol.SharedKey(n.id.Private, p.Public)
 	if e == nil {
+		aead, cipherErr := protocol.NewAEAD(k)
+		if cipherErr != nil {
+			return nil, nil, cipherErr
+		}
+		nonces, nonceErr := protocol.NewNonceSequence()
+		if nonceErr != nil {
+			return nil, nil, nonceErr
+		}
 		n.mu.Lock()
-		n.sharedKeys[id] = cachedKey{public: p.Public, key: k}
+		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces}
 		n.mu.Unlock()
 	}
 	return k, p, e
+}
+
+func (n *node) peerAEAD(id string) (cipher.AEAD, error) {
+	if _, _, err := n.peerKey(id); err != nil {
+		return nil, err
+	}
+	n.mu.RLock()
+	cached, ok := n.sharedKeys[id]
+	n.mu.RUnlock()
+	if !ok || cached.aead == nil {
+		return nil, errors.New("missing peer cipher")
+	}
+	return cached.aead, nil
+}
+
+func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, error) {
+	if _, _, err := n.peerKey(id); err != nil {
+		return nil, nil, err
+	}
+	n.mu.RLock()
+	cached, ok := n.sharedKeys[id]
+	n.mu.RUnlock()
+	if !ok || cached.aead == nil || cached.nonces == nil {
+		return nil, nil, errors.New("missing peer cipher")
+	}
+	return cached.aead, cached.nonces, nil
 }
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	k, _, e := n.peerKey(dst)
@@ -1205,12 +1245,12 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		}
 		return
 	}
-	k, _, e := n.peerKey(src)
+	aead, e := n.peerAEAD(src)
 	if e != nil {
 		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
-	plain, e := protocol.OpenBytes(k, auth[fastHeader:], []byte(src+":"+dst))
+	plain, e := protocol.OpenBytesWithAEAD(aead, auth[fastHeader:], []byte(src+":"+dst))
 	if e != nil {
 		n.debugf("drop fast frame %s->%s: decrypt failed: %v", src[:8], dst[:8], e)
 		return
@@ -1284,7 +1324,7 @@ func (n *node) tunLoop(ctx context.Context) {
 	}
 }
 func (n *node) sendIP(dst string, p []byte) bool {
-	k, _, e := n.peerKey(dst)
+	aead, nonces, e := n.peerCipher(dst)
 	if e != nil {
 		n.debugf("IP send to %s: %v", dst[:8], e)
 		return false
@@ -1302,7 +1342,7 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	binary.BigEndian.PutUint16(plain[8:], 0)
 	binary.BigEndian.PutUint16(plain[10:], 1)
 	copy(plain[12:], p)
-	sealed, e := protocol.SealBytes(k, plain, []byte(n.id.ID+":"+dst))
+	sealed, e := protocol.SealBytesWithSequence(aead, nonces, plain, []byte(n.id.ID+":"+dst))
 	if e != nil {
 		return false
 	}
