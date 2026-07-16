@@ -186,13 +186,18 @@ func SealBytesWithSequence(a cipher.AEAD, sequence *NonceSequence, plaintext, aa
 	if a.NonceSize() != chacha20poly1305.NonceSize {
 		return nil, fmt.Errorf("%w: unsupported nonce size", ErrProtocol)
 	}
-	nonce, err := sequence.Next()
-	if err != nil {
-		return nil, err
+	count := sequence.counter.Add(1)
+	if count == 0 {
+		return nil, fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
 	}
+	// Keep the nonce on the stack.  The frame itself owns the wire nonce, so
+	// allocating a separate []byte for it on every TUN packet is unnecessary.
+	var nonce [chacha20poly1305.NonceSize]byte
+	copy(nonce[:], sequence.prefix[:])
+	binary.BigEndian.PutUint32(nonce[8:], count)
 	frame := make([]byte, len(nonce), len(nonce)+len(plaintext)+a.Overhead())
-	copy(frame, nonce)
-	return a.Seal(frame, nonce, plaintext, aad), nil
+	copy(frame, nonce[:])
+	return a.Seal(frame, nonce[:], plaintext, aad), nil
 }
 func OpenBytes(key, sealed, aad []byte) ([]byte, error) {
 	if len(sealed) < 28 {

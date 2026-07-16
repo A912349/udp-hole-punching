@@ -96,10 +96,12 @@ type serviceResult struct {
 	Error string `json:"error"`
 }
 type cachedKey struct {
-	public string
-	key    []byte
-	aead   cipher.AEAD
-	nonces *protocol.NonceSequence
+	public  string
+	key     []byte
+	aead    cipher.AEAD
+	nonces  *protocol.NonceSequence
+	openAAD []byte
+	sealAAD []byte
 }
 type reassembly struct {
 	count      uint16
@@ -121,6 +123,7 @@ type node struct {
 	neighbors map[string]*peer
 	links     []edge
 	routes    map[string]string
+	meshNodes map[netip.Addr]string
 	seen      map[string]time.Time
 	pending   map[string]chan serviceResult
 	services  map[string]string
@@ -267,6 +270,7 @@ func newNode(c config) (*node, error) {
 		dir:                map[string]*peer{},
 		neighbors:          map[string]*peer{},
 		routes:             map[string]string{},
+		meshNodes:          map[netip.Addr]string{},
 		seen:               map[string]time.Time{},
 		pending:            map[string]chan serviceResult{},
 		services:           map[string]string{},
@@ -357,12 +361,19 @@ func (n *node) bootstrap() error {
 	n.mu.Lock()
 	old := n.neighbors
 	n.dir = map[string]*peer{}
+	n.meshNodes = map[netip.Addr]string{}
 	for _, v := range t.Directory {
 		p := v
 		n.dir[p.ID] = &p
+		if ip, err := netip.ParseAddr(p.MeshIP); err == nil {
+			n.meshNodes[ip] = p.ID
+		}
 	}
 	p := t.Self
 	n.dir[p.ID] = &p
+	if ip, err := netip.ParseAddr(p.MeshIP); err == nil {
+		n.meshNodes[ip] = p.ID
+	}
 	n.neighbors = map[string]*peer{}
 	for _, v := range t.Neighbors {
 		p := v
@@ -956,36 +967,36 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 			return nil, nil, nonceErr
 		}
 		n.mu.Lock()
-		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces}
+		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
 		n.mu.Unlock()
 	}
 	return k, p, e
 }
 
-func (n *node) peerAEAD(id string) (cipher.AEAD, error) {
-	if _, _, err := n.peerKey(id); err != nil {
-		return nil, err
-	}
-	n.mu.RLock()
-	cached, ok := n.sharedKeys[id]
-	n.mu.RUnlock()
-	if !ok || cached.aead == nil {
-		return nil, errors.New("missing peer cipher")
-	}
-	return cached.aead, nil
-}
-
-func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, error) {
+func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
 	if _, _, err := n.peerKey(id); err != nil {
 		return nil, nil, err
 	}
 	n.mu.RLock()
 	cached, ok := n.sharedKeys[id]
 	n.mu.RUnlock()
-	if !ok || cached.aead == nil || cached.nonces == nil {
+	if !ok || cached.aead == nil {
 		return nil, nil, errors.New("missing peer cipher")
 	}
-	return cached.aead, cached.nonces, nil
+	return cached.aead, cached.openAAD, nil
+}
+
+func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, error) {
+	if _, _, err := n.peerKey(id); err != nil {
+		return nil, nil, nil, err
+	}
+	n.mu.RLock()
+	cached, ok := n.sharedKeys[id]
+	n.mu.RUnlock()
+	if !ok || cached.aead == nil || cached.nonces == nil {
+		return nil, nil, nil, errors.New("missing peer cipher")
+	}
+	return cached.aead, cached.nonces, cached.sealAAD, nil
 }
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	k, _, e := n.peerKey(dst)
@@ -1222,7 +1233,8 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	auth, mac := data[:len(data)-fastMAC], data[len(data)-fastMAC:]
 	h := hmac.New(sha256.New, n.key)
 	h.Write(auth)
-	if !hmac.Equal(mac, h.Sum(nil)) {
+	var expectedMAC [fastMAC]byte
+	if !hmac.Equal(mac, h.Sum(expectedMAC[:0])) {
 		n.debugf("drop fast frame from %s: HMAC failed", a)
 		return
 	}
@@ -1237,20 +1249,22 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	n.touch(src, a)
 	if dst != n.id.ID {
 		if n.c.role == "superpeer" && ttl > 1 {
-			auth = append([]byte(nil), auth...)
+			// Reserve space for the new MAC while copying: the old frame's
+			// backing array belongs to the UDP read buffer and cannot be reused.
+			auth = append(make([]byte, 0, len(auth)+fastMAC), auth...)
 			auth[4]--
 			h := hmac.New(sha256.New, n.key)
 			h.Write(auth)
-			n.sendFast(dst, append(auth, h.Sum(nil)...))
+			n.sendFast(dst, h.Sum(auth))
 		}
 		return
 	}
-	aead, e := n.peerAEAD(src)
+	aead, aad, e := n.peerAEAD(src)
 	if e != nil {
 		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
-	plain, e := protocol.OpenBytesWithAEAD(aead, auth[fastHeader:], []byte(src+":"+dst))
+	plain, e := protocol.OpenBytesWithAEAD(aead, auth[fastHeader:], aad)
 	if e != nil {
 		n.debugf("drop fast frame %s->%s: decrypt failed: %v", src[:8], dst[:8], e)
 		return
@@ -1306,12 +1320,7 @@ func (n *node) tunLoop(ctx context.Context) {
 			continue
 		}
 		n.mu.RLock()
-		var dst string
-		for id, p := range n.dir {
-			if p.MeshIP == dstIP {
-				dst = id
-			}
-		}
+		dst := n.meshNodes[netip.AddrFrom4([4]byte(b[16:20]))]
 		n.mu.RUnlock()
 		if dst == "" {
 			n.debugf("drop TUN frame: no node owns %s", dstIP)
@@ -1324,7 +1333,7 @@ func (n *node) tunLoop(ctx context.Context) {
 	}
 }
 func (n *node) sendIP(dst string, p []byte) bool {
-	aead, nonces, e := n.peerCipher(dst)
+	aead, nonces, aad, e := n.peerCipher(dst)
 	if e != nil {
 		n.debugf("IP send to %s: %v", dst[:8], e)
 		return false
@@ -1342,13 +1351,13 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	binary.BigEndian.PutUint16(plain[8:], 0)
 	binary.BigEndian.PutUint16(plain[10:], 1)
 	copy(plain[12:], p)
-	sealed, e := protocol.SealBytesWithSequence(aead, nonces, plain, []byte(n.id.ID+":"+dst))
+	sealed, e := protocol.SealBytesWithSequence(aead, nonces, plain, aad)
 	if e != nil {
 		return false
 	}
 	src, _ := hex.DecodeString(n.id.ID)
 	target, _ := hex.DecodeString(dst)
-	pkt := make([]byte, fastHeader)
+	pkt := make([]byte, fastHeader, fastHeader+len(sealed)+fastMAC)
 	copy(pkt, fastMagic)
 	pkt[4] = protocol.DefaultTTL
 	copy(pkt[5:], src)
@@ -1357,7 +1366,7 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	pkt = append(pkt, sealed...)
 	h := hmac.New(sha256.New, n.key)
 	h.Write(pkt)
-	return n.sendFast(dst, append(pkt, h.Sum(nil)...))
+	return n.sendFast(dst, h.Sum(pkt))
 }
 func (n *node) deliver(src string, p []byte) {
 	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
