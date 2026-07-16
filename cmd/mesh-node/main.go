@@ -22,10 +22,12 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"golang.org/x/net/ipv4"
 	"home-udp-mesh/internal/protocol"
 )
 
@@ -48,6 +50,9 @@ const (
 	fastMAC               = 32
 	fastHeader            = 49
 	maxTUN                = 1279
+	fastBatchSize         = 32
+	fastQueueSize         = 1024
+	maxFastFrame          = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
 )
 
 var fastMagicBytes = []byte(fastMagic)
@@ -56,6 +61,7 @@ type config struct {
 	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile string
 	port, capacity, prefix                                                          int
 	noRelay, autoTUN, debug                                                         bool
+	fastWorkers                                                                     int
 	services, allows                                                                multi
 }
 type multi []string
@@ -112,11 +118,16 @@ type symmetricReply struct {
 	conn *net.UDPConn
 	addr *net.UDPAddr
 }
+type fastFrame struct {
+	data []byte
+	addr *net.UDPAddr
+}
 type node struct {
 	c         config
 	id        *protocol.Identity
 	key       []byte
 	conn      *net.UDPConn
+	packet    *ipv4.PacketConn
 	client    *http.Client
 	mu        sync.RWMutex
 	dir       map[string]*peer
@@ -131,6 +142,8 @@ type node struct {
 	stop      context.CancelFunc
 	tun       *os.File
 	startedAt time.Time
+	fastQueue chan fastFrame
+	fastPool  sync.Pool
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -199,6 +212,7 @@ func parse() config {
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
+	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = CPU count, max 16)")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
 	f.Parse(os.Args[1:])
@@ -266,6 +280,7 @@ func newNode(c config) (*node, error) {
 		id:                 id,
 		key:                k[:],
 		conn:               conn,
+		packet:             ipv4.NewPacketConn(conn),
 		client:             &http.Client{Timeout: 10 * time.Second},
 		dir:                map[string]*peer{},
 		neighbors:          map[string]*peer{},
@@ -500,6 +515,7 @@ func (n *node) start() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.stop = cancel
+	n.startFastWorkers(ctx)
 	go n.receive(ctx)
 	go n.periodic(ctx, keepAlive, n.helloAll)
 	go n.periodic(ctx, refresh, func() {
@@ -834,11 +850,61 @@ func (n *node) nextHop(destination string) (string, *peer) {
 	n.logf("route failover %s -> %s", destination[:8], hop[:8])
 	return hop, peer
 }
+func (n *node) startFastWorkers(ctx context.Context) {
+	workers := n.c.fastWorkers
+	if workers <= 0 {
+		workers = runtime.GOMAXPROCS(0)
+	}
+	workers = min(workers, 16)
+	n.fastQueue = make(chan fastFrame, fastQueueSize)
+	n.fastPool.New = func() any { return make([]byte, maxFastFrame) }
+	for range workers {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case frame, ok := <-n.fastQueue:
+					if !ok {
+						return
+					}
+					n.fast(frame.data, frame.addr)
+					n.fastPool.Put(frame.data[:maxFastFrame])
+				}
+			}
+		}()
+	}
+}
+
+func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
+	if len(data) > maxFastFrame {
+		n.debugf("drop fast frame from %s: exceeds MTU (%d bytes)", addr, len(data))
+		return
+	}
+	// ReadBatch reuses its buffers after this call. Copy only fast packets into
+	// a bounded pool so workers can decrypt in parallel without retaining the
+	// 60 KiB control-plane receive buffers.
+	owned := n.fastPool.Get().([]byte)[:len(data)]
+	copy(owned, data)
+	select {
+	case n.fastQueue <- fastFrame{data: owned, addr: addr}:
+	default:
+		// UDP has no backpressure. A bounded queue makes overload a visible
+		// packet drop instead of an unbounded allocation or stalled receiver.
+		n.fastPool.Put(owned[:maxFastFrame])
+		n.debugf("drop fast frame from %s: worker queue full", addr)
+	}
+}
+
 func (n *node) receive(ctx context.Context) {
-	b := make([]byte, 65535)
+	messages := make([]ipv4.Message, fastBatchSize)
+	for i := range messages {
+		messages[i].Buffers = [][]byte{make([]byte, protocol.MaxDatagramSize)}
+	}
+	defer close(n.fastQueue)
 	for {
-		n.conn.SetReadDeadline(time.Now().Add(time.Second))
-		l, a, e := n.conn.ReadFromUDP(b)
+		n.packet.SetReadDeadline(time.Now().Add(time.Second))
+		count, e := n.packet.ReadBatch(messages, 0)
 		if e != nil {
 			if ctx.Err() != nil {
 				return
@@ -848,36 +914,42 @@ func (n *node) receive(ctx context.Context) {
 			}
 			continue
 		}
-		datagram := b[:l]
-		if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
-			n.fast(datagram, a)
-			continue
-		}
-		p, e := protocol.DecodePacket(datagram, n.key)
-		if e != nil || !n.remember(p.ID) {
-			continue
-		}
-		n.touch(p.Source, a)
-		if p.Destination != n.id.ID {
-			if n.c.role == "superpeer" {
-				if q, e := p.DecTTL(); e == nil {
-					n.send(q)
-				}
+		for _, message := range messages[:count] {
+			datagram := message.Buffers[0][:message.N]
+			a, ok := message.Addr.(*net.UDPAddr)
+			if !ok {
+				continue
 			}
-			continue
-		}
-		switch p.Type {
-		case "HELLO":
-			n.ensureNeighbor(p.Source)
-			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
-		case "HELLO_ACK":
-			n.completeSymmetricScan(p.Source)
-		case "SYMMETRIC_BURST":
-			n.ensureNeighbor(p.Source)
-			n.handleSymmetricBurst(p)
-		case "DATA":
-			n.ensureNeighbor(p.Source)
-			n.data(p)
+			if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
+				n.enqueueFast(datagram, a)
+				continue
+			}
+			p, e := protocol.DecodePacket(datagram, n.key)
+			if e != nil || !n.remember(p.ID) {
+				continue
+			}
+			n.touch(p.Source, a)
+			if p.Destination != n.id.ID {
+				if n.c.role == "superpeer" {
+					if q, e := p.DecTTL(); e == nil {
+						n.send(q)
+					}
+				}
+				continue
+			}
+			switch p.Type {
+			case "HELLO":
+				n.ensureNeighbor(p.Source)
+				n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
+			case "HELLO_ACK":
+				n.completeSymmetricScan(p.Source)
+			case "SYMMETRIC_BURST":
+				n.ensureNeighbor(p.Source)
+				n.handleSymmetricBurst(p)
+			case "DATA":
+				n.ensureNeighbor(p.Source)
+				n.data(p)
+			}
 		}
 	}
 }
