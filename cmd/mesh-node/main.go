@@ -1245,7 +1245,7 @@ func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
 	b := make([]byte, maxTUN+1)
 	for {
-		l, e := n.tun.Read(b)
+		l, e := readTUN(n.tun, b)
 		if e != nil {
 			if ctx.Err() == nil {
 				n.logf("TUN read failed: %v", e)

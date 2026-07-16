@@ -37,6 +37,14 @@ func openTUN(name string) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// readTUN deliberately bypasses os.File.Read. Go's runtime poller rejects
+// some /dev/net/tun implementations with "not pollable", while the raw Linux
+// read(2) syscall is valid and blocks until the kernel supplies an IP frame.
+func readTUN(file *os.File, buffer []byte) (int, error) {
+	return syscall.Read(int(file.Fd()), buffer)
+}
+
 func configureTUN(name, ip string, prefix int) error {
 	address, e := netip.ParseAddr(ip)
 	if e != nil || !address.Is4() {
