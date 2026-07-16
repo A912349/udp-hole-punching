@@ -51,7 +51,7 @@ const (
 type config struct {
 	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile string
 	port, capacity, prefix                                                          int
-	noRelay, autoTUN                                                                bool
+	noRelay, autoTUN, debug                                                         bool
 	services, allows                                                                multi
 }
 type multi []string
@@ -189,6 +189,7 @@ func parse() config {
 	f.Var(&c.services, "service", "publish NAME=HOST:PORT")
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
+	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
 	f.Parse(os.Args[1:])
@@ -292,6 +293,11 @@ func newNode(c config) (*node, error) {
 	return n, nil
 }
 func (n *node) logf(f string, a ...any) { log.Printf("[%s] %s", n.id.ID[:8], fmt.Sprintf(f, a...)) }
+func (n *node) debugf(f string, a ...any) {
+	if n.c.debug {
+		n.logf(f, a...)
+	}
+}
 func (n *node) request(method, path string, in, out any) error {
 	var body io.Reader
 	if in != nil {
@@ -1170,12 +1176,14 @@ func (n *node) close() {
 // Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment | HMAC.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
 	if len(data) < fastHeader+28+fastMAC {
+		n.debugf("drop fast frame from %s: truncated (%d bytes)", a, len(data))
 		return
 	}
 	auth, mac := data[:len(data)-fastMAC], data[len(data)-fastMAC:]
 	h := hmac.New(sha256.New, n.key)
 	h.Write(auth)
 	if !hmac.Equal(mac, h.Sum(nil)) {
+		n.debugf("drop fast frame from %s: HMAC failed", a)
 		return
 	}
 	ttl := int(auth[4])
@@ -1183,6 +1191,7 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	dst := hex.EncodeToString(auth[21:37])
 	pid := hex.EncodeToString(auth[37:49])
 	if ttl < 1 || ttl > protocol.DefaultTTL || !n.remember(pid) {
+		n.debugf("drop fast frame %s->%s: invalid TTL or duplicate", src[:8], dst[:8])
 		return
 	}
 	n.touch(src, a)
@@ -1198,17 +1207,21 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	}
 	k, _, e := n.peerKey(src)
 	if e != nil {
+		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
 	plain, e := protocol.OpenBytes(k, auth[fastHeader:], []byte(src+":"+dst))
 	if e != nil {
+		n.debugf("drop fast frame %s->%s: decrypt failed: %v", src[:8], dst[:8], e)
 		return
 	}
+	n.debugf("fast frame %s->%s received (%d bytes encrypted)", src[:8], dst[:8], len(data))
 	n.acceptIPFragment(src, plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
 	_, p := n.nextHop(dst)
 	if !n.usable(p) {
+		n.debugf("fast send to %s: no usable route", dst[:8])
 		return false
 	}
 	a := p.last
@@ -1216,11 +1229,17 @@ func (n *node) sendFast(dst string, data []byte) bool {
 		var e error
 		a, e = net.ResolveUDPAddr("udp", p.Endpoint)
 		if e != nil {
+			n.debugf("fast send to %s: invalid endpoint %q: %v", dst[:8], p.Endpoint, e)
 			return false
 		}
 	}
 	_, e := n.conn.WriteToUDP(data, a.(*net.UDPAddr))
-	return e == nil
+	if e != nil {
+		n.debugf("fast send to %s via %s failed: %v", dst[:8], a, e)
+		return false
+	}
+	n.debugf("fast frame sent to %s via %s (%d bytes)", dst[:8], a, len(data))
+	return true
 }
 func (n *node) tunLoop(ctx context.Context) {
 	b := make([]byte, maxTUN+1)
@@ -1230,11 +1249,13 @@ func (n *node) tunLoop(ctx context.Context) {
 			return
 		}
 		if l < 20 || b[0]>>4 != 4 || l > maxTUN {
+			n.debugf("drop TUN frame: invalid IPv4 or exceeds MTU (%d bytes)", l)
 			continue
 		}
 		src := netip.AddrFrom4([4]byte(b[12:16])).String()
 		dstIP := netip.AddrFrom4([4]byte(b[16:20])).String()
 		if src != n.c.meshIP {
+			n.debugf("drop TUN frame: source %s is not local mesh IP", src)
 			continue
 		}
 		n.mu.RLock()
@@ -1246,23 +1267,28 @@ func (n *node) tunLoop(ctx context.Context) {
 		}
 		n.mu.RUnlock()
 		if dst == "" {
+			n.debugf("drop TUN frame: no node owns %s", dstIP)
 			continue
 		}
-		n.sendIP(dst, b[:l])
+		n.debugf("TUN IPv4 %s -> %s (%d bytes)", src, dstIP, l)
+		if !n.sendIP(dst, b[:l]) {
+			n.debugf("TUN IPv4 %s -> %s: send failed", src, dstIP)
+		}
 	}
 }
-func (n *node) sendIP(dst string, p []byte) {
+func (n *node) sendIP(dst string, p []byte) bool {
 	k, _, e := n.peerKey(dst)
 	if e != nil {
-		return
+		n.debugf("IP send to %s: %v", dst[:8], e)
+		return false
 	}
 	fragmentID := make([]byte, 8)
 	packetID := make([]byte, 12)
 	if _, e = rand.Read(fragmentID); e != nil {
-		return
+		return false
 	}
 	if _, e = rand.Read(packetID); e != nil {
-		return
+		return false
 	}
 	plain := make([]byte, 12+len(p))
 	copy(plain, fragmentID)
@@ -1271,7 +1297,7 @@ func (n *node) sendIP(dst string, p []byte) {
 	copy(plain[12:], p)
 	sealed, e := protocol.SealBytes(k, plain, []byte(n.id.ID+":"+dst))
 	if e != nil {
-		return
+		return false
 	}
 	src, _ := hex.DecodeString(n.id.ID)
 	target, _ := hex.DecodeString(dst)
@@ -1284,10 +1310,11 @@ func (n *node) sendIP(dst string, p []byte) {
 	pkt = append(pkt, sealed...)
 	h := hmac.New(sha256.New, n.key)
 	h.Write(pkt)
-	n.sendFast(dst, append(pkt, h.Sum(nil)...))
+	return n.sendFast(dst, append(pkt, h.Sum(nil)...))
 }
 func (n *node) deliver(src string, p []byte) {
 	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
+		n.debugf("drop IP packet from %s: invalid packet or TUN disabled", src[:8])
 		return
 	}
 	n.mu.RLock()
@@ -1297,9 +1324,14 @@ func (n *node) deliver(src string, p []byte) {
 	}
 	n.mu.RUnlock()
 	if netip.AddrFrom4([4]byte(p[12:16])).String() != expected || netip.AddrFrom4([4]byte(p[16:20])).String() != n.c.meshIP {
+		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
 		return
 	}
-	n.tun.Write(p)
+	if _, err := n.tun.Write(p); err != nil {
+		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
+		return
+	}
+	n.debugf("TUN IPv4 delivered from %s (%d bytes)", src[:8], len(p))
 }
 func min(a, b int) int {
 	if a < b {
