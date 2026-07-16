@@ -743,7 +743,7 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	}
 	n.deliver(src, plain[12:])
 }
-func (n *node) sendFast(dst, data []byte) bool {
+func (n *node) sendFast(dst string, data []byte) bool {
 	n.mu.RLock()
 	p := n.neighbors[n.routes[dst]]
 	n.mu.RUnlock()
