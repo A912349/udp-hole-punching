@@ -19,12 +19,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -58,11 +60,12 @@ const (
 var fastMagicBytes = []byte(fastMagic)
 
 type config struct {
-	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile string
-	port, capacity, prefix                                                          int
-	noRelay, autoTUN, debug                                                         bool
-	fastWorkers                                                                     int
-	services, allows                                                                multi
+	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen string
+	port, capacity, prefix                                                                       int
+	noRelay, autoTUN, debug                                                                      bool
+	fastWorkers                                                                                  int
+	statsInterval                                                                                time.Duration
+	services, allows                                                                             multi
 }
 type multi []string
 
@@ -122,6 +125,12 @@ type fastFrame struct {
 	data []byte
 	addr *net.UDPAddr
 }
+type fastStats struct {
+	receivedPackets, receivedBytes   atomic.Uint64
+	queueDrops                       atomic.Uint64
+	sentPackets, sentBytes           atomic.Uint64
+	deliveredPackets, deliveredBytes atomic.Uint64
+}
 type node struct {
 	c         config
 	id        *protocol.Identity
@@ -144,6 +153,7 @@ type node struct {
 	startedAt time.Time
 	fastQueue chan fastFrame
 	fastPool  sync.Pool
+	stats     fastStats
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -213,6 +223,8 @@ func parse() config {
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
 	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = CPU count, max 16)")
+	f.DurationVar(&c.statsInterval, "stats-interval", 0, "log fast-path throughput and queue statistics (0 = off)")
+	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
 	f.Parse(os.Args[1:])
@@ -222,6 +234,9 @@ func parse() config {
 	}
 	if c.role != "auto" && c.role != "client" && c.role != "superpeer" {
 		log.Fatal("invalid --role")
+	}
+	if c.statsInterval < 0 {
+		log.Fatal("--stats-interval must not be negative")
 	}
 	return c
 }
@@ -515,6 +530,9 @@ func (n *node) start() error {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	n.stop = cancel
+	if e := n.startPprof(); e != nil {
+		return e
+	}
 	n.startFastWorkers(ctx)
 	go n.receive(ctx)
 	go n.periodic(ctx, keepAlive, n.helloAll)
@@ -529,6 +547,9 @@ func (n *node) start() error {
 		}
 	})
 	go n.linkHealth(ctx)
+	if n.c.statsInterval > 0 {
+		go n.statsLoop(ctx, n.c.statsInterval)
+	}
 	if n.tun != nil {
 		go n.tunLoop(ctx)
 	}
@@ -876,7 +897,72 @@ func (n *node) startFastWorkers(ctx context.Context) {
 	}
 }
 
+func (n *node) startPprof() error {
+	if n.c.pprofListen == "" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(n.c.pprofListen)
+	if err != nil {
+		return fmt.Errorf("invalid --pprof-listen: %w", err)
+	}
+	ip := net.ParseIP(host)
+	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return errors.New("--pprof-listen must use localhost or a loopback IP")
+	}
+	go func() {
+		n.logf("pprof available at http://%s/debug/pprof/", n.c.pprofListen)
+		if err := http.ListenAndServe(n.c.pprofListen, nil); err != nil {
+			n.logf("pprof listener stopped: %v", err)
+		}
+	}()
+	return nil
+}
+
+func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var previous fastStatsSnapshot
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			current := n.fastStatsSnapshot()
+			rxPackets := current.receivedPackets - previous.receivedPackets
+			rxBytes := current.receivedBytes - previous.receivedBytes
+			txPackets := current.sentPackets - previous.sentPackets
+			txBytes := current.sentBytes - previous.sentBytes
+			drops := current.queueDrops - previous.queueDrops
+			var mem runtime.MemStats
+			runtime.ReadMemStats(&mem)
+			n.logf("fast stats %s: rx=%d pps %.2f Mbps tx=%d pps %.2f Mbps tun=%d pps queue=%d/%d drops=%d heap=%.1f MiB goroutines=%d",
+				interval, rxPackets, float64(rxBytes*8)/interval.Seconds()/1e6,
+				txPackets, float64(txBytes*8)/interval.Seconds()/1e6,
+				current.deliveredPackets-previous.deliveredPackets, len(n.fastQueue), cap(n.fastQueue), drops,
+				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
+			previous = current
+		}
+	}
+}
+
+type fastStatsSnapshot struct {
+	receivedPackets, receivedBytes   uint64
+	queueDrops                       uint64
+	sentPackets, sentBytes           uint64
+	deliveredPackets, deliveredBytes uint64
+}
+
+func (n *node) fastStatsSnapshot() fastStatsSnapshot {
+	return fastStatsSnapshot{
+		receivedPackets: n.stats.receivedPackets.Load(), receivedBytes: n.stats.receivedBytes.Load(),
+		queueDrops: n.stats.queueDrops.Load(), sentPackets: n.stats.sentPackets.Load(), sentBytes: n.stats.sentBytes.Load(),
+		deliveredPackets: n.stats.deliveredPackets.Load(), deliveredBytes: n.stats.deliveredBytes.Load(),
+	}
+}
+
 func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
+	n.stats.receivedPackets.Add(1)
+	n.stats.receivedBytes.Add(uint64(len(data)))
 	if len(data) > maxFastFrame {
 		n.debugf("drop fast frame from %s: exceeds MTU (%d bytes)", addr, len(data))
 		return
@@ -892,6 +978,7 @@ func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 		// UDP has no backpressure. A bounded queue makes overload a visible
 		// packet drop instead of an unbounded allocation or stalled receiver.
 		n.fastPool.Put(owned[:maxFastFrame])
+		n.stats.queueDrops.Add(1)
 		n.debugf("drop fast frame from %s: worker queue full", addr)
 	}
 }
@@ -1364,6 +1451,8 @@ func (n *node) sendFast(dst string, data []byte) bool {
 		n.debugf("fast send to %s via %s failed: %v", dst[:8], a, e)
 		return false
 	}
+	n.stats.sentPackets.Add(1)
+	n.stats.sentBytes.Add(uint64(len(data)))
 	n.debugf("fast frame sent to %s via %s (%d bytes)", dst[:8], a, len(data))
 	return true
 }
@@ -1459,6 +1548,8 @@ func (n *node) deliver(src string, p []byte) {
 		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
 		return
 	}
+	n.stats.deliveredPackets.Add(1)
+	n.stats.deliveredBytes.Add(uint64(len(p)))
 	n.debugf("TUN IPv4 delivered from %s (%d bytes)", src[:8], len(p))
 }
 func min(a, b int) int {
