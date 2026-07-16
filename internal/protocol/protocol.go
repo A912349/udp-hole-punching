@@ -130,14 +130,18 @@ func Open(key []byte, sealed map[string]string, aad []byte) ([]byte, error) {
 	return a.Open(nil, n, append(c, t...), aad)
 }
 func SealBytes(key, plaintext, aad []byte) ([]byte, error) {
-	s, e := Seal(key, plaintext, aad)
-	if e != nil {
-		return nil, e
+	a, err := chacha20poly1305.New(key)
+	if err != nil {
+		return nil, err
 	}
-	n, _ := B64Decode(s["nonce"])
-	c, _ := B64Decode(s["ciphertext"])
-	t, _ := B64Decode(s["tag"])
-	return append(append(n, c...), t...), nil
+	nonce := make([]byte, a.NonceSize())
+	if _, err = rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	// Fast TUN frames are binary on the wire. Do not route them through the
+	// JSON helper: Base64 encode + decode here used to allocate and copy every
+	// packet twice under load.
+	return a.Seal(nonce, nonce, plaintext, aad), nil
 }
 func OpenBytes(key, sealed, aad []byte) ([]byte, error) {
 	if len(sealed) < 28 {

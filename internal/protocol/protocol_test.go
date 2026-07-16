@@ -59,4 +59,15 @@ func TestSealedPayloadRoundTrip(t *testing.T) {
 	if !bytes.Equal(opened, plain) {
 		t.Fatalf("got %q, want %q", opened, plain)
 	}
+	fastFrame, err := SealBytes(leftKey, plain, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fastOpened, err := OpenBytes(rightKey, fastFrame, aad)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fastOpened, plain) {
+		t.Fatalf("fast frame got %q, want %q", fastOpened, plain)
+	}
 }
