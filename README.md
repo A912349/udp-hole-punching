@@ -27,7 +27,15 @@ export MESH_NETWORK_TOKEN='a-long-random-secret-of-at-least-24-characters'
 
 Useful optional environment variables are `MESH_DATABASE` (default
 `mesh.db`), `MESH_PORT` (default `8001`), `MESH_IP_NETWORK` (default
-`10.77.0.0/24`), `MESH_AUTO_SUPERPEERS`, and `MESH_NODE_TTL_SECONDS`.
+`10.77.0.0/24`), and `MESH_NODE_TTL_SECONDS`.
+
+The coordinator builds a two-tier overlay. Cone NAT relays form the backbone;
+ordinary cone clients keep two relay links and symmetric NAT clients keep three
+so that a mobile NAT mapping is never the only route. By default, the number
+of automatically selected superpeers is `ceil(sqrt(eligible cone relays))`.
+Set `MESH_AUTO_SUPERPEERS` to a positive number to pin that count. Advanced
+controls are `MESH_BACKBONE_DEGREE` (default `6`), `MESH_CLIENT_LINKS`
+(default `2`), and `MESH_SYMMETRIC_LINKS` (default `3`).
 
 ## Run a node
 

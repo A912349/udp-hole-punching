@@ -4,6 +4,7 @@ package main
 import (
 	"crypto/sha256"
 	"database/sql"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -39,11 +40,12 @@ type link struct {
 	Cost float64 `json:"cost"`
 }
 type server struct {
-	db      *sql.DB
-	token   string
-	network *net.IPNet
-	ttl     int64
-	auto    int
+	db                                          *sql.DB
+	token                                       string
+	network                                     *net.IPNet
+	ttl                                         int64
+	auto                                        int // 0 selects ceil(sqrt(eligible cone relays)); a positive value is an override.
+	backboneDegree, clientLinks, symmetricLinks int
 
 	sessionsMu sync.Mutex
 	sessions   map[string]map[string]*rendezvousPeer
@@ -81,7 +83,12 @@ func main() {
 	if _, e = db.Exec("PRAGMA busy_timeout = 10000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL"); e != nil {
 		log.Fatal(e)
 	}
-	s := &server{db: db, token: os.Getenv("MESH_NETWORK_TOKEN"), ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)), auto: envInt("MESH_AUTO_SUPERPEERS", 2), sessions: map[string]map[string]*rendezvousPeer{}}
+	s := &server{
+		db: db, token: os.Getenv("MESH_NETWORK_TOKEN"), ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)),
+		auto: envInt("MESH_AUTO_SUPERPEERS", 0), backboneDegree: envInt("MESH_BACKBONE_DEGREE", 6),
+		clientLinks: envInt("MESH_CLIENT_LINKS", 2), symmetricLinks: envInt("MESH_SYMMETRIC_LINKS", 3),
+		sessions: map[string]map[string]*rendezvousPeer{},
+	}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
 		log.Fatal(e)
@@ -234,7 +241,13 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 			c = append(c, n)
 		}
 	}
-	slots := s.auto - manual
+	target := s.auto
+	if target == 0 {
+		// sqrt grows the backbone slowly while still giving a small network
+		// redundancy. Manual superpeers are counted separately below.
+		target = intSqrtCeil(len(c))
+	}
+	slots := target - manual
 	if slots <= 0 {
 		return "client", nil
 	}
@@ -256,6 +269,16 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 		}
 	}
 	return "client", nil
+}
+func intSqrtCeil(n int) int {
+	if n <= 1 {
+		return n
+	}
+	r := 1
+	for r*r < n {
+		r++
+	}
+	return r
 }
 func min(a, b int) int {
 	if a < b {
@@ -434,7 +457,31 @@ func topologyVersion(nodes []node) string {
 	h := sha256.Sum256([]byte(strings.Join(a, "|")))
 	return hex.EncodeToString(h[:])[:16]
 }
-func links(nodes []node) []link {
+func weightedPeerOrder(client node, peers []node) []node {
+	rank := append([]node(nil), peers...)
+	sort.Slice(rank, func(i, j int) bool {
+		// Weighted rendezvous hashing gives every client a stable preference
+		// order. Capacity raises a relay's chance without globally reshuffling
+		// assignments when an unrelated node appears or disappears.
+		si := rendezvousScore(client.ID, rank[i].ID, rank[i].Capacity)
+		sj := rendezvousScore(client.ID, rank[j].ID, rank[j].Capacity)
+		if si != sj {
+			return si < sj
+		}
+		return rank[i].ID < rank[j].ID
+	})
+	return rank
+}
+func rendezvousScore(clientID, peerID string, capacity int) uint64 {
+	if capacity < 1 {
+		capacity = 1
+	}
+	h := sha256.Sum256([]byte(clientID + ":" + peerID))
+	// A lower weighted score wins. Do not use endpoint data: it changes after
+	// NAT rebinding and would needlessly restart symmetric-NAT connections.
+	return binary.BigEndian.Uint64(h[:8]) / uint64(capacity)
+}
+func (s *server) links(nodes []node) []link {
 	var sp []node
 	for _, n := range nodes {
 		if n.Role == "superpeer" {
@@ -442,7 +489,7 @@ func links(nodes []node) []link {
 		}
 	}
 	var out []link
-	degree := min(6, len(sp)-1)
+	degree := min(max(1, s.backboneDegree), len(sp)-1)
 	seen := map[string]bool{}
 	for i, n := range sp {
 		for step := 1; step <= degree/2; step++ {
@@ -468,25 +515,16 @@ func links(nodes []node) []link {
 			}
 		}
 	}
-	assigned := map[string]int{}
 	for _, n := range nodes {
 		if n.Role != "client" {
 			continue
 		}
-		rank := append([]node(nil), sp...)
-		sort.Slice(rank, func(i, j int) bool {
-			li := float64(assigned[rank[i].ID]) / float64(max(1, rank[i].Capacity))
-			lj := float64(assigned[rank[j].ID]) / float64(max(1, rank[j].Capacity))
-			if li != lj {
-				return li < lj
-			}
-			if rank[i].Capacity != rank[j].Capacity {
-				return rank[i].Capacity > rank[j].Capacity
-			}
-			return rank[i].ID < rank[j].ID
-		})
-		for i, p := range rank[:min(3, len(rank))] {
-			assigned[p.ID]++
+		linkCount := s.clientLinks
+		if n.NAT == "symmetric" {
+			linkCount = s.symmetricLinks
+		}
+		rank := weightedPeerOrder(n, sp)
+		for i, p := range rank[:min(linkCount, len(rank))] {
 			out = append(out, link{n.ID, p.ID, 1 + float64(i)/10})
 		}
 	}
@@ -518,7 +556,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		reply(w, 404, map[string]any{"error": "unknown node"})
 		return
 	}
-	ls := links(all)
+	ls := s.links(all)
 	neighbors := map[string]bool{}
 	for _, l := range ls {
 		if l.A == id {
