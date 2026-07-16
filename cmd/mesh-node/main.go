@@ -1242,10 +1242,17 @@ func (n *node) sendFast(dst string, data []byte) bool {
 	return true
 }
 func (n *node) tunLoop(ctx context.Context) {
+	n.logf("TUN reader started")
 	b := make([]byte, maxTUN+1)
 	for {
 		l, e := n.tun.Read(b)
-		if e != nil || ctx.Err() != nil {
+		if e != nil {
+			if ctx.Err() == nil {
+				n.logf("TUN read failed: %v", e)
+			}
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		if l < 20 || b[0]>>4 != 4 || l > maxTUN {
