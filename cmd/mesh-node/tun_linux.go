@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -41,8 +43,12 @@ func configureTUN(name, ip string, prefix int) error {
 		return fmt.Errorf("invalid mesh IPv4 address %q", ip)
 	}
 	network := netip.PrefixFrom(address, prefix).Masked().String()
+	ipCommand, e := findIPCommand()
+	if e != nil {
+		return e
+	}
 	run := func(args ...string) error {
-		if out, e := exec.Command("ip", args...).CombinedOutput(); e != nil {
+		if out, e := exec.Command(ipCommand, args...).CombinedOutput(); e != nil {
 			return fmt.Errorf("ip %v: %s", args, string(out))
 		}
 		return nil
@@ -53,5 +59,37 @@ func configureTUN(name, ip string, prefix int) error {
 	if e = run("addr", "replace", fmt.Sprintf("%s/%d", ip, prefix), "dev", name); e != nil {
 		return e
 	}
-	return run("route", "replace", network, "dev", name, "scope", "link", "src", ip, "table", "main")
+	route := []string{"route", "replace", network, "dev", name, "scope", "link", "src", ip}
+	if e = run(append(route, "table", "main")...); e != nil {
+		return e
+	}
+	// Android/Termux can route normal traffic through an rmnet policy table.
+	// Add the same narrow mesh route there without ever changing a default route.
+	if output, err := exec.Command(ipCommand, "route", "get", "1.1.1.1").Output(); err == nil {
+		if _, table, found := strings.Cut(string(output), " table "); found {
+			table = strings.Fields(table)[0]
+			if table != "main" && table != "local" {
+				return run(append(route, "table", table)...)
+			}
+		}
+	}
+	return nil
+}
+
+func findIPCommand() (string, error) {
+	if path, err := exec.LookPath("ip"); err == nil {
+		return path, nil
+	}
+	if executable, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(executable), "ip")
+		if _, err = os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	for _, candidate := range []string{"/sbin/ip", "/usr/sbin/ip"} {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("iproute2 command 'ip' was not found")
 }

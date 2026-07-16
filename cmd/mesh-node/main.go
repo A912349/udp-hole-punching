@@ -32,12 +32,20 @@ const (
 	refresh     = 5 * time.Second
 	heartbeat   = 15 * time.Second
 	linkTimeout = 30 * time.Second
+	linkGrace   = 35 * time.Second
 	maxRequest  = 32000
 	maxResponse = 48000
-	fastMagic   = "MIP1"
-	fastMAC     = 32
-	fastHeader  = 49
-	maxTUN      = 1279
+
+	symmetricBurstSize    = 500
+	symmetricBurstTimeout = 45 * time.Second
+	scanInitialStart      = -1000
+	scanInitialEnd        = 2000
+	scanExpand            = 2000
+	scanDelay             = 500 * time.Microsecond
+	fastMagic             = "MIP1"
+	fastMAC               = 32
+	fastHeader            = 49
+	maxTUN                = 1279
 )
 
 type config struct {
@@ -83,6 +91,19 @@ type serviceResult struct {
 	Data  string `json:"data"`
 	Error string `json:"error"`
 }
+type cachedKey struct {
+	public string
+	key    []byte
+}
+type reassembly struct {
+	count      uint16
+	chunks     map[uint16][]byte
+	receivedAt time.Time
+}
+type symmetricReply struct {
+	conn *net.UDPConn
+	addr *net.UDPAddr
+}
 type node struct {
 	c         config
 	id        *protocol.Identity
@@ -100,6 +121,16 @@ type node struct {
 	allow     map[string]bool
 	stop      context.CancelFunc
 	tun       *os.File
+	startedAt time.Time
+
+	sharedKeys map[string]cachedKey
+	reassembly map[string]*reassembly
+
+	symmetricMu        sync.Mutex
+	symmetricReady     bool
+	symmetricScans     map[string]chan struct{}
+	symmetricConnected map[string]bool
+	symmetricBurstAt   map[string]time.Time
 }
 
 func main() {
@@ -220,7 +251,26 @@ func newNode(c config) (*node, error) {
 		return nil, e
 	}
 	k := sha256.Sum256([]byte(c.token))
-	n := &node{c: c, id: id, key: k[:], conn: conn, client: &http.Client{Timeout: 10 * time.Second}, dir: map[string]*peer{}, neighbors: map[string]*peer{}, routes: map[string]string{}, seen: map[string]time.Time{}, pending: map[string]chan serviceResult{}, services: map[string]string{}, allow: map[string]bool{"*": true}}
+	n := &node{
+		c:                  c,
+		id:                 id,
+		key:                k[:],
+		conn:               conn,
+		client:             &http.Client{Timeout: 10 * time.Second},
+		dir:                map[string]*peer{},
+		neighbors:          map[string]*peer{},
+		routes:             map[string]string{},
+		seen:               map[string]time.Time{},
+		pending:            map[string]chan serviceResult{},
+		services:           map[string]string{},
+		allow:              map[string]bool{"*": true},
+		startedAt:          time.Now(),
+		sharedKeys:         map[string]cachedKey{},
+		reassembly:         map[string]*reassembly{},
+		symmetricScans:     map[string]chan struct{}{},
+		symmetricConnected: map[string]bool{},
+		symmetricBurstAt:   map[string]time.Time{},
+	}
 	for _, v := range c.allows {
 		if v != "" {
 			if len(n.allow) == 1 {
@@ -315,6 +365,13 @@ func (n *node) bootstrap() error {
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
 	n.logf("topology=%s neighbors=%d", t.Version, len(t.Neighbors))
+	if n.c.role == "superpeer" {
+		for _, candidate := range t.Neighbors {
+			if candidate.NAT == "symmetric" {
+				n.startSymmetricScan(candidate.ID, candidate.Endpoint, false)
+			}
+		}
+	}
 	return nil
 }
 
@@ -402,6 +459,9 @@ func (n *node) start() error {
 	if e := n.bootstrap(); e != nil {
 		return e
 	}
+	if !n.establishSymmetricTransport() {
+		return errors.New("symmetric NAT synchronization with a superpeer failed")
+	}
 	if n.c.tun != "" {
 		f, e := openTUN(n.c.tun)
 		if e != nil {
@@ -429,12 +489,221 @@ func (n *node) start() error {
 			n.logf("heartbeat failed: %v", e)
 		}
 	})
+	go n.linkHealth(ctx)
 	if n.tun != nil {
 		go n.tunLoop(ctx)
 	}
 	n.helloAll()
 	n.logf("listening on %s", n.conn.LocalAddr())
 	return nil
+}
+
+// establishSymmetricTransport mirrors the legacy 500-port burst.  A symmetric
+// NAT allocates a mapping per destination, therefore one of these sockets must
+// receive the cone superpeer's HELLO before it becomes the node's transport.
+func (n *node) establishSymmetricTransport() bool {
+	if n.c.nat != "symmetric" {
+		return true
+	}
+	n.symmetricMu.Lock()
+	if n.symmetricReady {
+		n.symmetricMu.Unlock()
+		return true
+	}
+	n.symmetricMu.Unlock()
+
+	n.mu.RLock()
+	var relay *peer
+	var relayID string
+	for id, candidate := range n.neighbors {
+		if candidate.Role == "superpeer" {
+			relayID, relay = id, candidate
+			break
+		}
+	}
+	n.mu.RUnlock()
+	if relay == nil {
+		n.logf("symmetric burst deferred: no superpeer in topology")
+		return false
+	}
+	endpoint, err := net.ResolveUDPAddr("udp", relay.Endpoint)
+	if err != nil {
+		n.logf("invalid superpeer endpoint: %v", err)
+		return false
+	}
+
+	responses := make(chan symmetricReply, symmetricBurstSize)
+	sockets := make([]*net.UDPConn, 0, symmetricBurstSize)
+	n.logf("symmetric NAT: probing %d UDP ports via %s", symmetricBurstSize, relayID[:8])
+	for range symmetricBurstSize {
+		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)})
+		if err != nil {
+			continue
+		}
+		burst := protocol.NewPacket("SYMMETRIC_BURST", n.id.ID, relayID, map[string]any{})
+		encoded, err := protocol.EncodePacket(burst, n.key)
+		if err != nil {
+			probe.Close()
+			continue
+		}
+		if _, err = probe.WriteToUDP(encoded, endpoint); err != nil {
+			probe.Close()
+			continue
+		}
+		sockets = append(sockets, probe)
+		go n.awaitSymmetricHello(probe, relayID, responses)
+	}
+
+	deadline := time.NewTimer(symmetricBurstTimeout)
+	defer deadline.Stop()
+	var selected *net.UDPConn
+	for selected == nil {
+		select {
+		case received := <-responses:
+			selected = received.conn
+			ack := protocol.NewPacket("HELLO_ACK", n.id.ID, relayID, map[string]any{})
+			if encoded, err := protocol.EncodePacket(ack, n.key); err == nil {
+				_, _ = selected.WriteToUDP(encoded, received.addr)
+			}
+		case <-deadline.C:
+			for _, probe := range sockets {
+				_ = probe.Close()
+			}
+			n.logf("symmetric NAT burst timed out without HELLO")
+			return false
+		}
+	}
+	for _, probe := range sockets {
+		if probe != selected {
+			_ = probe.Close()
+		}
+	}
+	old := n.conn
+	n.conn = selected
+	_ = old.Close()
+	n.symmetricMu.Lock()
+	n.symmetricReady = true
+	n.symmetricMu.Unlock()
+	n.logf("symmetric NAT synchronized through %s on %s", relayID[:8], selected.LocalAddr())
+	return true
+}
+
+func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses chan<- symmetricReply) {
+	_ = conn.SetReadDeadline(time.Now().Add(symmetricBurstTimeout))
+	buffer := make([]byte, 65535)
+	length, address, err := conn.ReadFromUDP(buffer)
+	if err != nil {
+		return
+	}
+	packet, err := protocol.DecodePacket(buffer[:length], n.key)
+	if err != nil || packet.Type != "HELLO" || packet.Source != relayID || packet.Destination != n.id.ID {
+		return
+	}
+	select {
+	case responses <- symmetricReply{conn: conn, addr: address}:
+	default:
+	}
+}
+
+func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
+	n.symmetricMu.Lock()
+	if existing := n.symmetricScans[peerID]; existing != nil {
+		if !force {
+			n.symmetricMu.Unlock()
+			return
+		}
+		delete(n.symmetricScans, peerID)
+		close(existing)
+	}
+	if n.symmetricConnected[peerID] && !force {
+		n.symmetricMu.Unlock()
+		return
+	}
+	cancel := make(chan struct{})
+	n.symmetricScans[peerID] = cancel
+	n.symmetricMu.Unlock()
+	go n.scanSymmetricNeighbor(peerID, endpoint, cancel)
+}
+
+func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct{}) {
+	defer func() {
+		n.symmetricMu.Lock()
+		if n.symmetricScans[peerID] == cancel {
+			delete(n.symmetricScans, peerID)
+		}
+		n.symmetricMu.Unlock()
+	}()
+	address, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		n.logf("symmetric scan endpoint for %s: %v", peerID[:8], err)
+		return
+	}
+	n.logf("symmetric scan for %s around %s", peerID[:8], endpoint)
+	scanned := make(map[int]bool)
+	for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
+		start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
+		for port := start; port <= end; port++ {
+			select {
+			case <-cancel:
+				n.symmetricMu.Lock()
+				n.symmetricConnected[peerID] = true
+				n.symmetricMu.Unlock()
+				n.logf("symmetric scan connected to %s", peerID[:8])
+				return
+			default:
+			}
+			if scanned[port] {
+				continue
+			}
+			scanned[port] = true
+			target := *address
+			target.Port = port
+			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public}), &target)
+			time.Sleep(scanDelay)
+		}
+		if start == 1 && end == 65535 {
+			break
+		}
+	}
+	n.logf("symmetric scan exhausted UDP ports for %s", peerID[:8])
+}
+
+func (n *node) completeSymmetricScan(peerID string) {
+	n.symmetricMu.Lock()
+	cancel := n.symmetricScans[peerID]
+	if cancel != nil {
+		delete(n.symmetricScans, peerID)
+		close(cancel)
+	}
+	n.symmetricMu.Unlock()
+}
+
+func (n *node) handleSymmetricBurst(packet protocol.Packet) {
+	if n.c.role != "superpeer" {
+		return
+	}
+	n.mu.RLock()
+	peer := n.neighbors[packet.Source]
+	n.mu.RUnlock()
+	if peer == nil || peer.NAT != "symmetric" {
+		return
+	}
+	n.symmetricMu.Lock()
+	previous := n.symmetricBurstAt[packet.Source]
+	n.symmetricBurstAt[packet.Source] = time.Now()
+	n.symmetricMu.Unlock()
+	if time.Since(previous) < 5*time.Second {
+		return
+	}
+	n.startSymmetricScan(packet.Source, peer.Endpoint, true)
+}
+
+func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
+	encoded, err := protocol.EncodePacket(packet, n.key)
+	if err != nil {
+		return
+	}
+	_, _ = n.conn.WriteToUDP(encoded, address)
 }
 func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 	t := time.NewTicker(d)
@@ -463,10 +732,7 @@ func (n *node) usable(p *peer) bool {
 	return p != nil && (p.lastRX.IsZero() || time.Since(p.lastRX) < linkTimeout)
 }
 func (n *node) send(p protocol.Packet) bool {
-	n.mu.RLock()
-	hop := n.routes[p.Destination]
-	q := n.neighbors[hop]
-	n.mu.RUnlock()
+	hop, q := n.nextHop(p.Destination)
 	if !n.usable(q) {
 		return false
 	}
@@ -484,6 +750,66 @@ func (n *node) send(p protocol.Packet) bool {
 	}
 	_, e = n.conn.WriteToUDP(b, a.(*net.UDPAddr))
 	return e == nil
+}
+
+func (n *node) nextHop(destination string) (string, *peer) {
+	n.mu.RLock()
+	hop := n.routes[destination]
+	peer := n.neighbors[hop]
+	if n.usable(peer) {
+		n.mu.RUnlock()
+		return hop, peer
+	}
+
+	adjacency := map[string][]qitem{}
+	for _, edge := range n.links {
+		adjacency[edge.A] = append(adjacency[edge.A], qitem{edge.B, edge.Cost})
+		adjacency[edge.B] = append(adjacency[edge.B], qitem{edge.A, edge.Cost})
+	}
+	costs := map[string]float64{n.id.ID: 0}
+	previous := map[string]string{}
+	queue := &pq{{n.id.ID, 0}}
+	heap.Init(queue)
+	for queue.Len() > 0 {
+		current := heap.Pop(queue).(qitem)
+		if current.cost != costs[current.id] {
+			continue
+		}
+		for _, candidate := range adjacency[current.id] {
+			if current.id == n.id.ID && !n.usable(n.neighbors[candidate.id]) {
+				continue
+			}
+			candidateCost := current.cost + candidate.cost
+			if existing, ok := costs[candidate.id]; !ok || candidateCost < existing {
+				costs[candidate.id] = candidateCost
+				previous[candidate.id] = current.id
+				heap.Push(queue, qitem{candidate.id, candidateCost})
+			}
+		}
+	}
+	if _, ok := previous[destination]; !ok {
+		n.mu.RUnlock()
+		return "", nil
+	}
+	hop = destination
+	for previous[hop] != n.id.ID {
+		parent := previous[hop]
+		if parent == "" {
+			n.mu.RUnlock()
+			return "", nil
+		}
+		hop = parent
+	}
+	peer = n.neighbors[hop]
+	n.mu.RUnlock()
+	if !n.usable(peer) {
+		return "", nil
+	}
+	n.mu.Lock()
+	n.routes[destination] = hop
+	n.mu.Unlock()
+	n.logf("route failover %s -> %s", destination[:8], hop[:8])
+	return hop, peer
 }
 func (n *node) receive(ctx context.Context) {
 	b := make([]byte, 65535)
@@ -519,8 +845,15 @@ func (n *node) receive(ctx context.Context) {
 		}
 		switch p.Type {
 		case "HELLO":
+			n.ensureNeighbor(p.Source)
 			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
+		case "HELLO_ACK":
+			n.completeSymmetricScan(p.Source)
+		case "SYMMETRIC_BURST":
+			n.ensureNeighbor(p.Source)
+			n.handleSymmetricBurst(p)
 		case "DATA":
+			n.ensureNeighbor(p.Source)
 			n.data(p)
 		}
 	}
@@ -549,14 +882,63 @@ func (n *node) touch(id string, a net.Addr) {
 	}
 	n.mu.Unlock()
 }
+
+func (n *node) ensureNeighbor(id string) {
+	n.mu.RLock()
+	known := n.neighbors[id] != nil
+	n.mu.RUnlock()
+	if known {
+		return
+	}
+	n.logf("received traffic from new node %s; refreshing topology", id[:8])
+	if err := n.bootstrap(); err != nil {
+		n.logf("topology refresh failed: %v", err)
+	}
+}
+
+func (n *node) linkHealth(ctx context.Context) {
+	ticker := time.NewTicker(keepAlive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			n.mu.Lock()
+			for id, peer := range n.neighbors {
+				live := n.usable(peer)
+				if peer.up != live {
+					peer.up = live
+					state := "down"
+					if live {
+						state = "up"
+					}
+					n.logf("link %s %s", id[:8], state)
+				}
+			}
+			n.mu.Unlock()
+		}
+	}
+}
 func (n *node) peerKey(id string) ([]byte, *peer, error) {
 	n.mu.RLock()
 	p := n.dir[id]
+	if p != nil {
+		if cached, ok := n.sharedKeys[id]; ok && cached.public == p.Public {
+			n.mu.RUnlock()
+			return cached.key, p, nil
+		}
+	}
 	n.mu.RUnlock()
 	if p == nil {
 		return nil, nil, errors.New("unknown peer")
 	}
 	k, e := protocol.SharedKey(n.id.Private, p.Public)
+	if e == nil {
+		n.mu.Lock()
+		n.sharedKeys[id] = cachedKey{public: p.Public, key: k}
+		n.mu.Unlock()
+	}
 	return k, p, e
 }
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
@@ -576,6 +958,16 @@ func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	return n.send(p)
 }
 func (n *node) data(p protocol.Packet) {
+	if rawIP, ok := p.Payload["ip"].(map[string]any); ok {
+		sealed := make(map[string]string, len(rawIP))
+		for key, value := range rawIP {
+			if text, ok := value.(string); ok {
+				sealed[key] = text
+			}
+		}
+		n.handleLegacyIPFragment(p.Source, sealed)
+		return
+	}
 	k, _, e := n.peerKey(p.Source)
 	if e != nil {
 		return
@@ -618,7 +1010,78 @@ func (n *node) data(p protocol.Packet) {
 			default:
 			}
 		}
+	case "IP_PACKET":
+		encoded, _ := m.Body["data"].(string)
+		if payload, err := protocol.B64Decode(encoded); err == nil {
+			n.deliver(p.Source, payload)
+		}
 	}
+}
+
+// handleLegacyIPFragment accepts the JSON-sealed fragment representation used
+// before the compact MIP1 data plane.  Keeping it makes rolling upgrades safe:
+// a Go destination can receive packets from an older mesh node.
+func (n *node) handleLegacyIPFragment(source string, sealed map[string]string) {
+	key, _, err := n.peerKey(source)
+	if err != nil {
+		return
+	}
+	plain, err := protocol.Open(key, sealed, []byte(source+":"+n.id.ID))
+	if err != nil {
+		return
+	}
+	n.acceptIPFragment(source, plain)
+}
+
+func (n *node) acceptIPFragment(source string, plain []byte) {
+	if len(plain) < 12 {
+		return
+	}
+	fragmentID := plain[:8]
+	index := binary.BigEndian.Uint16(plain[8:10])
+	count := binary.BigEndian.Uint16(plain[10:12])
+	if count == 0 || count > 128 || index >= count {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	cutoff := time.Now().Add(-10 * time.Second)
+	for id, state := range n.reassembly {
+		if state.receivedAt.Before(cutoff) {
+			delete(n.reassembly, id)
+		}
+	}
+	stateID := source + ":" + hex.EncodeToString(fragmentID)
+	state := n.reassembly[stateID]
+	if state == nil {
+		if len(n.reassembly) >= 128 {
+			for id := range n.reassembly {
+				delete(n.reassembly, id)
+				break
+			}
+		}
+		state = &reassembly{count: count, chunks: map[uint16][]byte{}}
+		n.reassembly[stateID] = state
+	}
+	if state.count != count {
+		delete(n.reassembly, stateID)
+		return
+	}
+	state.chunks[index] = append([]byte(nil), plain[12:]...)
+	state.receivedAt = time.Now()
+	if len(state.chunks) != int(count) {
+		return
+	}
+	packet := make([]byte, 0)
+	for part := uint16(0); part < count; part++ {
+		chunk, ok := state.chunks[part]
+		if !ok {
+			return
+		}
+		packet = append(packet, chunk...)
+	}
+	delete(n.reassembly, stateID)
+	go n.deliver(source, packet)
 }
 func (n *node) serviceRequest(src, rid string, b map[string]any) {
 	name, _ := b["service"].(string)
@@ -738,15 +1201,13 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		return
 	}
 	plain, e := protocol.OpenBytes(k, auth[fastHeader:], []byte(src+":"+dst))
-	if e != nil || len(plain) < 12 {
+	if e != nil {
 		return
 	}
-	n.deliver(src, plain[12:])
+	n.acceptIPFragment(src, plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
-	n.mu.RLock()
-	p := n.neighbors[n.routes[dst]]
-	n.mu.RUnlock()
+	_, p := n.nextHop(dst)
 	if !n.usable(p) {
 		return false
 	}
@@ -826,7 +1287,7 @@ func (n *node) sendIP(dst string, p []byte) {
 	n.sendFast(dst, append(pkt, h.Sum(nil)...))
 }
 func (n *node) deliver(src string, p []byte) {
-	if n.tun == nil || len(p) < 20 || p[0]>>4 != 4 {
+	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
 		return
 	}
 	n.mu.RLock()

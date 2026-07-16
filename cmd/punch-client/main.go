@@ -161,37 +161,74 @@ func punchCone(c *net.UDPConn, a *net.UDPAddr) error {
 			}
 		}
 	}()
-	for start := a.Port - 1000; start <= 65535; start += 3000 {
-		for p := max(1, start); p <= min(65535, start+2999); p++ {
-			c.WriteToUDP([]byte("cone_punch"), &net.UDPAddr{IP: a.IP, Port: p})
+	scanned := make(map[int]bool)
+	for startOffset, endOffset := -1000, 2000; ; startOffset, endOffset = startOffset-2000, endOffset+2000 {
+		start, end := max(1, a.Port+startOffset), min(65535, a.Port+endOffset)
+		for p := start; p <= end; p++ {
+			if scanned[p] {
+				continue
+			}
+			scanned[p] = true
+			_, _ = c.WriteToUDP([]byte("cone_punch"), &net.UDPAddr{IP: a.IP, Port: p})
+			time.Sleep(500 * time.Microsecond)
 		}
 		select {
 		case x := <-done:
 			*a = *x
 			return nil
-		case <-time.After(800 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
+		}
+		if start == 1 && end == 65535 {
+			break
 		}
 	}
 	return errors.New("all UDP ports scanned without handshake")
 }
 func punchBurst(a *net.UDPAddr) error {
+	type result struct {
+		conn *net.UDPConn
+		peer *net.UDPAddr
+	}
+	results := make(chan result, 500)
+	sockets := make([]*net.UDPConn, 0, 500)
 	for i := 0; i < 500; i++ {
 		c, e := net.ListenUDP("udp4", &net.UDPAddr{})
 		if e != nil {
 			continue
 		}
-		c.WriteToUDP([]byte("burst_punch"), a)
-		c.SetReadDeadline(time.Now().Add(45 * time.Second))
-		b := make([]byte, 64)
-		_, peer, e := c.ReadFromUDP(b)
-		if e == nil {
-			c.WriteToUDP([]byte("HELLO_MOBILE"), peer)
-			chat(c, peer)
-			return nil
+		if _, e = c.WriteToUDP([]byte("burst_punch"), a); e != nil {
+			c.Close()
+			continue
 		}
-		c.Close()
+		sockets = append(sockets, c)
+		go func(conn *net.UDPConn) {
+			_ = conn.SetReadDeadline(time.Now().Add(45 * time.Second))
+			buffer := make([]byte, 64)
+			_, peer, err := conn.ReadFromUDP(buffer)
+			if err == nil {
+				results <- result{conn: conn, peer: peer}
+			}
+		}(c)
 	}
-	return errors.New("symmetric burst timed out")
+	if len(sockets) == 0 {
+		return errors.New("could not allocate symmetric burst sockets")
+	}
+	select {
+	case connected := <-results:
+		for _, conn := range sockets {
+			if conn != connected.conn {
+				conn.Close()
+			}
+		}
+		_, _ = connected.conn.WriteToUDP([]byte("HELLO_MOBILE"), connected.peer)
+		chat(connected.conn, connected.peer)
+		return nil
+	case <-time.After(45 * time.Second):
+		for _, conn := range sockets {
+			conn.Close()
+		}
+		return errors.New("symmetric burst timed out")
+	}
 }
 func chat(c *net.UDPConn, a *net.UDPAddr) {
 	go func() {

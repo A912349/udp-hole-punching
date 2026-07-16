@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"home-udp-mesh/internal/protocol"
@@ -43,6 +44,18 @@ type server struct {
 	network *net.IPNet
 	ttl     int64
 	auto    int
+
+	sessionsMu sync.Mutex
+	sessions   map[string]map[string]*rendezvousPeer
+}
+
+type rendezvousPeer struct {
+	endpoint string
+	natType  string
+	status   string
+	other    string
+	otherNAT string
+	ready    chan struct{}
 }
 
 func envInt(name string, fallback int) int {
@@ -60,7 +73,7 @@ func main() {
 	if e != nil {
 		log.Fatal(e)
 	}
-	s := &server{db: db, token: os.Getenv("MESH_NETWORK_TOKEN"), ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)), auto: envInt("MESH_AUTO_SUPERPEERS", 2)}
+	s := &server{db: db, token: os.Getenv("MESH_NETWORK_TOKEN"), ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)), auto: envInt("MESH_AUTO_SUPERPEERS", 2), sessions: map[string]map[string]*rendezvousPeer{}}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
 		log.Fatal(e)
@@ -70,6 +83,10 @@ func main() {
 	mux.HandleFunc("GET /v1/bootstrap/{node_id}", s.bootstrap)
 	mux.HandleFunc("POST /v1/services", s.service)
 	mux.HandleFunc("GET /v1/services/{node_id}/{name}", s.serviceDetails)
+	// Legacy endpoints intentionally stay unauthenticated: the experimental
+	// punch client predates the mesh network token and can use this coordinator.
+	mux.HandleFunc("POST /register", s.rendezvousRegister)
+	mux.HandleFunc("GET /wait", s.rendezvousWait)
 	port := value("MESH_PORT", "8001")
 	log.Printf("[SERVER] starting on 0.0.0.0:%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
@@ -81,8 +98,49 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));`)
-	return e
+	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));`)
+	if err != nil {
+		return err
+	}
+	rows, err := s.db.Query("PRAGMA table_info(nodes)")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull int
+		var defaultValue any
+		var primaryKey int
+		if err = rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		columns[name] = true
+	}
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	if !columns["mesh_ip"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN mesh_ip TEXT"); err != nil {
+			return err
+		}
+	}
+	if !columns["requested_role"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN requested_role TEXT"); err != nil {
+			return err
+		}
+		if _, err = s.db.Exec("UPDATE nodes SET requested_role = CASE WHEN role = 'superpeer' THEN 'superpeer' ELSE 'auto' END"); err != nil {
+			return err
+		}
+	}
+	if !columns["relay_capable"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN relay_capable INTEGER NOT NULL DEFAULT 1"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *server) auth(w http.ResponseWriter, r *http.Request) bool {
 	if s.token != "" && r.Header.Get("X-Mesh-Token") != s.token {
@@ -275,6 +333,85 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (s *server) rendezvousRegister(w http.ResponseWriter, r *http.Request) {
+	var request struct {
+		Session  string `json:"session"`
+		ID       string `json:"id"`
+		External string `json:"external"`
+		NATType  string `json:"nat_type"`
+	}
+	if json.NewDecoder(r.Body).Decode(&request) != nil || request.Session == "" || request.ID == "" || request.External == "" || (request.NATType != "cone" && request.NATType != "symmetric") {
+		reply(w, http.StatusBadRequest, map[string]any{"error": "missing or invalid fields"})
+		return
+	}
+	if _, _, err := net.SplitHostPort(request.External); err != nil {
+		reply(w, http.StatusBadRequest, map[string]any{"error": "invalid external endpoint"})
+		return
+	}
+
+	s.sessionsMu.Lock()
+	peers := s.sessions[request.Session]
+	if peers == nil {
+		peers = map[string]*rendezvousPeer{}
+		s.sessions[request.Session] = peers
+	}
+	peers[request.ID] = &rendezvousPeer{endpoint: request.External, natType: request.NATType, status: "waiting", ready: make(chan struct{})}
+	if len(peers) == 2 {
+		ids := make([]string, 0, 2)
+		for id := range peers {
+			ids = append(ids, id)
+		}
+		first, second := peers[ids[0]], peers[ids[1]]
+		if first.natType == "symmetric" && second.natType == "symmetric" {
+			for _, peer := range peers {
+				peer.status = "incompatible"
+				close(peer.ready)
+			}
+		} else {
+			first.status, first.other, first.otherNAT = "ready", second.endpoint, second.natType
+			second.status, second.other, second.otherNAT = "ready", first.endpoint, first.natType
+			close(first.ready)
+			close(second.ready)
+		}
+	}
+	s.sessionsMu.Unlock()
+	log.Printf("[SERVER] rendezvous register session=%s peer=%s nat=%s", request.Session, request.ID, request.NATType)
+	reply(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) rendezvousWait(w http.ResponseWriter, r *http.Request) {
+	session, id := r.URL.Query().Get("session"), r.URL.Query().Get("id")
+	timeout, err := strconv.Atoi(r.URL.Query().Get("timeout"))
+	if err != nil || timeout <= 0 {
+		timeout = 30
+	}
+	timeout = min(timeout, 120)
+	s.sessionsMu.Lock()
+	peer := s.sessions[session][id]
+	s.sessionsMu.Unlock()
+	if peer == nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "not registered"})
+		return
+	}
+	select {
+	case <-peer.ready:
+	case <-time.After(time.Duration(timeout) * time.Second):
+		reply(w, http.StatusRequestTimeout, map[string]string{"status": "timeout"})
+		return
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	if peer.status == "incompatible" {
+		reply(w, http.StatusConflict, map[string]string{"status": "incompatible", "error": "symmetric-symmetric is unsupported"})
+		return
+	}
+	if peer.status != "ready" {
+		reply(w, http.StatusRequestTimeout, map[string]string{"status": "timeout"})
+		return
+	}
+	reply(w, http.StatusOK, map[string]string{"status": "ready", "peer": peer.other, "peer_nat_type": peer.otherNAT})
 }
 func topologyVersion(nodes []node) string {
 	var a []string
