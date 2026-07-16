@@ -2,3 +2,11 @@ old/
 __pycache__/
 .agents/
 *.zip
+mesh.db
+mesh-state/
+state-*/
+/server
+/mesh-node
+/punch-client
+/.gocache/
+/.gopath/

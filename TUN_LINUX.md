@@ -6,11 +6,11 @@ delivery and fragmentation.
 
 ## Requirements
 
-- Run the updated `server.py` once so it adds the `mesh_ip` database column.
+- Run the updated `server` once so it creates the `mesh_ip` database column.
 - The coordinator assigns and persists a unique mesh IPv4 address for every
   node identity. A manual `--mesh-ip` is optional only when a fixed address is
   required.
-- Run `mesh_node.py` as root, or grant it `CAP_NET_ADMIN`, to create `/dev/net/tun`.
+- Run `mesh-node` as root, or grant it `CAP_NET_ADMIN`, to create `/dev/net/tun`.
 - Use Linux on both endpoints. Android/Termux needs a later `VpnService` layer.
 
 The default private overlay subnet is `10.77.0.0/24`. The assigned address is
@@ -22,7 +22,7 @@ In one terminal, start the node. The process creates `mesh0` and must remain
 running:
 
 ```bash
-sudo python3 mesh_node.py \
+sudo ./mesh-node \
   --server http://COORDINATOR_IP:8001 \
   --network-token 'change-this-to-a-long-random-secret-12345' \
   --nat-type auto \
@@ -45,7 +45,7 @@ sudo ip addr add ASSIGNED_MESH_IP/24 dev mesh0
 Start it with its own identity directory and overlay address:
 
 ```bash
-sudo python3 mesh_node.py \
+sudo ./mesh-node \
   --server http://COORDINATOR_IP:8001 \
   --network-token 'change-this-to-a-long-random-secret-12345' \
   --nat-type auto \
@@ -77,7 +77,7 @@ mesh route in reverse.
   addresses.
 - IPv4 packets up to 1279 bytes use one compact binary encrypted UDP frame
   (at most 1400 bytes on the wire). This fast data plane requires the updated
-  `mesh_node.py` on both endpoints and every forwarding superpeer.
+  `mesh-node` on both endpoints and every forwarding superpeer.
 - This version still has no retransmission, congestion control, or routing of
   local LAN prefixes. Keep it for ping and small UDP/TCP smoke tests until the
   reliable transport layer is added.
