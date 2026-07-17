@@ -282,12 +282,44 @@ func parse() config {
 			if c.state == "mesh-state" {
 				c.state = saved.state
 			}
+			if c.tun == "" {
+				c.tun = saved.tun
+			}
+			if c.nat == "auto" {
+				c.nat = saved.nat
+			}
+			if c.bind == "0.0.0.0" {
+				c.bind = saved.bind
+			}
+			if c.endpoint == "" {
+				c.endpoint = saved.endpoint
+			}
+			if c.meshIP == "" {
+				c.meshIP = saved.meshIP
+			}
+			if c.port == 0 {
+				c.port = saved.port
+			}
+			if c.capacity == 1 {
+				c.capacity = saved.capacity
+			}
+			if c.prefix == 24 {
+				c.prefix = saved.prefix
+			}
+			if !c.autoTUN {
+				c.autoTUN = saved.autoTUN
+			}
+			if !c.noRelay {
+				c.noRelay = saved.noRelay
+			}
 		}
-	} else if len(os.Args) == 1 {
+	} else if c.server == "" || (c.token == "" && c.inviteToken == "") {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.Printf("saved configuration needs replacement: %v", err)
 		}
+		debug, stats := c.debug, c.statsInterval
 		c = askInteractiveConfig()
+		c.debug, c.statsInterval = debug, stats
 		if err := saveInteractiveConfig(c); err != nil {
 			log.Fatal("save configuration: ", err)
 		}
