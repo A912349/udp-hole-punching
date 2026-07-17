@@ -41,9 +41,11 @@ type node struct {
 	LastSeen, CreatedAt int64
 }
 type link struct {
-	A    string  `json:"a"`
-	B    string  `json:"b"`
-	Cost float64 `json:"cost"`
+	A      string  `json:"a"`
+	B      string  `json:"b"`
+	Cost   float64 `json:"cost"`
+	RTTMS  float64 `json:"rtt_ms,omitempty"`
+	Status string  `json:"status,omitempty"`
 }
 type server struct {
 	db                                          *sql.DB
@@ -60,6 +62,13 @@ type server struct {
 	sessions   map[string]map[string]*rendezvousPeer
 	controlMu  sync.Mutex
 	controls   map[*controlClient]string
+	metricsMu  sync.RWMutex
+	metrics    map[string]linkMetric
+}
+type linkMetric struct {
+	RTTMS float64
+	Up    bool
+	Seen  time.Time
 }
 
 type controlClient struct {
@@ -110,6 +119,7 @@ func main() {
 		clientLinks: envInt("MESH_CLIENT_LINKS", 2), symmetricLinks: envInt("MESH_SYMMETRIC_LINKS", 3),
 		sessions:       map[string]map[string]*rendezvousPeer{},
 		controls:       map[*controlClient]string{},
+		metrics:        map[string]linkMetric{},
 		inviteAttempts: map[string][]time.Time{},
 	}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
@@ -136,6 +146,7 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("PUT /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("GET /v1/admin/topology", s.adminTopology)
+	mux.HandleFunc("POST /v1/telemetry", s.telemetry)
 	mux.HandleFunc("GET /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
@@ -252,6 +263,8 @@ func (s *server) controlRequest(in controlFrame) controlFrame {
 		s.register(w, r)
 	case in.Method == http.MethodPost && in.Path == "/v1/services":
 		s.service(w, r)
+	case in.Method == http.MethodPost && in.Path == "/v1/telemetry":
+		s.telemetry(w, r)
 	case in.Method == http.MethodGet && strings.HasPrefix(in.Path, "/v1/bootstrap/"):
 		r.SetPathValue("node_id", strings.TrimPrefix(in.Path, "/v1/bootstrap/"))
 		s.bootstrap(w, r)
@@ -535,6 +548,69 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusOK, map[string]any{"nodes": nodes, "links": s.links(nodes), "settings": s.settings()})
+}
+
+func metricKey(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return a + "\x00" + b
+}
+func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	var report struct {
+		NodeID string `json:"node_id"`
+		Links  []struct {
+			PeerID string  `json:"peer_id"`
+			RTTMS  float64 `json:"rtt_ms"`
+			Up     bool    `json:"up"`
+		} `json:"links"`
+	}
+	if err := decodeJSON(w, r, &report); err != nil || report.NodeID == "" {
+		reply(w, 400, map[string]string{"error": "invalid telemetry"})
+		return
+	}
+	now := time.Now()
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	for _, x := range report.Links {
+		if x.PeerID == "" || x.PeerID == report.NodeID {
+			continue
+		}
+		k := metricKey(report.NodeID, x.PeerID)
+		old := s.metrics[k]
+		if x.RTTMS > 0 && x.RTTMS < 60000 {
+			if old.RTTMS == 0 {
+				old.RTTMS = x.RTTMS
+			} else {
+				old.RTTMS = old.RTTMS*.7 + x.RTTMS*.3
+			}
+		}
+		old.Up = x.Up
+		old.Seen = now
+		s.metrics[k] = old
+	}
+	reply(w, 200, map[string]string{"status": "ok"})
+}
+func (s *server) decorateLinks(links []link) []link {
+	s.metricsMu.RLock()
+	defer s.metricsMu.RUnlock()
+	now := time.Now()
+	for i := range links {
+		m := s.metrics[metricKey(links[i].A, links[i].B)]
+		if m.RTTMS > 0 {
+			links[i].RTTMS = m.RTTMS
+			links[i].Cost = 1 + m.RTTMS/1000
+		}
+		if m.Up && now.Sub(m.Seen) < 45*time.Second {
+			links[i].Status = "up"
+		} else {
+			links[i].Status = "down"
+		}
+	}
+	return links
 }
 
 func (s *server) consumeInvite(token string) bool {
@@ -1055,9 +1131,37 @@ func rendezvousScore(clientID, peerID string, capacity int) uint64 {
 	// NAT rebinding and would needlessly restart symmetric-NAT connections.
 	return binary.BigEndian.Uint64(h[:8]) / uint64(capacity)
 }
+func (s *server) telemetryPeerOrder(client node, peers []node) []node {
+	rank := append([]node(nil), peers...)
+	s.metricsMu.RLock()
+	defer s.metricsMu.RUnlock()
+	sort.Slice(rank, func(i, j int) bool {
+		a, b := s.metrics[metricKey(client.ID, rank[i].ID)], s.metrics[metricKey(client.ID, rank[j].ID)]
+		freshA := a.Up && time.Since(a.Seen) < 45*time.Second
+		freshB := b.Up && time.Since(b.Seen) < 45*time.Second
+		if freshA != freshB {
+			return freshA
+		}
+		ra, rb := a.RTTMS, b.RTTMS
+		if ra == 0 {
+			ra = 1e9
+		}
+		if rb == 0 {
+			rb = 1e9
+		}
+		if ra != rb {
+			return ra < rb
+		}
+		if rank[i].Capacity != rank[j].Capacity {
+			return rank[i].Capacity > rank[j].Capacity
+		}
+		return rank[i].ID < rank[j].ID
+	})
+	return rank
+}
 func (s *server) links(nodes []node) []link {
 	if manual := s.manualLinks(); len(manual) > 0 {
-		return manual
+		return s.decorateLinks(manual)
 	}
 	s.configMu.RLock()
 	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
@@ -1080,7 +1184,7 @@ func (s *server) links(nodes []node) []link {
 			k := a + ":" + b
 			if !seen[k] {
 				seen[k] = true
-				out = append(out, link{a, b, 1})
+				out = append(out, link{A: a, B: b, Cost: 1})
 			}
 		}
 		if degree%2 == 1 && len(sp)%2 == 0 {
@@ -1091,7 +1195,7 @@ func (s *server) links(nodes []node) []link {
 			k := a + ":" + b
 			if !seen[k] {
 				seen[k] = true
-				out = append(out, link{a, b, 1})
+				out = append(out, link{A: a, B: b, Cost: 1})
 			}
 		}
 	}
@@ -1103,12 +1207,12 @@ func (s *server) links(nodes []node) []link {
 		if n.NAT == "symmetric" {
 			linkCount = symmetricLinks
 		}
-		rank := weightedPeerOrder(n, sp)
+		rank := s.telemetryPeerOrder(n, sp)
 		for i, p := range rank[:min(linkCount, len(rank))] {
-			out = append(out, link{n.ID, p.ID, 1 + float64(i)/10})
+			out = append(out, link{A: n.ID, B: p.ID, Cost: 1 + float64(i)/10})
 		}
 	}
-	return out
+	return s.decorateLinks(out)
 }
 func max(a, b int) int {
 	if a > b {

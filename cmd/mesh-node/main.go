@@ -89,6 +89,7 @@ type peer struct {
 	last     net.Addr
 	lastRX   time.Time
 	up       bool
+	rttMS    float64
 }
 type edge struct {
 	A    string  `json:"a"`
@@ -152,6 +153,8 @@ type node struct {
 	controlMu    sync.Mutex
 	controlCall  sync.Mutex
 	controlReply chan controlFrame
+	pingMu       sync.Mutex
+	pings        map[string]time.Time
 	mu           sync.RWMutex
 	dir          map[string]*peer
 	neighbors    map[string]*peer
@@ -248,24 +251,38 @@ func parse() config {
 	f.BoolVar(&c.controlInsecure, "control-insecure-skip-verify", false, "skip HTTPS certificate verification (testing only)")
 	f.BoolVar(&c.resetConfig, "reset-config", false, "delete saved interactive configuration and ask again")
 	f.Parse(os.Args[1:])
-	if len(os.Args) == 1 {
-		if saved, err := loadInteractiveConfig(); err == nil {
-			c = saved
-		} else if !errors.Is(err, os.ErrNotExist) {
-			log.Fatal("read saved configuration: ", err)
-		} else {
-			c = askInteractiveConfig()
-			if err := saveInteractiveConfig(c); err != nil {
-				log.Fatal("save configuration: ", err)
-			}
-		}
-	}
 	if c.resetConfig {
 		if err := os.Remove(interactiveConfigFile); err != nil && !errors.Is(err, os.ErrNotExist) {
 			log.Fatal("reset configuration: ", err)
 		}
 		fmt.Println("Saved configuration reset. Run without parameters to configure it again.")
 		os.Exit(0)
+	}
+	if saved, err := loadInteractiveConfig(); err == nil {
+		if len(os.Args) == 1 {
+			c = saved
+		} else { // Keep CLI tuning flags, but reuse saved connection and identity settings.
+			if c.server == "" {
+				c.server = saved.server
+			}
+			if c.token == "" {
+				c.token = saved.token
+			}
+			if c.inviteToken == "" {
+				c.inviteToken = saved.inviteToken
+			}
+			if c.state == "mesh-state" {
+				c.state = saved.state
+			}
+		}
+	} else if len(os.Args) == 1 {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Fatal("read saved configuration: ", err)
+		}
+		c = askInteractiveConfig()
+		if err := saveInteractiveConfig(c); err != nil {
+			log.Fatal("save configuration: ", err)
+		}
 	}
 	if c.server == "" || (c.token == "" && c.inviteToken == "") {
 		f.Usage()
@@ -317,7 +334,6 @@ func askInteractiveConfig() config {
 		c.token = credential
 	}
 	c.role = ask("Role (auto/client/superpeer)", "auto")
-	c.state = ask("State directory", "mesh-state")
 	return c
 }
 func loadIdentity(dir string) (*protocol.Identity, error) {
@@ -390,6 +406,7 @@ func newNode(c config) (*node, error) {
 		symmetricScans:     map[string]chan struct{}{},
 		symmetricConnected: map[string]bool{},
 		symmetricBurstAt:   map[string]time.Time{},
+		pings:              map[string]time.Time{},
 	}
 	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
 	for _, v := range c.allows {
@@ -745,9 +762,15 @@ func (n *node) start() error {
 	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
 	go n.periodic(ctx, keepAlive, n.helloAll)
+	go n.periodic(ctx, keepAlive, n.pingAll)
 	go n.periodic(ctx, heartbeat, func() {
 		if e := n.register(); e != nil {
 			n.logf("heartbeat failed: %v", e)
+		}
+	})
+	go n.periodic(ctx, heartbeat, func() {
+		if e := n.reportTelemetry(); e != nil {
+			n.logf("telemetry failed: %v", e)
 		}
 	})
 	go n.linkHealth(ctx)
@@ -1004,6 +1027,35 @@ func (n *node) helloAll() {
 	for _, id := range a {
 		n.send(protocol.NewPacket("HELLO", n.id.ID, id, map[string]any{"public_key": n.id.Public}))
 	}
+}
+func (n *node) pingAll() {
+	n.mu.RLock()
+	ids := make([]string, 0, len(n.neighbors))
+	for id := range n.neighbors {
+		ids = append(ids, id)
+	}
+	n.mu.RUnlock()
+	for _, id := range ids {
+		p := protocol.NewPacket("PING", n.id.ID, id, map[string]any{})
+		n.pingMu.Lock()
+		n.pings[p.ID] = time.Now()
+		n.pingMu.Unlock()
+		n.send(p)
+	}
+}
+func (n *node) reportTelemetry() error {
+	type measurement struct {
+		PeerID string  `json:"peer_id"`
+		RTTMS  float64 `json:"rtt_ms"`
+		Up     bool    `json:"up"`
+	}
+	n.mu.RLock()
+	links := make([]measurement, 0, len(n.neighbors))
+	for id, p := range n.neighbors {
+		links = append(links, measurement{id, p.rttMS, !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout})
+	}
+	n.mu.RUnlock()
+	return n.request("POST", "/v1/telemetry", map[string]any{"node_id": n.id.ID, "links": links}, &map[string]any{})
 }
 func (n *node) usable(p *peer) bool {
 	return p != nil && (p.lastRX.IsZero() || time.Since(p.lastRX) < linkTimeout)
@@ -1274,6 +1326,22 @@ func (n *node) receive(ctx context.Context) {
 				n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
 			case "HELLO_ACK":
 				n.completeSymmetricScan(p.Source)
+			case "PING":
+				n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
+			case "PONG":
+				if id, ok := p.Payload["ping_id"].(string); ok {
+					n.pingMu.Lock()
+					sent := n.pings[id]
+					delete(n.pings, id)
+					n.pingMu.Unlock()
+					if !sent.IsZero() {
+						n.mu.Lock()
+						if q := n.neighbors[p.Source]; q != nil {
+							q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
+						}
+						n.mu.Unlock()
+					}
+				}
 			case "SYMMETRIC_BURST":
 				n.ensureNeighbor(p.Source)
 				n.handleSymmetricBurst(p)
