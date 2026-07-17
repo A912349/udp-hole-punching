@@ -147,6 +147,7 @@ func main() {
 	mux.HandleFunc("PUT /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("GET /v1/admin/topology", s.adminTopology)
 	mux.HandleFunc("POST /v1/telemetry", s.telemetry)
+	mux.HandleFunc("GET /v1/admin/audit", s.adminAudit)
 	mux.HandleFunc("GET /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
@@ -593,6 +594,26 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		s.metrics[k] = old
 	}
 	reply(w, 200, map[string]string{"status": "ok"})
+}
+func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	rows, err := s.db.Query("SELECT created_at,event,detail FROM audit_log ORDER BY created_at DESC LIMIT 30")
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var at int64
+		var event, detail string
+		if rows.Scan(&at, &event, &detail) == nil {
+			out = append(out, map[string]any{"created_at": at, "event": event, "detail": detail})
+		}
+	}
+	reply(w, 200, out)
 }
 func (s *server) decorateLinks(links []link) []link {
 	s.metricsMu.RLock()
