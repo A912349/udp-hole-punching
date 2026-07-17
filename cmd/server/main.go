@@ -36,8 +36,8 @@ type node struct {
 	Endpoint            string `json:"endpoint"`
 	Capacity            int    `json:"capacity"`
 	MeshIP              string `json:"mesh_ip"`
-	RequestedRole       string
-	Relay               bool
+	RequestedRole       string `json:"requested_role"`
+	Relay               bool   `json:"relay_capable"`
 	LastSeen, CreatedAt int64
 }
 type link struct {
@@ -153,6 +153,7 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
+	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/role", s.adminNodeRole)
 	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
 	mux.HandleFunc("PUT /v1/admin/graph", s.adminGraph)
 	// Legacy endpoints intentionally stay unauthenticated: the experimental
@@ -297,7 +298,7 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));`)
+	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);`)
 	if err != nil {
 		return err
 	}
@@ -748,9 +749,48 @@ func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("DELETE FROM services WHERE node_id=?", id)
+	_, _ = s.db.Exec("DELETE FROM role_overrides WHERE node_id=?", id)
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_deleted", id)
 	s.pushTopologies()
 	reply(w, 200, map[string]string{"status": "deleted"})
+}
+
+func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	var input struct {
+		Role string `json:"role"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil || (input.Role != "auto" && input.Role != "client" && input.Role != "superpeer") {
+		reply(w, 400, map[string]string{"error": "role must be auto, client or superpeer"})
+		return
+	}
+	var nat string
+	if err := s.db.QueryRow("SELECT nat_type FROM nodes WHERE node_id=?", id).Scan(&nat); err != nil {
+		reply(w, 404, map[string]string{"error": "node not found"})
+		return
+	}
+	if input.Role == "superpeer" && nat != "cone" {
+		reply(w, 409, map[string]string{"error": "only cone NAT nodes can be superpeers"})
+		return
+	}
+	if _, err := s.db.Exec("INSERT INTO role_overrides(node_id,role) VALUES(?,?) ON CONFLICT(node_id) DO UPDATE SET role=excluded.role", id, input.Role); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err := s.db.Exec("UPDATE nodes SET requested_role=? WHERE node_id=?", input.Role, id); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err := s.rebalanceRoles(); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "role_changed", id+":"+input.Role)
+	s.pushTopologies()
+	reply(w, 200, map[string]string{"status": "ok", "role": input.Role})
 }
 
 func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
@@ -992,6 +1032,10 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if e != nil || protocol.NodeID(pub) != d.ID {
 		reply(w, 400, map[string]any{"error": "node_id does not match public_key"})
 		return
+	}
+	var roleOverride string
+	if s.db.QueryRow("SELECT role FROM role_overrides WHERE node_id=?", d.ID).Scan(&roleOverride) == nil {
+		d.Role = roleOverride
 	}
 	if d.Role == "superpeer" && d.NAT != "cone" {
 		reply(w, 400, map[string]any{"error": "only cone nodes may be superpeers"})
