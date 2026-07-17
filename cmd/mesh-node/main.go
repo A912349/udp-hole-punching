@@ -63,12 +63,12 @@ const (
 var fastMagicBytes = []byte(fastMagic)
 
 type config struct {
-	server, token, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen string
-	port, capacity, prefix                                                                       int
-	noRelay, autoTUN, debug                                                                      bool
-	fastWorkers                                                                                  int
-	statsInterval                                                                                time.Duration
-	services, allows                                                                             multi
+	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen string
+	port, capacity, prefix                                                                                    int
+	noRelay, autoTUN, debug                                                                                   bool
+	fastWorkers                                                                                               int
+	statsInterval                                                                                             time.Duration
+	services, allows                                                                                          multi
 }
 type multi []string
 
@@ -180,7 +180,7 @@ type node struct {
 
 func main() {
 	c := parse()
-	if len(c.token) < 24 {
+	if c.token != "" && len(c.token) < 24 {
 		log.Fatal("--network-token must be at least 24 characters")
 	}
 	n, e := newNode(c)
@@ -220,6 +220,7 @@ func parse() config {
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	f.StringVar(&c.server, "server", "", "Control-plane base URL")
 	f.StringVar(&c.token, "network-token", "", "shared network token")
+	f.StringVar(&c.inviteToken, "invite-token", "", "one-time coordinator invitation token")
 	f.StringVar(&c.role, "role", "auto", "auto, superpeer or client")
 	f.StringVar(&c.nat, "nat-type", "auto", "auto, cone or symmetric")
 	f.StringVar(&c.bind, "bind", "0.0.0.0", "UDP bind host")
@@ -241,7 +242,7 @@ func parse() config {
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
 	f.Parse(os.Args[1:])
-	if c.server == "" || c.token == "" {
+	if c.server == "" || (c.token == "" && c.inviteToken == "") {
 		f.Usage()
 		os.Exit(2)
 	}
@@ -383,6 +384,9 @@ func (n *node) connectControl() error {
 		return err
 	}
 	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
+	if n.c.inviteToken != "" {
+		wsConfig.Header.Set("X-Mesh-Invite", n.c.inviteToken)
+	}
 	ws, err := websocket.DialConfig(wsConfig)
 	if err != nil {
 		return fmt.Errorf("connect control websocket: %w", err)
@@ -477,6 +481,7 @@ func (n *node) register() error {
 	var out struct {
 		MeshIP string `json:"mesh_ip"`
 		Role   string `json:"assigned_role"`
+		Token  string `json:"network_token"`
 	}
 	if e := n.request("POST", "/v1/register", r, &out); e != nil {
 		return e
@@ -486,6 +491,12 @@ func (n *node) register() error {
 	}
 	n.c.meshIP = out.MeshIP
 	n.c.role = out.Role
+	if out.Token != "" {
+		n.c.token = out.Token
+		n.c.inviteToken = ""
+		k := sha256.Sum256([]byte(out.Token))
+		n.key = k[:]
+	}
 	n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
 	return nil
 }

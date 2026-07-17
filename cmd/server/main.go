@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
@@ -52,6 +53,8 @@ type server struct {
 	auto                                        int // 0 selects ceil(sqrt(eligible cone relays)); a positive value is an override.
 	backboneDegree, clientLinks, symmetricLinks int
 	configMu                                    sync.RWMutex
+	inviteMu                                    sync.Mutex
+	inviteAttempts                              map[string][]time.Time
 
 	sessionsMu sync.Mutex
 	sessions   map[string]map[string]*rendezvousPeer
@@ -60,8 +63,9 @@ type server struct {
 }
 
 type controlClient struct {
-	ws sync.Mutex
-	c  *websocket.Conn
+	ws      sync.Mutex
+	c       *websocket.Conn
+	invited bool
 }
 
 type rendezvousPeer struct {
@@ -104,8 +108,9 @@ func main() {
 		db: db, token: token, ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)),
 		auto: envInt("MESH_AUTO_SUPERPEERS", 0), backboneDegree: envInt("MESH_BACKBONE_DEGREE", 6),
 		clientLinks: envInt("MESH_CLIENT_LINKS", 2), symmetricLinks: envInt("MESH_SYMMETRIC_LINKS", 3),
-		sessions: map[string]map[string]*rendezvousPeer{},
-		controls: map[*controlClient]string{},
+		sessions:       map[string]map[string]*rendezvousPeer{},
+		controls:       map[*controlClient]string{},
+		inviteAttempts: map[string][]time.Time{},
 	}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
@@ -117,7 +122,9 @@ func main() {
 		Handler: websocket.Handler(s.controlWS),
 		Handshake: func(_ *websocket.Config, r *http.Request) error {
 			if s.token != "" && r.Header.Get("X-Mesh-Token") != s.token {
-				return fmt.Errorf("unauthorized")
+				if !s.allowInviteAttempt(r.RemoteAddr) || !s.consumeInvite(r.Header.Get("X-Mesh-Invite")) {
+					return fmt.Errorf("unauthorized")
+				}
 			}
 			return nil
 		},
@@ -129,6 +136,11 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("PUT /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("GET /v1/admin/topology", s.adminTopology)
+	mux.HandleFunc("GET /v1/admin/invites", s.adminInvite)
+	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
+	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
+	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
+	mux.HandleFunc("PUT /v1/admin/graph", s.adminGraph)
 	// Legacy endpoints intentionally stay unauthenticated: the experimental
 	// punch client predates the mesh network token and can use this coordinator.
 	mux.HandleFunc("POST /register", s.rendezvousRegister)
@@ -164,7 +176,7 @@ type controlFrame struct {
 }
 
 func (s *server) controlWS(ws *websocket.Conn) {
-	client := &controlClient{c: ws}
+	client := &controlClient{c: ws, invited: ws.Request().Header.Get("X-Mesh-Invite") != ""}
 	defer func() {
 		s.controlMu.Lock()
 		delete(s.controls, client)
@@ -177,6 +189,13 @@ func (s *server) controlWS(ws *websocket.Conn) {
 			return
 		}
 		out := s.controlRequest(in)
+		if client.invited && in.Method == http.MethodPost && in.Path == "/v1/register" && out.Status >= 200 && out.Status < 300 {
+			var body map[string]any
+			_ = json.Unmarshal(out.Body, &body)
+			body["network_token"] = s.token
+			out.Body, _ = json.Marshal(body)
+			client.invited = false
+		}
 		if err := client.send(out); err != nil {
 			return
 		}
@@ -262,7 +281,7 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);`)
+	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));`)
 	if err != nil {
 		return err
 	}
@@ -516,6 +535,192 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, http.StatusOK, map[string]any{"nodes": nodes, "links": s.links(nodes), "settings": s.settings()})
+}
+
+func (s *server) consumeInvite(token string) bool {
+	if len(token) != 6 {
+		return false
+	}
+	now := time.Now().Unix()
+	result, err := s.db.Exec("UPDATE invites SET used_at=? WHERE token=? AND used_at IS NULL AND expires_at>=?", now, token, now)
+	if err != nil {
+		return false
+	}
+	count, err := result.RowsAffected()
+	return err == nil && count == 1
+}
+
+// Five failed invite attempts per IP per 30 seconds keeps a short human
+// friendly code practical without making it a brute-force credential.
+func (s *server) allowInviteAttempt(remote string) bool {
+	host, _, err := net.SplitHostPort(remote)
+	if err != nil {
+		host = remote
+	}
+	now := time.Now()
+	cutoff := now.Add(-30 * time.Second)
+	s.inviteMu.Lock()
+	defer s.inviteMu.Unlock()
+	old := s.inviteAttempts[host]
+	kept := old[:0]
+	for _, t := range old {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= 5 {
+		s.inviteAttempts[host] = kept
+		return false
+	}
+	s.inviteAttempts[host] = append(kept, now)
+	return true
+}
+
+func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	if r.Method == http.MethodGet {
+		rows, err := s.db.Query("SELECT token,created_at,expires_at,used_at FROM invites WHERE expires_at>=? ORDER BY created_at DESC", time.Now().Unix())
+		if err != nil {
+			reply(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		var out []map[string]any
+		for rows.Next() {
+			var token string
+			var created, expires int64
+			var used sql.NullInt64
+			if err = rows.Scan(&token, &created, &expires, &used); err != nil {
+				reply(w, 500, map[string]string{"error": err.Error()})
+				return
+			}
+			out = append(out, map[string]any{"token": token, "created_at": created, "expires_at": expires, "used": used.Valid})
+		}
+		reply(w, 200, out)
+		return
+	}
+	const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	var token string
+	for {
+		var raw [6]byte
+		if _, err := rand.Read(raw[:]); err != nil {
+			reply(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+		b := make([]byte, 6)
+		for i := range b {
+			b[i] = alphabet[int(raw[i])%len(alphabet)]
+		}
+		token = string(b)
+		var exists int
+		_ = s.db.QueryRow("SELECT 1 FROM invites WHERE token=?", token).Scan(&exists)
+		if exists == 0 {
+			break
+		}
+	}
+	now := time.Now().Unix()
+	if _, err := s.db.Exec("INSERT INTO invites(token,created_at,expires_at) VALUES(?,?,?)", token, now, now+30); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "invite_created", token[:8])
+	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 30, "expires_in_seconds": 30})
+}
+
+func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	if id == "" {
+		reply(w, 400, map[string]string{"error": "missing node_id"})
+		return
+	}
+	result, err := s.db.Exec("DELETE FROM nodes WHERE node_id=?", id)
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		reply(w, 404, map[string]string{"error": "node not found"})
+		return
+	}
+	_, _ = s.db.Exec("DELETE FROM services WHERE node_id=?", id)
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_deleted", id)
+	s.pushTopologies()
+	reply(w, 200, map[string]string{"status": "deleted"})
+}
+
+func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	if r.Method == http.MethodGet {
+		reply(w, 200, map[string]any{"links": s.manualLinks()})
+		return
+	}
+	var input struct {
+		Links []link `json:"links"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil {
+		reply(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	for _, e := range input.Links {
+		if e.A == "" || e.B == "" || e.A == e.B || e.Cost <= 0 || e.Cost > 1000 {
+			reply(w, 400, map[string]string{"error": "invalid graph link"})
+			return
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	if _, err = tx.Exec("DELETE FROM graph_links"); err == nil {
+		for _, e := range input.Links {
+			a, b := e.A, e.B
+			if a > b {
+				a, b = b, a
+			}
+			if _, err = tx.Exec("INSERT OR REPLACE INTO graph_links(a,b,cost) VALUES(?,?,?)", a, b, e.Cost); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	s.pushTopologies()
+	reply(w, 200, map[string]any{"links": input.Links})
+}
+
+func (s *server) manualLinks() []link {
+	if s.db == nil {
+		return nil
+	}
+	rows, err := s.db.Query("SELECT a,b,cost FROM graph_links ORDER BY a,b")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []link
+	for rows.Next() {
+		var e link
+		if rows.Scan(&e.A, &e.B, &e.Cost) == nil {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func (s *server) adminPage(w http.ResponseWriter, r *http.Request) {
@@ -840,6 +1045,9 @@ func rendezvousScore(clientID, peerID string, capacity int) uint64 {
 	return binary.BigEndian.Uint64(h[:8]) / uint64(capacity)
 }
 func (s *server) links(nodes []node) []link {
+	if manual := s.manualLinks(); len(manual) > 0 {
+		return manual
+	}
 	s.configMu.RLock()
 	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
 	s.configMu.RUnlock()
