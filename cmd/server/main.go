@@ -687,7 +687,7 @@ func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		defer rows.Close()
-		var out []map[string]any
+		out := []map[string]any{}
 		for rows.Next() {
 			var token string
 			var created, expires int64
