@@ -54,6 +54,9 @@ const (
 	scanInitialEnd        = 2000
 	scanExpand            = 2000
 	scanDelay             = 500 * time.Microsecond
+	symmetricScanRetries  = 5
+	symmetricRetryDelay   = 2 * time.Second
+	symmetricBurstRetries = 4
 	fastMagic             = "MIP1"
 	fastMAC               = 32
 	fastHeader            = 49
@@ -852,6 +855,22 @@ func (n *node) start() error {
 // NAT allocates a mapping per destination, therefore one of these sockets must
 // receive the cone superpeer's HELLO before it becomes the node's transport.
 func (n *node) establishSymmetricTransport() bool {
+	for attempt := 1; attempt <= symmetricBurstRetries; attempt++ {
+		if n.establishSymmetricTransportOnce(attempt) {
+			return true
+		}
+		if attempt < symmetricBurstRetries {
+			n.logf("symmetric burst retry %d/%d", attempt, symmetricBurstRetries-1)
+			if err := n.bootstrap(); err != nil {
+				n.logf("topology refresh before symmetric retry failed: %v", err)
+			}
+			time.Sleep(symmetricRetryDelay)
+		}
+	}
+	return false
+}
+
+func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 	if n.c.nat != "symmetric" {
 		return true
 	}
@@ -884,7 +903,7 @@ func (n *node) establishSymmetricTransport() bool {
 
 	responses := make(chan symmetricReply, symmetricBurstSize)
 	sockets := make([]*net.UDPConn, 0, symmetricBurstSize)
-	n.logf("symmetric NAT: probing %d UDP ports via %s", symmetricBurstSize, relayID[:8])
+	n.logf("symmetric NAT: probing %d UDP ports via %s (attempt %d/%d)", symmetricBurstSize, relayID[:8], attempt, symmetricBurstRetries)
 	for range symmetricBurstSize {
 		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)})
 		if err != nil {
@@ -996,39 +1015,56 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct
 		}
 		n.symmetricMu.Unlock()
 	}()
-	address, err := net.ResolveUDPAddr("udp", endpoint)
-	if err != nil {
-		n.logf("symmetric scan endpoint for %s: %v", peerID[:8], err)
-		return
-	}
-	n.logf("symmetric scan for %s around %s", peerID[:8], endpoint)
-	scanned := make(map[int]bool)
-	for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
-		start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
-		for port := start; port <= end; port++ {
+	for attempt := 1; attempt <= symmetricScanRetries; attempt++ {
+		if n.symmetricScanCancelled(cancel) {
+			return
+		}
+		address, err := net.ResolveUDPAddr("udp", endpoint)
+		if err != nil {
+			n.logf("symmetric scan endpoint for %s (attempt %d/%d): %v", peerID[:8], attempt, symmetricScanRetries, err)
+		} else {
+			n.logf("symmetric scan for %s around %s (attempt %d/%d)", peerID[:8], endpoint, attempt, symmetricScanRetries)
+			scanned := make(map[int]bool)
+			for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
+				start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
+				for port := start; port <= end; port++ {
+					if n.symmetricScanCancelled(cancel) {
+						return
+					}
+					if scanned[port] {
+						continue
+					}
+					scanned[port] = true
+					target := *address
+					target.Port = port
+					n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public}), &target)
+					time.Sleep(scanDelay)
+				}
+				if start == 1 && end == 65535 {
+					break
+				}
+			}
+		}
+		if attempt < symmetricScanRetries && !n.symmetricScanCancelled(cancel) {
+			timer := time.NewTimer(symmetricRetryDelay)
 			select {
 			case <-cancel:
-				n.symmetricMu.Lock()
-				n.symmetricConnected[peerID] = true
-				n.symmetricMu.Unlock()
-				n.logf("symmetric scan connected to %s", peerID[:8])
+				timer.Stop()
 				return
-			default:
+			case <-timer.C:
 			}
-			if scanned[port] {
-				continue
-			}
-			scanned[port] = true
-			target := *address
-			target.Port = port
-			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public}), &target)
-			time.Sleep(scanDelay)
-		}
-		if start == 1 && end == 65535 {
-			break
 		}
 	}
-	n.logf("symmetric scan exhausted UDP ports for %s", peerID[:8])
+	n.logf("symmetric scan exhausted retries for %s", peerID[:8])
+}
+
+func (n *node) symmetricScanCancelled(cancel chan struct{}) bool {
+	select {
+	case <-cancel:
+		return true
+	default:
+		return false
+	}
 }
 
 func (n *node) completeSymmetricScan(peerID string) {
@@ -1037,6 +1073,7 @@ func (n *node) completeSymmetricScan(peerID string) {
 	if cancel != nil {
 		delete(n.symmetricScans, peerID)
 		close(cancel)
+		n.symmetricConnected[peerID] = true
 	}
 	n.symmetricMu.Unlock()
 }
