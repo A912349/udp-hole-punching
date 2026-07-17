@@ -10,6 +10,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -64,12 +66,12 @@ const (
 var fastMagicBytes = []byte(fastMagic)
 
 type config struct {
-	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen string
-	port, capacity, prefix                                                                                    int
-	noRelay, autoTUN, debug, resetConfig                                                                      bool
-	fastWorkers                                                                                               int
-	statsInterval                                                                                             time.Duration
-	services, allows                                                                                          multi
+	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
+	port, capacity, prefix                                                                                               int
+	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                bool
+	fastWorkers                                                                                                          int
+	statsInterval                                                                                                        time.Duration
+	services, allows                                                                                                     multi
 }
 type multi []string
 
@@ -242,6 +244,8 @@ func parse() config {
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
+	f.StringVar(&c.controlCA, "control-ca-file", "", "PEM CA bundle for an HTTPS/WSS coordinator")
+	f.BoolVar(&c.controlInsecure, "control-insecure-skip-verify", false, "skip HTTPS certificate verification (testing only)")
 	f.BoolVar(&c.resetConfig, "reset-config", false, "delete saved interactive configuration and ask again")
 	f.Parse(os.Args[1:])
 	if len(os.Args) == 1 {
@@ -448,6 +452,28 @@ func (n *node) connectControl() error {
 	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
 	if n.c.inviteToken != "" {
 		wsConfig.Header.Set("X-Mesh-Invite", n.c.inviteToken)
+	}
+	if u.Scheme == "wss" {
+		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
+		if n.c.controlCA != "" {
+			pem, err := os.ReadFile(n.c.controlCA)
+			if err != nil {
+				return fmt.Errorf("read --control-ca-file: %w", err)
+			}
+			pool, err := x509.SystemCertPool()
+			if err != nil || pool == nil {
+				pool = x509.NewCertPool()
+			}
+			if !pool.AppendCertsFromPEM(pem) {
+				return fmt.Errorf("no certificate found in --control-ca-file")
+			}
+			tlsConfig.RootCAs = pool
+		}
+		if n.c.controlInsecure {
+			tlsConfig.InsecureSkipVerify = true
+			n.logf("WARNING: TLS certificate verification is disabled")
+		}
+		wsConfig.TlsConfig = tlsConfig
 	}
 	ws, err := websocket.DialConfig(wsConfig)
 	if err != nil {

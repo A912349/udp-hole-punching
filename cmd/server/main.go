@@ -625,7 +625,7 @@ func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "invite_created", token[:8])
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "invite_created", token)
 	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 30, "expires_in_seconds": 30})
 }
 
