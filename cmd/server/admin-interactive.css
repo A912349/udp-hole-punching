@@ -1,0 +1,27 @@
+.graphCard { padding-bottom: 12px; }
+.graphHelp { margin-bottom: 0; }
+.graphActions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+.graphActions label { color: var(--muted); font-size: 12px; }
+.graphActions input { width: 78px; margin-left: 5px; }
+.graphStage { position: relative; margin-top: 12px; }
+.graphStage svg { height: 600px; touch-action: none; user-select: none; }
+.graphMode { position: absolute; left: 14px; top: 14px; padding: 7px 11px; border: 1px solid #39577f; border-radius: 20px; background: #0a1628d9; color: var(--muted); pointer-events: none; }
+.graphMode.active { border-color: var(--blue); color: white; box-shadow: 0 0 18px #3b82f655; }
+.graphInspector { min-height: 55px; display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.graphInspector .spacer { flex: 1; }
+.graphInspector button.dangerButton { background: #7f2833; }
+.graphInspector input { width: 90px; }
+.edgeHit { stroke: transparent; stroke-width: 18; cursor: pointer; }
+.edgeGroup:hover .edge, .edgeGroup.selected .edge { stroke-width: 6; }
+.edgeGroup.selected .edge { stroke: #fbbf24; }
+.peerGroup { cursor: grab; }
+.peerGroup.dragging { cursor: grabbing; }
+.peerGroup.selected .node { stroke: #fbbf24; stroke-width: 5; filter: drop-shadow(0 0 8px #fbbf24); }
+.peerGroup.linkSource .node { stroke: #60a5fa; stroke-width: 5; filter: drop-shadow(0 0 9px #3b82f6); }
+.advancedGraph { margin-top: 16px; }
+.advancedGraph article { min-width: 0; }
+@media (max-width: 900px) {
+  .cardHead { align-items: flex-start; flex-direction: column; }
+  .graphActions { justify-content: flex-start; }
+  .graphStage svg { height: 480px; }
+}

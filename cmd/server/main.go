@@ -144,6 +144,7 @@ func main() {
 	mux.HandleFunc("GET /v1/services/{node_id}/{name}", s.serviceDetails)
 	mux.HandleFunc("GET /admin", s.adminPage)
 	mux.HandleFunc("GET /admin.css", s.adminAsset)
+	mux.HandleFunc("GET /admin-interactive.css", s.adminAsset)
 	mux.HandleFunc("GET /admin.js", s.adminAsset)
 	mux.HandleFunc("GET /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("PUT /v1/admin/config", s.adminConfig)
@@ -875,6 +876,9 @@ func (s *server) adminAsset(w http.ResponseWriter, r *http.Request) {
 	case "/admin.css":
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 		_, _ = io.WriteString(w, adminCSS)
+	case "/admin-interactive.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		_, _ = io.WriteString(w, adminInteractiveCSS)
 	case "/admin.js":
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		_, _ = io.WriteString(w, adminJS)
