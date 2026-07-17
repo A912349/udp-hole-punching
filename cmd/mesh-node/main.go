@@ -22,6 +22,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -31,6 +32,7 @@ import (
 	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/websocket"
 	"home-udp-mesh/internal/protocol"
 )
 
@@ -143,7 +145,10 @@ type node struct {
 	key          []byte
 	conn         *net.UDPConn
 	packet       *ipv4.PacketConn
-	client       *http.Client
+	control      *websocket.Conn
+	controlMu    sync.Mutex
+	controlCall  sync.Mutex
+	controlReply chan controlFrame
 	mu           sync.RWMutex
 	dir          map[string]*peer
 	neighbors    map[string]*peer
@@ -304,7 +309,6 @@ func newNode(c config) (*node, error) {
 		key:                k[:],
 		conn:               conn,
 		packet:             ipv4.NewPacketConn(conn),
-		client:             &http.Client{Timeout: 10 * time.Second},
 		dir:                map[string]*peer{},
 		neighbors:          map[string]*peer{},
 		routes:             map[string]string{},
@@ -347,33 +351,126 @@ func (n *node) debugf(f string, a ...any) {
 		n.logf(f, a...)
 	}
 }
-func (n *node) request(method, path string, in, out any) error {
-	var body io.Reader
-	if in != nil {
-		b, e := json.Marshal(in)
-		if e != nil {
-			return e
+
+type controlFrame struct {
+	Method string          `json:"method"`
+	Path   string          `json:"path"`
+	Body   json.RawMessage `json:"body,omitempty"`
+	Status int             `json:"status,omitempty"`
+	Error  string          `json:"error,omitempty"`
+	Event  string          `json:"event,omitempty"`
+}
+
+func (n *node) connectControl() error {
+	if n.control != nil {
+		return nil
+	}
+	u, err := url.Parse(strings.TrimRight(n.c.server, "/") + "/v1/ws")
+	if err != nil {
+		return err
+	}
+	switch u.Scheme {
+	case "http":
+		u.Scheme = "ws"
+	case "https":
+		u.Scheme = "wss"
+	default:
+		return fmt.Errorf("unsupported control-plane URL scheme %q", u.Scheme)
+	}
+	origin := "http://" + u.Host
+	wsConfig, err := websocket.NewConfig(u.String(), origin)
+	if err != nil {
+		return err
+	}
+	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
+	ws, err := websocket.DialConfig(wsConfig)
+	if err != nil {
+		return fmt.Errorf("connect control websocket: %w", err)
+	}
+	n.control = ws
+	n.controlReply = make(chan controlFrame, 1)
+	go n.readControl(ws, n.controlReply)
+	n.logf("control WebSocket connected")
+	return nil
+}
+
+func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
+	for {
+		var frame controlFrame
+		if err := websocket.JSON.Receive(ws, &frame); err != nil {
+			n.controlMu.Lock()
+			if n.control == ws {
+				n.control = nil
+			}
+			n.controlMu.Unlock()
+			return
 		}
-		body = strings.NewReader(string(b))
+		if frame.Event == "topology" {
+			var t topology
+			if err := json.Unmarshal(frame.Body, &t); err != nil {
+				n.logf("invalid pushed topology: %v", err)
+			} else {
+				n.applyTopology(t)
+			}
+			continue
+		}
+		select {
+		case replies <- frame:
+		default:
+			n.logf("unexpected control-plane reply discarded")
+		}
 	}
-	r, e := http.NewRequest(method, strings.TrimRight(n.c.server, "/")+path, body)
-	if e != nil {
-		return e
-	}
-	r.Header.Set("X-Mesh-Token", n.c.token)
+}
+
+// request sends compact JSON frames over one long-lived WebSocket. A failed
+// connection is recreated once, which also handles NAT or server restarts.
+func (n *node) request(method, path string, in, out any) error {
+	var body json.RawMessage
 	if in != nil {
-		r.Header.Set("Content-Type", "application/json")
+		b, err := json.Marshal(in)
+		if err != nil {
+			return err
+		}
+		body = b
 	}
-	res, e := n.client.Do(r)
-	if e != nil {
-		return e
+	n.controlCall.Lock()
+	defer n.controlCall.Unlock()
+	var last error
+	for attempt := 0; attempt < 2; attempt++ {
+		n.controlMu.Lock()
+		if err := n.connectControl(); err != nil {
+			n.controlMu.Unlock()
+			last = err
+			continue
+		}
+		ws, replies := n.control, n.controlReply
+		frame := controlFrame{Method: method, Path: path, Body: body}
+		if err := websocket.JSON.Send(ws, frame); err != nil {
+			n.controlMu.Unlock()
+			last = err
+		} else {
+			n.controlMu.Unlock()
+			select {
+			case reply := <-replies:
+				if reply.Status < 200 || reply.Status > 299 {
+					return fmt.Errorf("control plane: status %d: %s", reply.Status, reply.Error)
+				}
+				if out == nil {
+					return nil
+				}
+				return json.Unmarshal(reply.Body, out)
+			case <-time.After(10 * time.Second):
+				last = errors.New("control websocket response timed out")
+			}
+		}
+		n.controlMu.Lock()
+		if n.control == ws {
+			_ = n.control.Close()
+			n.control = nil
+		}
+		n.controlMu.Unlock()
 	}
-	defer res.Body.Close()
-	if res.StatusCode < 200 || res.StatusCode > 299 {
-		b, _ := io.ReadAll(res.Body)
-		return fmt.Errorf("control plane: %s: %s", res.Status, strings.TrimSpace(string(b)))
-	}
-	return json.NewDecoder(res.Body).Decode(out)
+	return fmt.Errorf("control websocket request: %w", last)
 }
 func (n *node) register() error {
 	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.c.role, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
@@ -397,6 +494,10 @@ func (n *node) bootstrap() error {
 	if e := n.request("GET", "/v1/bootstrap/"+n.id.ID, nil, &t); e != nil {
 		return e
 	}
+	n.applyTopology(t)
+	return nil
+}
+func (n *node) applyTopology(t topology) {
 	n.mu.Lock()
 	old := n.neighbors
 	n.dir = map[string]*peer{}
@@ -434,7 +535,6 @@ func (n *node) bootstrap() error {
 			}
 		}
 	}
-	return nil
 }
 
 type qitem struct {
@@ -546,11 +646,6 @@ func (n *node) start() error {
 	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
 	go n.periodic(ctx, keepAlive, n.helloAll)
-	go n.periodic(ctx, refresh, func() {
-		if e := n.bootstrap(); e != nil {
-			n.logf("topology refresh failed: %v", e)
-		}
-	})
 	go n.periodic(ctx, heartbeat, func() {
 		if e := n.register(); e != nil {
 			n.logf("heartbeat failed: %v", e)
@@ -1442,6 +1537,12 @@ func (n *node) close() {
 	if n.tun != nil {
 		n.tun.Close()
 	}
+	n.controlMu.Lock()
+	if n.control != nil {
+		_ = n.control.Close()
+		n.control = nil
+	}
+	n.controlMu.Unlock()
 }
 
 func (n *node) networkMAC(data, dst []byte) []byte {

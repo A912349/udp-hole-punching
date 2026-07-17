@@ -1,9 +1,11 @@
 # Home UDP Mesh (Go)
 
-This is the Go implementation of the home UDP mesh. It contains a small HTTP
-control plane, an encrypted UDP overlay node with Linux TUN support, and the
-stand-alone UDP hole-punching experiment. The control plane never relays user
-packets.
+This is the Go implementation of the home UDP mesh. It contains a WebSocket
+control plane (legacy HTTP endpoints remain for compatibility), an encrypted
+UDP overlay node with Linux TUN support, and the stand-alone UDP
+hole-punching experiment. Mesh nodes keep one connection open at `/v1/ws`;
+the coordinator pushes topology snapshots immediately after a node changes,
+without 5-second HTTP polling. The control plane never relays user packets.
 
 ## Build
 
@@ -36,6 +38,15 @@ of automatically selected superpeers is `ceil(sqrt(eligible cone relays))`.
 Set `MESH_AUTO_SUPERPEERS` to a positive number to pin that count. Advanced
 controls are `MESH_BACKBONE_DEGREE` (default `6`), `MESH_CLIENT_LINKS`
 (default `2`), and `MESH_SYMMETRIC_LINKS` (default `3`).
+
+## Web administration
+
+Open `http://SERVER_IP:8001/admin`, enter `MESH_NETWORK_TOKEN`, and use the
+page to view active nodes and overlay links or change the topology settings.
+Changes are stored in `mesh.db`, survive a coordinator restart, immediately
+recompute automatic superpeers, and are pushed to connected nodes through the
+control WebSocket. The page itself exposes no data until the token is supplied;
+serve the coordinator behind HTTPS in production.
 
 ## Run a node
 
