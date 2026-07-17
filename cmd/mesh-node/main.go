@@ -144,35 +144,36 @@ type fastStats struct {
 	deliveryDrops                    atomic.Uint64
 }
 type node struct {
-	c            config
-	id           *protocol.Identity
-	key          []byte
-	conn         *net.UDPConn
-	packet       *ipv4.PacketConn
-	control      *websocket.Conn
-	controlMu    sync.Mutex
-	controlCall  sync.Mutex
-	controlReply chan controlFrame
-	pingMu       sync.Mutex
-	pings        map[string]time.Time
-	mu           sync.RWMutex
-	dir          map[string]*peer
-	neighbors    map[string]*peer
-	links        []edge
-	routes       map[string]string
-	meshNodes    map[netip.Addr]string
-	seen         map[string]struct{}
-	pending      map[string]chan serviceResult
-	services     map[string]string
-	allow        map[string]bool
-	stop         context.CancelFunc
-	tun          *os.File
-	startedAt    time.Time
-	fastQueue    chan fastFrame
-	fastPool     sync.Pool
-	macPool      sync.Pool
-	deliverQueue chan deliverFrame
-	stats        fastStats
+	c             config
+	requestedRole string
+	id            *protocol.Identity
+	key           []byte
+	conn          *net.UDPConn
+	packet        *ipv4.PacketConn
+	control       *websocket.Conn
+	controlMu     sync.Mutex
+	controlCall   sync.Mutex
+	controlReply  chan controlFrame
+	pingMu        sync.Mutex
+	pings         map[string]time.Time
+	mu            sync.RWMutex
+	dir           map[string]*peer
+	neighbors     map[string]*peer
+	links         []edge
+	routes        map[string]string
+	meshNodes     map[netip.Addr]string
+	seen          map[string]struct{}
+	pending       map[string]chan serviceResult
+	services      map[string]string
+	allow         map[string]bool
+	stop          context.CancelFunc
+	tun           *os.File
+	startedAt     time.Time
+	fastQueue     chan fastFrame
+	fastPool      sync.Pool
+	macPool       sync.Pool
+	deliverQueue  chan deliverFrame
+	stats         fastStats
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -409,6 +410,7 @@ func newNode(c config) (*node, error) {
 	k := sha256.Sum256([]byte(c.token))
 	n := &node{
 		c:                  c,
+		requestedRole:      c.role,
 		id:                 id,
 		key:                k[:],
 		conn:               conn,
@@ -603,7 +605,7 @@ func (n *node) request(method, path string, in, out any) error {
 	return fmt.Errorf("control websocket request: %w", last)
 }
 func (n *node) register() error {
-	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.c.role, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
+	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.requestedRole, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
 	var out struct {
 		MeshIP string `json:"mesh_ip"`
 		Role   string `json:"assigned_role"`
@@ -622,6 +624,12 @@ func (n *node) register() error {
 		n.c.inviteToken = ""
 		k := sha256.Sum256([]byte(out.Token))
 		n.key = k[:]
+		persisted := n.c
+		persisted.role = n.requestedRole
+		if err := saveInteractiveConfig(persisted); err != nil {
+			return fmt.Errorf("persist enrolled network token: %w", err)
+		}
+		n.logf("invite accepted; permanent network credentials saved")
 	}
 	n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
 	return nil

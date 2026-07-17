@@ -143,6 +143,8 @@ func main() {
 	mux.HandleFunc("POST /v1/services", s.service)
 	mux.HandleFunc("GET /v1/services/{node_id}/{name}", s.serviceDetails)
 	mux.HandleFunc("GET /admin", s.adminPage)
+	mux.HandleFunc("GET /admin.css", s.adminAsset)
+	mux.HandleFunc("GET /admin.js", s.adminAsset)
 	mux.HandleFunc("GET /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("PUT /v1/admin/config", s.adminConfig)
 	mux.HandleFunc("GET /v1/admin/topology", s.adminTopology)
@@ -827,6 +829,18 @@ func (s *server) adminPage(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, adminPageHTML)
+}
+func (s *server) adminAsset(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/admin.css":
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		_, _ = io.WriteString(w, adminCSS)
+	case "/admin.js":
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		_, _ = io.WriteString(w, adminJS)
+	default:
+		http.NotFound(w, r)
+	}
 }
 
 /* Legacy inline admin UI retained temporarily for source-history context.
