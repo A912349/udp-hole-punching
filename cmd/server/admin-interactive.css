@@ -18,6 +18,7 @@
 .peerGroup.dragging { cursor: grabbing; }
 .peerGroup.selected .node { stroke: #fbbf24; stroke-width: 5; filter: drop-shadow(0 0 8px #fbbf24); }
 .peerGroup.linkSource .node { stroke: #60a5fa; stroke-width: 5; filter: drop-shadow(0 0 9px #3b82f6); }
+.nodeUptime { fill: var(--muted); font-size: 10px; }
 .advancedGraph { margin-top: 16px; }
 .advancedGraph article { min-width: 0; }
 @media (max-width: 900px) {

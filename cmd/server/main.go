@@ -29,16 +29,18 @@ import (
 )
 
 type node struct {
-	ID                  string `json:"node_id"`
-	PublicKey           string `json:"public_key"`
-	NAT                 string `json:"nat_type"`
-	Role                string `json:"role"`
-	Endpoint            string `json:"endpoint"`
-	Capacity            int    `json:"capacity"`
-	MeshIP              string `json:"mesh_ip"`
-	RequestedRole       string `json:"requested_role"`
-	Relay               bool   `json:"relay_capable"`
-	LastSeen, CreatedAt int64
+	ID            string `json:"node_id"`
+	PublicKey     string `json:"public_key"`
+	NAT           string `json:"nat_type"`
+	Role          string `json:"role"`
+	Endpoint      string `json:"endpoint"`
+	Capacity      int    `json:"capacity"`
+	MeshIP        string `json:"mesh_ip"`
+	RequestedRole string `json:"requested_role"`
+	Relay         bool   `json:"relay_capable"`
+	LastSeen      int64  `json:"last_seen"`
+	CreatedAt     int64  `json:"created_at"`
+	UptimeSeconds int64  `json:"uptime_seconds,omitempty"`
 }
 type link struct {
 	A      string  `json:"a"`
@@ -547,10 +549,17 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ttl := s.settings().TTL
-	nodes, err := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id", time.Now().Unix()-int64(ttl))
+	now := time.Now().Unix()
+	nodes, err := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id", now-int64(ttl))
 	if err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	for i := range nodes {
+		nodes[i].UptimeSeconds = now - nodes[i].CreatedAt
+		if nodes[i].UptimeSeconds < 0 {
+			nodes[i].UptimeSeconds = 0
+		}
 	}
 	reply(w, http.StatusOK, map[string]any{"nodes": nodes, "links": s.links(nodes), "settings": s.settings()})
 }
@@ -619,23 +628,63 @@ func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	reply(w, 200, out)
 }
-func (s *server) decorateLinks(links []link) []link {
+func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 	s.metricsMu.RLock()
 	defer s.metricsMu.RUnlock()
 	now := time.Now()
+	uptime := map[string]int64{}
+	if len(nodes) > 0 {
+		for _, n := range nodes[0] {
+			uptime[n.ID] = max64(0, now.Unix()-n.CreatedAt)
+		}
+	}
 	for i := range links {
 		m := s.metrics[metricKey(links[i].A, links[i].B)]
+		baseCost := links[i].Cost
+		if baseCost <= 0 {
+			baseCost = 1
+		}
 		if m.RTTMS > 0 {
 			links[i].RTTMS = m.RTTMS
-			links[i].Cost = 1 + m.RTTMS/1000
+			// Keep the configured/manual weight as a base, then add the
+			// measured latency. This makes cost useful for both automatic and
+			// manually edited graphs instead of silently replacing it.
+			links[i].Cost = baseCost * (1 + m.RTTMS/1000)
+		} else {
+			links[i].Cost = baseCost
+		}
+		// New nodes have less observed uptime, so keep them slightly less
+		// attractive until they prove stable. The factor converges to 1.
+		if ua, oka := uptime[links[i].A]; oka {
+			if ub, okb := uptime[links[i].B]; okb {
+				hours := float64(min64(ua, ub)) / 3600
+				links[i].Cost *= 1 + 1/(1+hours)
+			}
 		}
 		if m.Up && now.Sub(m.Seen) < 45*time.Second {
 			links[i].Status = "up"
 		} else {
 			links[i].Status = "down"
+			// A stale/down link remains visible for diagnostics but is made
+			// expensive enough that routing avoids it while telemetry recovers.
+			links[i].Cost *= 4
 		}
 	}
 	return links
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (s *server) consumeInvite(token string) bool {
@@ -1244,7 +1293,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 }
 func (s *server) links(nodes []node) []link {
 	if manual := s.manualLinks(); len(manual) > 0 {
-		return s.decorateLinks(manual)
+		return s.decorateLinks(manual, nodes)
 	}
 	s.configMu.RLock()
 	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
@@ -1295,7 +1344,7 @@ func (s *server) links(nodes []node) []link {
 			out = append(out, link{A: n.ID, B: p.ID, Cost: 1 + float64(i)/10})
 		}
 	}
-	return s.decorateLinks(out)
+	return s.decorateLinks(out, nodes)
 }
 func max(a, b int) int {
 	if a > b {
