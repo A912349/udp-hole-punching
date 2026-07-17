@@ -354,7 +354,9 @@ func loadInteractiveConfig() (config, error) {
 	var saved savedConfig
 	err = json.Unmarshal(b, &saved)
 	if err == nil {
-		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: saved.Endpoint, meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: saved.Debug, controlInsecure: saved.ControlInsecure}
+		// Debug is intentionally not restored from disk: it is a temporary
+		// diagnostic mode enabled only by an explicit --debug flag.
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: saved.Endpoint, meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
 		if c.server == "" || (c.token == "" && c.inviteToken == "") {
 			return config{}, fmt.Errorf("saved configuration is empty; run --reset-config once")
 		}
@@ -362,7 +364,7 @@ func loadInteractiveConfig() (config, error) {
 	return c, err
 }
 func saveInteractiveConfig(c config) error {
-	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: c.debug, ControlInsecure: c.controlInsecure}
+	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure}
 	b, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
