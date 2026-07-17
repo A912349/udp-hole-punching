@@ -706,14 +706,14 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 
 func (s *server) manualLinks() []link {
 	if s.db == nil {
-		return nil
+		return []link{}
 	}
 	rows, err := s.db.Query("SELECT a,b,cost FROM graph_links ORDER BY a,b")
 	if err != nil {
-		return nil
+		return []link{}
 	}
 	defer rows.Close()
-	var out []link
+	out := []link{}
 	for rows.Next() {
 		var e link
 		if rows.Scan(&e.A, &e.B, &e.Cost) == nil {
@@ -924,6 +924,11 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
 	}
+	if e = s.rebalanceRoles(); e != nil {
+		reply(w, 500, map[string]any{"error": e.Error()})
+		return
+	}
+	_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
 	log.Printf("[SERVER] register node=%s role=%s mesh_ip=%s", d.ID[:8], role, ip)
 	reply(w, 200, map[string]any{"status": "ok", "mesh_ip": ip, "mesh_network": s.network.String(), "assigned_role": role})
 }
@@ -1057,7 +1062,7 @@ func (s *server) links(nodes []node) []link {
 			sp = append(sp, n)
 		}
 	}
-	var out []link
+	out := []link{}
 	degree := min(max(1, backboneDegree), len(sp)-1)
 	seen := map[string]bool{}
 	for i, n := range sp {
