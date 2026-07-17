@@ -650,7 +650,20 @@ func (n *node) establishSymmetricTransport() bool {
 	}
 	old := n.conn
 	n.conn = selected
+	// The receive loop uses PacketConn for batched reads. It must follow the
+	// selected symmetric-NAT socket too; otherwise it remains attached to the
+	// closed bootstrap socket and the node can send packets but never receive
+	// fast frames.
+	n.packet = ipv4.NewPacketConn(selected)
 	_ = old.Close()
+	if endpoint, _, err := stunEndpoint(selected); err == nil {
+		n.c.endpoint = endpoint
+		if err := n.register(); err != nil {
+			n.logf("symmetric NAT endpoint update failed: %v", err)
+		} else if err := n.bootstrap(); err != nil {
+			n.logf("topology refresh after symmetric NAT update failed: %v", err)
+		}
+	}
 	n.symmetricMu.Lock()
 	n.symmetricReady = true
 	n.symmetricMu.Unlock()
