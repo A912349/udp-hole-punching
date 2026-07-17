@@ -261,6 +261,13 @@ func parse() config {
 	if saved, err := loadInteractiveConfig(); err == nil {
 		if len(os.Args) == 1 {
 			c = saved
+			// Interactive nodes are TUN endpoints by default. Migrate earlier
+			// saved configurations that predate this default.
+			if c.tun == "" {
+				c.tun = "mesh0"
+				c.autoTUN = true
+				_ = saveInteractiveConfig(c)
+			}
 		} else { // Keep CLI tuning flags, but reuse saved connection and identity settings.
 			if c.server == "" {
 				c.server = saved.server
@@ -277,7 +284,7 @@ func parse() config {
 		}
 	} else if len(os.Args) == 1 {
 		if !errors.Is(err, os.ErrNotExist) {
-			log.Fatal("read saved configuration: ", err)
+			log.Printf("saved configuration needs replacement: %v", err)
 		}
 		c = askInteractiveConfig()
 		if err := saveInteractiveConfig(c); err != nil {
@@ -299,17 +306,31 @@ func parse() config {
 
 const interactiveConfigFile = "mesh-node-config.json"
 
+type savedConfig struct {
+	Server, Token, InviteToken, Role, NAT, Bind, Endpoint, MeshIP, TUN, State, ControlCA string
+	Port, Capacity, Prefix                                                               int
+	NoRelay, AutoTUN, Debug, ControlInsecure                                             bool
+}
+
 func loadInteractiveConfig() (config, error) {
 	var c config
 	b, err := os.ReadFile(interactiveConfigFile)
 	if err != nil {
 		return c, err
 	}
-	err = json.Unmarshal(b, &c)
+	var saved savedConfig
+	err = json.Unmarshal(b, &saved)
+	if err == nil {
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: saved.Endpoint, meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: saved.Debug, controlInsecure: saved.ControlInsecure}
+		if c.server == "" || (c.token == "" && c.inviteToken == "") {
+			return config{}, fmt.Errorf("saved configuration is empty; run --reset-config once")
+		}
+	}
 	return c, err
 }
 func saveInteractiveConfig(c config) error {
-	b, err := json.MarshalIndent(c, "", "  ")
+	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: c.debug, ControlInsecure: c.controlInsecure}
+	b, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -326,7 +347,7 @@ func askInteractiveConfig() config {
 		}
 		return v
 	}
-	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", prefix: 24, capacity: 1}
+	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1}
 	credential := ask("Network token or 6-character invite", "")
 	if len(credential) == 6 {
 		c.inviteToken = credential
