@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"container/heap"
 	"context"
@@ -65,7 +66,7 @@ var fastMagicBytes = []byte(fastMagic)
 type config struct {
 	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen string
 	port, capacity, prefix                                                                                    int
-	noRelay, autoTUN, debug                                                                                   bool
+	noRelay, autoTUN, debug, resetConfig                                                                      bool
 	fastWorkers                                                                                               int
 	statsInterval                                                                                             time.Duration
 	services, allows                                                                                          multi
@@ -241,7 +242,27 @@ func parse() config {
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
 	f.StringVar(&c.requestFile, "request-file", "", "request file")
+	f.BoolVar(&c.resetConfig, "reset-config", false, "delete saved interactive configuration and ask again")
 	f.Parse(os.Args[1:])
+	if len(os.Args) == 1 {
+		if saved, err := loadInteractiveConfig(); err == nil {
+			c = saved
+		} else if !errors.Is(err, os.ErrNotExist) {
+			log.Fatal("read saved configuration: ", err)
+		} else {
+			c = askInteractiveConfig()
+			if err := saveInteractiveConfig(c); err != nil {
+				log.Fatal("save configuration: ", err)
+			}
+		}
+	}
+	if c.resetConfig {
+		if err := os.Remove(interactiveConfigFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Fatal("reset configuration: ", err)
+		}
+		fmt.Println("Saved configuration reset. Run without parameters to configure it again.")
+		os.Exit(0)
+	}
 	if c.server == "" || (c.token == "" && c.inviteToken == "") {
 		f.Usage()
 		os.Exit(2)
@@ -252,6 +273,47 @@ func parse() config {
 	if c.statsInterval < 0 {
 		log.Fatal("--stats-interval must not be negative")
 	}
+	return c
+}
+
+const interactiveConfigFile = "mesh-node-config.json"
+
+func loadInteractiveConfig() (config, error) {
+	var c config
+	b, err := os.ReadFile(interactiveConfigFile)
+	if err != nil {
+		return c, err
+	}
+	err = json.Unmarshal(b, &c)
+	return c, err
+}
+func saveInteractiveConfig(c config) error {
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(interactiveConfigFile, b, 0600)
+}
+func askInteractiveConfig() config {
+	in := bufio.NewReader(os.Stdin)
+	ask := func(label, fallback string) string {
+		fmt.Printf("%s [%s]: ", label, fallback)
+		v, _ := in.ReadString('\n')
+		v = strings.TrimSpace(v)
+		if v == "" {
+			return fallback
+		}
+		return v
+	}
+	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", prefix: 24, capacity: 1}
+	credential := ask("Network token or 6-character invite", "")
+	if len(credential) == 6 {
+		c.inviteToken = credential
+	} else {
+		c.token = credential
+	}
+	c.role = ask("Role (auto/client/superpeer)", "auto")
+	c.state = ask("State directory", "mesh-state")
 	return c
 }
 func loadIdentity(dir string) (*protocol.Identity, error) {
