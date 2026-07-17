@@ -291,9 +291,7 @@ func parse() config {
 			if c.bind == "0.0.0.0" {
 				c.bind = saved.bind
 			}
-			if c.endpoint == "" {
-				c.endpoint = saved.endpoint
-			}
+			// Never restore a previously observed public endpoint; rediscover it.
 			if c.meshIP == "" {
 				c.meshIP = saved.meshIP
 			}
@@ -356,7 +354,9 @@ func loadInteractiveConfig() (config, error) {
 	if err == nil {
 		// Debug is intentionally not restored from disk: it is a temporary
 		// diagnostic mode enabled only by an explicit --debug flag.
-		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: saved.Endpoint, meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
+		// Public NAT mappings are not persistent credentials. Always rediscover
+		// the endpoint after a process/NAT restart instead of reusing stale JSON.
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
 		if c.server == "" || (c.token == "" && c.inviteToken == "") {
 			return config{}, fmt.Errorf("saved configuration is empty; run --reset-config once")
 		}
