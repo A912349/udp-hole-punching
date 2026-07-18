@@ -204,6 +204,15 @@ func configureSiteNAT(localLAN, remoteVirtual []string) error {
 					return fmt.Errorf("iptables MASQUERADE %s to %s: %s", src, dst, string(out))
 				}
 			}
+			for _, direction := range [][2]string{{src, dst}, {dst, src}} {
+				check := []string{"-w", "-t", "filter", "-C", "FORWARD", "-s", direction[0], "-d", direction[1], "-j", "ACCEPT"}
+				if _, err := run(check...); err != nil {
+					add := []string{"-w", "-t", "filter", "-A", "FORWARD", "-s", direction[0], "-d", direction[1], "-j", "ACCEPT"}
+					if out, e := run(add...); e != nil {
+						return fmt.Errorf("iptables FORWARD %s to %s: %s", direction[0], direction[1], string(out))
+					}
+				}
+			}
 		}
 	}
 	if out, err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput(); err != nil {

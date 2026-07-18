@@ -745,6 +745,13 @@ func (n *node) applyTopology(t topology) {
 	n.links = t.Links
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
+	if n.c.debug {
+		n.mu.RLock()
+		for _, r := range n.subnetRoutes {
+			n.logf("virtual route %s -> %s (LAN %s)", r.Virtual, r.Owner, r.LAN)
+		}
+		n.mu.RUnlock()
+	}
 	if n.tun != nil && n.c.autoTUN {
 		if err := n.syncTUNRoutes(); err != nil {
 			n.logf("subnet route sync failed: %v", err)
@@ -2020,6 +2027,9 @@ func (n *node) deliver(src string, p []byte) {
 		return
 	}
 	sourceIP, destinationIP := netip.AddrFrom4([4]byte(p[12:16])), netip.AddrFrom4([4]byte(p[16:20]))
+	if n.c.debug {
+		n.debugf("deliver candidate from %s: %s -> %s proto=%d", src[:8], sourceIP, destinationIP, p[9])
+	}
 	if !n.addressOwnedBy(src, sourceIP) || !(destinationIP.String() == n.c.meshIP || n.addressOwnedBy(n.id.ID, destinationIP)) {
 		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
 		return
@@ -2028,6 +2038,13 @@ func (n *node) deliver(src string, p []byte) {
 		n.debugf("drop IP packet from %s: missing local translation", src[:8])
 		return
 	}
+	if n.c.debug {
+		n.debugf("deliver to TUN from %s: %s -> %s", src[:8], netip.AddrFrom4([4]byte(p[12:16])), netip.AddrFrom4([4]byte(p[16:20])))
+		ihl := int(p[0]&15) * 4
+		if ihl <= len(p) && packetChecksum(p[:ihl]) != 0 {
+			n.debugf("deliver warning: invalid IPv4 header checksum")
+		}
+	}
 	if _, err := n.tun.Write(p); err != nil {
 		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
 		return
@@ -2035,6 +2052,23 @@ func (n *node) deliver(src string, p []byte) {
 	n.stats.deliveredPackets.Add(1)
 	n.stats.deliveredBytes.Add(uint64(len(p)))
 	n.debugf("TUN IPv4 delivered from %s (%d bytes)", src[:8], len(p))
+}
+
+func packetChecksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+		for sum>>16 != 0 {
+			sum = (sum & 0xffff) + (sum >> 16)
+		}
+	}
+	if len(b)%2 != 0 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
 }
 
 func (n *node) ownerOf(ip netip.Addr) string {
