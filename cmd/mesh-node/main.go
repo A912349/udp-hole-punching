@@ -39,13 +39,15 @@ import (
 )
 
 const (
-	keepAlive   = 10 * time.Second
-	refresh     = 5 * time.Second
-	heartbeat   = 15 * time.Second
-	linkTimeout = 30 * time.Second
-	linkGrace   = 35 * time.Second
-	maxRequest  = 32000
-	maxResponse = 48000
+	keepAlive          = 10 * time.Second
+	refresh            = 5 * time.Second
+	heartbeat          = 15 * time.Second
+	linkTimeout        = 30 * time.Second
+	linkGrace          = 35 * time.Second
+	recoveryMinBackoff = 30 * time.Second
+	recoveryMaxBackoff = 5 * time.Minute
+	maxRequest         = 32000
+	maxResponse        = 48000
 
 	symmetricBurstSize    = 500
 	symmetricBurstTimeout = 45 * time.Second
@@ -173,6 +175,8 @@ type node struct {
 	lanConn         *net.UDPConn
 	udpReadMu       sync.Mutex
 	recoveryMu      sync.Mutex
+	recoveryNext    time.Time
+	recoveryFails   int
 	control         *websocket.Conn
 	controlMu       sync.Mutex
 	controlCall     sync.Mutex
@@ -1254,10 +1258,14 @@ func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 
 func (n *node) recoverNetwork() {
 	n.mu.RLock()
-	stale := false
+	stale := len(n.neighbors) > 0
 	for _, peer := range n.neighbors {
-		if !peer.lastRX.IsZero() && time.Since(peer.lastRX) >= linkTimeout {
-			stale = true
+		// A single offline neighbor is normal in a mesh. Recovery of the
+		// local NAT mapping is only justified when every observed neighbor is
+		// stale; otherwise an unrelated peer can repeatedly disrupt healthy
+		// traffic on this node.
+		if peer.lastRX.IsZero() || time.Since(peer.lastRX) < linkTimeout {
+			stale = false
 			break
 		}
 	}
@@ -1266,10 +1274,22 @@ func (n *node) recoverNetwork() {
 		return
 	}
 	defer n.recoveryMu.Unlock()
+	if time.Now().Before(n.recoveryNext) {
+		return
+	}
 	n.logf("network link stale; refreshing STUN endpoint and topology")
 	endpoint, nat, err := n.detectEndpoint()
 	if err != nil {
-		n.logf("STUN recovery failed: %v", err)
+		n.recoveryFails++
+		backoff := recoveryMinBackoff
+		for i := 1; i < n.recoveryFails && backoff < recoveryMaxBackoff; i++ {
+			backoff *= 2
+		}
+		if backoff > recoveryMaxBackoff {
+			backoff = recoveryMaxBackoff
+		}
+		n.recoveryNext = time.Now().Add(backoff)
+		n.logf("STUN recovery failed: %v; retrying in %s", err, backoff)
 		return
 	}
 	n.c.endpoint = endpoint
@@ -1284,6 +1304,8 @@ func (n *node) recoverNetwork() {
 		n.logf("topology refresh after network loss failed: %v", err)
 		return
 	}
+	n.recoveryFails = 0
+	n.recoveryNext = time.Time{}
 	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
 		n.logf("symmetric transport recovery failed")
 	}
@@ -1375,6 +1397,7 @@ func (n *node) send(p protocol.Packet) bool {
 func (n *node) nextHop(destination string) (string, *peer) {
 	n.mu.RLock()
 	hop := n.routes[destination]
+	previousHop := hop
 	peer := n.neighbors[hop]
 	if n.usable(peer) {
 		n.mu.RUnlock()
@@ -1428,7 +1451,9 @@ func (n *node) nextHop(destination string) (string, *peer) {
 	n.mu.Lock()
 	n.routes[destination] = hop
 	n.mu.Unlock()
-	n.logf("route failover %s -> %s", destination[:8], hop[:8])
+	if previousHop != hop {
+		n.logf("route failover %s -> %s", destination[:8], hop[:8])
+	}
 	return hop, peer
 }
 func (n *node) startFastWorkers(ctx context.Context) {
