@@ -1578,7 +1578,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 }
 func (s *server) links(nodes []node) []link {
 	if manual := s.manualLinks(); len(manual) > 0 {
-		return s.decorateLinks(manual, nodes)
+		return s.decorateLinks(s.addAutomaticClientLinks(manual, nodes), nodes)
 	}
 	s.configMu.RLock()
 	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
@@ -1630,6 +1630,61 @@ func (s *server) links(nodes []node) []link {
 		}
 	}
 	return s.decorateLinks(out, nodes)
+}
+
+// addAutomaticClientLinks preserves manually managed backbone edges while
+// still attaching every client to the nearest available superpeers. Without
+// this merge, adding any manual graph edge disables all automatic client
+// attachments, leaving newly registered nodes with neighbors=0.
+func (s *server) addAutomaticClientLinks(out []link, nodes []node) []link {
+	s.configMu.RLock()
+	clientLinks, symmetricLinks := s.clientLinks, s.symmetricLinks
+	s.configMu.RUnlock()
+	var superpeers []node
+	for _, n := range nodes {
+		if n.Role == "superpeer" {
+			superpeers = append(superpeers, n)
+		}
+	}
+	if len(superpeers) == 0 {
+		return out
+	}
+	for _, client := range nodes {
+		if client.Role != "client" {
+			continue
+		}
+		want := clientLinks
+		if client.NAT == "symmetric" {
+			want = symmetricLinks
+		}
+		connected := map[string]bool{}
+		for _, edge := range out {
+			if edge.A == client.ID {
+				connected[edge.B] = true
+			}
+			if edge.B == client.ID {
+				connected[edge.A] = true
+			}
+		}
+		count := 0
+		for _, peer := range superpeers {
+			if connected[peer.ID] {
+				count++
+			}
+		}
+		for _, peer := range s.telemetryPeerOrder(client, superpeers) {
+			if count >= want {
+				break
+			}
+			if connected[peer.ID] {
+				continue
+			}
+			out = append(out, link{A: client.ID, B: peer.ID, Cost: 1 + float64(count)/10})
+			connected[peer.ID] = true
+			count++
+		}
+	}
+	return out
 }
 func max(a, b int) int {
 	if a > b {

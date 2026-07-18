@@ -68,3 +68,16 @@ func TestWeightedPeerOrderIsStable(t *testing.T) {
 		}
 	}
 }
+
+func TestManualBackboneStillAttachesNewClients(t *testing.T) {
+	s := &server{clientLinks: 2, symmetricLinks: 3}
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("new-client", "cone", "client", 1),
+	}
+	links := s.addAutomaticClientLinks([]link{{A: "sp-a", B: "sp-b"}}, nodes)
+	if got := len(neighborsFor(links, "new-client")); got != 2 {
+		t.Fatalf("new client has %d automatic superpeer links, want 2", got)
+	}
+}
