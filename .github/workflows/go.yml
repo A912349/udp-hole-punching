@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - run: go mod download
+
+      - name: Create bin directory
+        run: mkdir -p bin
+
+      - name: Build server
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o bin/server ./cmd/server
+
+      - name: Build mesh-node (linux amd64)
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o bin/mesh-node ./cmd/mesh-node
+
+      - name: Build mesh-node (linux arm64)
+        run: |
+          GOOS=linux GOARCH=arm64 \
+          go build -trimpath -ldflags="-s -w" \
+            -o bin/mesh-node-linux-arm64 ./cmd/mesh-node
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: bin/
