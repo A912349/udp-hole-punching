@@ -43,6 +43,7 @@ type node struct {
 	LastSeen      int64                `json:"last_seen"`
 	CreatedAt     int64                `json:"created_at"`
 	UptimeSeconds int64                `json:"uptime_seconds,omitempty"`
+	Online        bool                 `json:"online"`
 	Name          string               `json:"name,omitempty"`
 	Routes        []routeAdvertisement `json:"routes,omitempty"`
 	DNSRecords    []dnsRecord          `json:"dns_records,omitempty"`
@@ -567,7 +568,15 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	}
 	ttl := s.settings().TTL
 	now := time.Now().Unix()
-	nodes, err := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id", now-int64(ttl))
+	scope := r.URL.Query().Get("scope")
+	all := scope == "all"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id"
+	args := []any{now - int64(ttl)}
+	if all {
+		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes ORDER BY node_id"
+		args = nil
+	}
+	nodes, err := s.rows(query, args...)
 	if err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -578,8 +587,32 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		if nodes[i].UptimeSeconds < 0 {
 			nodes[i].UptimeSeconds = 0
 		}
+		nodes[i].Online = nodes[i].LastSeen >= now-int64(ttl)
 	}
-	reply(w, http.StatusOK, map[string]any{"nodes": nodes, "links": s.links(nodes), "settings": s.settings()})
+	links := s.links(nodes)
+	if all {
+		// Keep the live topology based on online nodes, but expose stored manual
+		// links to offline nodes so they can still be edited in the graph.
+		online := make([]node, 0, len(nodes))
+		for _, n := range nodes {
+			if n.Online {
+				online = append(online, n)
+			}
+		}
+		links = s.links(online)
+		seen := map[string]bool{}
+		for _, e := range links {
+			seen[edgeKey(e.A, e.B)] = true
+		}
+		missing := []link{}
+		for _, e := range s.manualLinks() {
+			if !seen[edgeKey(e.A, e.B)] {
+				missing = append(missing, e)
+			}
+		}
+		links = append(links, s.decorateLinks(missing, nodes)...)
+	}
+	reply(w, http.StatusOK, map[string]any{"scope": map[bool]string{true: "all", false: "online"}[all], "nodes": nodes, "links": links, "settings": s.settings()})
 }
 
 func (s *server) enrichNodes(nodes []node) {
@@ -1771,6 +1804,13 @@ func (s *server) links(nodes []node) []link {
 		}
 	}
 	return s.decorateLinks(out, nodes)
+}
+
+func edgeKey(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return a + ":" + b
 }
 
 // addAutomaticClientLinks preserves manually managed backbone edges while
