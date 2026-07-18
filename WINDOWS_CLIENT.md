@@ -39,6 +39,15 @@ restores adapter DNS to DHCP.
 If the adapter name is already used by another Wintun instance, choose another
 name with `--tun-name`. Each client must use its own `--state-dir` and identity.
 
+Run the local smoke test from the repository after starting the client:
+
+```powershell
+.\WINDOWS_SMOKE_TEST.ps1 -Peer 10.77.0.1,10.77.0.2
+```
+
+It verifies the adapter state, assigned IPv4 address, routes and the inbound
+firewall rule before testing the selected mesh peers.
+
 ## Troubleshooting
 
 - `load wintun.dll`: copy the architecture-matching Wintun DLL beside the

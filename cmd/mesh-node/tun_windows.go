@@ -231,7 +231,7 @@ $prefix = [int]$env:MESH_TUN_PREFIX
 $old = Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne $ip }
 $old | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
 if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
-    New-NetIPAddress -InterfaceIndex $index -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 -PolicyStore ActiveStore -PassThru | Out-Null
+    New-NetIPAddress -InterfaceIndex $index -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 -PolicyStore ActiveStore | Out-Null
 }
 if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
     throw "IPv4 address was not materialized on interface index $index"
@@ -247,7 +247,7 @@ if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAct
 	// Keep netsh as a fallback for stripped-down Windows installations where
 	// the NetTCPIP PowerShell module is unavailable.
 	netshSetErr := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "gateway=none", "store=active")
-	netshErr := runWindows("netsh", "interface", "ipv4", "add", "address", "name="+name, "address="+ip, "mask="+mask, "type=unicast", "gateway=none", "store=active")
+	netshErr := runWindows("netsh", "interface", "ipv4", "add", "address", "name="+name, "address="+ip, "mask="+mask, "type=unicast", "store=active")
 	if netshSetErr == nil && netshErr == nil {
 		if err := windowsHasAddress(name, ip); err == nil {
 			return nil
