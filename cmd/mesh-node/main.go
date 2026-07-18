@@ -34,7 +34,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/ipv4"
 	"golang.org/x/net/websocket"
 	"home-udp-mesh/internal/protocol"
 )
@@ -169,7 +168,6 @@ type node struct {
 	id              *protocol.Identity
 	key             []byte
 	conn            *net.UDPConn
-	packet          *ipv4.PacketConn
 	control         *websocket.Conn
 	controlMu       sync.Mutex
 	controlCall     sync.Mutex
@@ -471,7 +469,6 @@ func newNode(c config) (*node, error) {
 		id:                 id,
 		key:                k[:],
 		conn:               conn,
-		packet:             ipv4.NewPacketConn(conn),
 		dir:                map[string]*peer{},
 		neighbors:          map[string]*peer{},
 		routes:             map[string]string{},
@@ -1007,11 +1004,6 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 	}
 	old := n.conn
 	n.conn = selected
-	// The receive loop uses PacketConn for batched reads. It must follow the
-	// selected symmetric-NAT socket too; otherwise it remains attached to the
-	// closed bootstrap socket and the node can send packets but never receive
-	// fast frames.
-	n.packet = ipv4.NewPacketConn(selected)
 	_ = old.Close()
 	if endpoint, _, err := stunEndpoint(selected); err == nil {
 		n.c.endpoint = endpoint
@@ -1438,14 +1430,12 @@ func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 }
 
 func (n *node) receive(ctx context.Context) {
-	messages := make([]ipv4.Message, fastBatchSize)
-	for i := range messages {
-		messages[i].Buffers = [][]byte{make([]byte, protocol.MaxDatagramSize)}
-	}
+	buffer := make([]byte, protocol.MaxDatagramSize)
 	defer close(n.fastQueue)
 	for {
-		n.packet.SetReadDeadline(time.Now().Add(time.Second))
-		count, e := n.packet.ReadBatch(messages, 0)
+		conn := n.conn
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		length, address, e := conn.ReadFromUDP(buffer)
 		if e != nil {
 			if ctx.Err() != nil {
 				return
@@ -1453,60 +1443,55 @@ func (n *node) receive(ctx context.Context) {
 			if ne, ok := e.(net.Error); ok && ne.Timeout() {
 				continue
 			}
+			n.debugf("UDP receive failed: %v", e)
 			continue
 		}
-		for _, message := range messages[:count] {
-			datagram := message.Buffers[0][:message.N]
-			a, ok := message.Addr.(*net.UDPAddr)
-			if !ok {
-				continue
-			}
-			if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
-				n.enqueueFast(datagram, a)
-				continue
-			}
-			p, e := protocol.DecodePacket(datagram, n.key)
-			if e != nil || !n.remember(p.ID) {
-				continue
-			}
-			n.touch(p.Source, a)
-			if p.Destination != n.id.ID {
-				if n.c.role == "superpeer" {
-					if q, e := p.DecTTL(); e == nil {
-						n.send(q)
-					}
+		datagram := buffer[:length]
+		if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
+			n.enqueueFast(datagram, address)
+			continue
+		}
+		p, e := protocol.DecodePacket(datagram, n.key)
+		if e != nil || !n.remember(p.ID) {
+			continue
+		}
+		n.touch(p.Source, address)
+		if p.Destination != n.id.ID {
+			if n.c.role == "superpeer" {
+				if q, e := p.DecTTL(); e == nil {
+					n.send(q)
 				}
-				continue
 			}
-			switch p.Type {
-			case "HELLO":
-				n.ensureNeighbor(p.Source)
-				n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
-			case "HELLO_ACK":
-				n.completeSymmetricScan(p.Source)
-			case "PING":
-				n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
-			case "PONG":
-				if id, ok := p.Payload["ping_id"].(string); ok {
-					n.pingMu.Lock()
-					sent := n.pings[id]
-					delete(n.pings, id)
-					n.pingMu.Unlock()
-					if !sent.IsZero() {
-						n.mu.Lock()
-						if q := n.neighbors[p.Source]; q != nil {
-							q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
-						}
-						n.mu.Unlock()
+			continue
+		}
+		switch p.Type {
+		case "HELLO":
+			n.ensureNeighbor(p.Source)
+			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
+		case "HELLO_ACK":
+			n.completeSymmetricScan(p.Source)
+		case "PING":
+			n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
+		case "PONG":
+			if id, ok := p.Payload["ping_id"].(string); ok {
+				n.pingMu.Lock()
+				sent := n.pings[id]
+				delete(n.pings, id)
+				n.pingMu.Unlock()
+				if !sent.IsZero() {
+					n.mu.Lock()
+					if q := n.neighbors[p.Source]; q != nil {
+						q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
 					}
+					n.mu.Unlock()
 				}
-			case "SYMMETRIC_BURST":
-				n.ensureNeighbor(p.Source)
-				n.handleSymmetricBurst(p)
-			case "DATA":
-				n.ensureNeighbor(p.Source)
-				n.data(p)
 			}
+		case "SYMMETRIC_BURST":
+			n.ensureNeighbor(p.Source)
+			n.handleSymmetricBurst(p)
+		case "DATA":
+			n.ensureNeighbor(p.Source)
+			n.data(p)
 		}
 	}
 }
