@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/binary"
 	"net"
-	"os"
 	"strings"
 	"time"
 )
@@ -44,13 +43,7 @@ func dnsAnswer(query []byte, questionEnd int, ip net.IP) []byte {
 }
 
 func systemResolver() string {
-	b, err := os.ReadFile("/etc/resolv.conf")
-	if err == nil {
-		if resolver := resolverFromResolvConf(string(b)); resolver != "" {
-			return resolver
-		}
-	}
-	return "1.1.1.1:53"
+	return platformSystemResolver()
 }
 
 // resolverFromResolvConf returns an upstream resolver, ignoring the address

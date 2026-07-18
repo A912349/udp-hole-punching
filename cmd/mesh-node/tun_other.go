@@ -1,17 +1,23 @@
-//go:build !linux
+//go:build !linux && !windows
 
 package main
 
 import (
 	"errors"
-	"os"
 )
 
-func openTUN(string) (*os.File, error)       { return nil, errors.New("TUN is supported only on Linux") }
-func configureTUN(string, string, int) error { return errors.New("TUN is supported only on Linux") }
-func readTUN(*os.File, []byte) (int, error)  { return 0, errors.New("TUN is supported only on Linux") }
+func openTUN(string) (tunDevice, error) {
+	return nil, errors.New("TUN is supported on Linux and Windows")
+}
+func configureTUN(string, string, int) error {
+	return errors.New("TUN is supported on Linux and Windows")
+}
+func readTUN(tunDevice, []byte) (int, error) {
+	return 0, errors.New("TUN is supported only on Linux and Windows")
+}
 func configureTUNRoutes(string, map[string]bool, map[string]bool) error {
 	return errors.New("TUN is supported only on Linux")
 }
 func configureSystemDNS(string, string, string) error { return nil }
 func configureSiteNAT([]string, []string) error       { return nil }
+func cleanupTUN(string, map[string]bool)              {}

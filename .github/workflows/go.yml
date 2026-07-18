@@ -75,3 +75,45 @@ jobs:
           path: bin/*
           compression-level: 0
           retention-days: 30
+
+  windows-client:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Test Windows client
+        run: go test ./cmd/mesh-node ./cmd/punch-client ./internal/protocol
+
+      - name: Build Windows client
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          $env:CGO_ENABLED = '0'
+          go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o bin/mesh-node.exe ./cmd/mesh-node
+          go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o bin/punch-client.exe ./cmd/punch-client
+
+      - name: Bundle official Wintun runtime
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'wintun') -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun\wintun\bin\amd64\wintun.dll') bin\wintun.dll
+
+      - name: Upload Windows client
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-client
+          path: bin/*
+          compression-level: 0
+          retention-days: 30

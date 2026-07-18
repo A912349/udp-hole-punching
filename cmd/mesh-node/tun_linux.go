@@ -42,7 +42,11 @@ func openTUN(name string) (*os.File, error) {
 // readTUN deliberately bypasses os.File.Read. Go's runtime poller rejects
 // some /dev/net/tun implementations with "not pollable", while the raw Linux
 // read(2) syscall is valid and blocks until the kernel supplies an IP frame.
-func readTUN(file *os.File, buffer []byte) (int, error) {
+func readTUN(device tunDevice, buffer []byte) (int, error) {
+	file, ok := device.(*os.File)
+	if !ok {
+		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
+	}
 	return syscall.Read(int(file.Fd()), buffer)
 }
 
@@ -241,6 +245,8 @@ func configureSiteNAT(localLAN, remoteVirtual []string) error {
 	}
 	return nil
 }
+
+func cleanupTUN(string, map[string]bool) {}
 
 func findIPCommand() (string, error) {
 	if path, err := exec.LookPath("ip"); err == nil {

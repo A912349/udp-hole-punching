@@ -190,7 +190,7 @@ type node struct {
 	services        map[string]string
 	allow           map[string]bool
 	stop            context.CancelFunc
-	tun             *os.File
+	tun             tunDevice
 	startedAt       time.Time
 	fastQueue       chan fastFrame
 	fastPool        sync.Pool
@@ -1853,6 +1853,9 @@ func (n *node) close() {
 		n.stop()
 	}
 	n.conn.Close()
+	if n.tun != nil {
+		cleanupTUN(n.c.tun, n.installedRoutes)
+	}
 	if n.tun != nil {
 		n.tun.Close()
 	}

@@ -87,6 +87,14 @@ previous implementation, so a node can reuse an existing `identity.json`.
 The service transport remains request/response rather than a reliable TCP
 tunnel: it is appropriate for small requests and short HTTP responses, not
 for SSH, RDP, or long streams.
+
+## Windows client
+
+The coordinator remains a Linux service, while `mesh-node.exe` can run on
+Windows using the official Wintun adapter. See [WINDOWS_CLIENT.md](WINDOWS_CLIENT.md)
+for installation, elevation and firewall requirements. Windows uses the same
+encrypted UDP/WebSocket protocol and topology as Linux; only the virtual
+adapter, route and DNS integration are platform-specific.
 ## Site-to-site routes and mesh DNS
 
 Open a peer in **Admin → Topology** to assign a DNS name, one or more LAN CIDRs
