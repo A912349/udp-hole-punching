@@ -13,3 +13,4 @@ func readTUN(*os.File, []byte) (int, error)  { return 0, errors.New("TUN is supp
 func configureTUNRoutes(string, map[string]bool, map[string]bool) error {
 	return errors.New("TUN is supported only on Linux")
 }
+func configureSystemDNS(string, string) error { return nil }

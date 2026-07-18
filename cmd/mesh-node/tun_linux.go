@@ -95,10 +95,22 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 		}
 		return nil
 	}
+	policyTable := ""
+	if output, e := exec.Command(ipCommand, "route", "get", "1.1.1.1").Output(); e == nil {
+		if _, table, found := strings.Cut(string(output), " table "); found {
+			fields := strings.Fields(table)
+			if len(fields) > 0 && fields[0] != "main" && fields[0] != "local" {
+				policyTable = fields[0]
+			}
+		}
+	}
 	for route := range installed {
 		if !wanted[route] {
 			if err := run("route", "del", route, "dev", name); err != nil {
 				return err
+			}
+			if policyTable != "" {
+				_ = run("route", "del", route, "dev", name, "table", policyTable)
 			}
 		}
 	}
@@ -106,6 +118,50 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 		if err := run("route", "replace", route, "dev", name); err != nil {
 			return err
 		}
+		if policyTable != "" {
+			if err := run("route", "replace", route, "dev", name, "table", policyTable); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// configureSystemDNS integrates the mesh resolver with systemd-resolved when
+// available. It is deliberately best-effort: distributions without
+// resolvectl can still use the listener through a local DNS forwarder.
+func configureSystemDNS(iface, meshIP string) error {
+	if iface == "" || meshIP == "" {
+		return nil
+	}
+	resolvectl, err := exec.LookPath("resolvectl")
+	if err != nil {
+		// Small routers commonly have no systemd-resolved. If resolv.conf is a
+		// real file, make short names work locally by using the node's mesh IP
+		// as the DNS server and adding the mesh search suffix. Symlinks managed
+		// by resolvconf/NetworkManager are intentionally left untouched.
+		info, statErr := os.Lstat("/etc/resolv.conf")
+		if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		data, readErr := os.ReadFile("/etc/resolv.conf")
+		if readErr != nil {
+			return readErr
+		}
+		text := string(data)
+		if !strings.Contains(text, "nameserver "+meshIP) {
+			text = "nameserver " + meshIP + "\nsearch mesh\n" + text
+			if writeErr := os.WriteFile("/etc/resolv.conf", []byte(text), 0644); writeErr != nil {
+				return writeErr
+			}
+		}
+		return nil
+	}
+	if out, err := exec.Command(resolvectl, "dns", iface, meshIP).CombinedOutput(); err != nil {
+		return fmt.Errorf("resolvectl dns: %s", string(out))
+	}
+	if out, err := exec.Command(resolvectl, "domain", iface, "~mesh", "mesh").CombinedOutput(); err != nil {
+		return fmt.Errorf("resolvectl domain: %s", string(out))
 	}
 	return nil
 }

@@ -1957,13 +1957,21 @@ func (n *node) tunLoop(ctx context.Context) {
 		}
 		src := netip.AddrFrom4([4]byte(b[12:16])).String()
 		dstIP := netip.AddrFrom4([4]byte(b[16:20])).String()
-		if src != n.c.meshIP && !n.translateLocalPacket(b[:l], true) {
-			n.debugf("drop TUN frame: source %s is not local mesh IP", src)
-			continue
-		}
 		dst := n.ownerOf(netip.AddrFrom4([4]byte(b[16:20])))
 		if dst == "" {
 			n.debugf("drop TUN frame: no node owns %s", dstIP)
+			continue
+		}
+		if dst == n.id.ID {
+			// The local virtual route is also installed on the TUN. Translate
+			// it back to the physical LAN and inject it into the kernel.
+			if n.translateLocalPacket(b[:l], false) {
+				_, _ = n.tun.Write(b[:l])
+			}
+			continue
+		}
+		if src != n.c.meshIP && !n.translateLocalPacket(b[:l], true) {
+			n.debugf("drop TUN frame: source %s is not local mesh IP", src)
 			continue
 		}
 		n.debugf("TUN IPv4 %s -> %s (%d bytes)", src, dstIP, l)
@@ -2131,15 +2139,14 @@ func (n *node) syncTUNRoutes() error {
 	n.mu.RLock()
 	wanted := map[string]bool{}
 	for _, r := range n.subnetRoutes {
-		if r.Owner != n.id.ID {
-			wanted[r.Virtual.String()] = true
-		}
+		wanted[r.Virtual.String()] = true
 	}
 	n.mu.RUnlock()
 	if err := configureTUNRoutes(n.c.tun, wanted, n.installedRoutes); err != nil {
 		return err
 	}
 	n.installedRoutes = wanted
+	n.logf("TUN virtual routes synchronized: %d", len(wanted))
 	return nil
 }
 func min(a, b int) int {

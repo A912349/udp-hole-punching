@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const meshDNSListen = "127.0.0.1:5353"
+const meshDNSFallback = "127.0.0.1:5353"
 
 func dnsQuestion(packet []byte) (string, int, bool) {
 	if len(packet) < 17 || binary.BigEndian.Uint16(packet[4:6]) != 1 {
@@ -82,15 +82,46 @@ func (n *node) meshDNSIP(name string) net.IP {
 }
 
 func (n *node) serveDNS(ctx context.Context) {
-	c, err := net.ListenPacket("udp4", meshDNSListen)
-	if err != nil {
-		n.logf("DNS disabled: %v", err)
+	addresses := []string{"127.0.0.1:53"}
+	if n.c.meshIP != "" {
+		addresses = append(addresses, net.JoinHostPort(n.c.meshIP, "53"))
+	}
+	addresses = append(addresses, meshDNSFallback)
+	listeners := make([]net.PacketConn, 0, len(addresses))
+	for _, address := range addresses {
+		c, err := net.ListenPacket("udp4", address)
+		if err != nil {
+			n.logf("DNS listener %s unavailable: %v", address, err)
+			continue
+		}
+		listeners = append(listeners, c)
+	}
+	if len(listeners) == 0 {
+		n.logf("DNS disabled: no listen address available")
 		return
 	}
-	defer c.Close()
-	go func() { <-ctx.Done(); c.Close() }()
+	defer func() {
+		for _, c := range listeners {
+			c.Close()
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		for _, c := range listeners {
+			c.Close()
+		}
+	}()
 	upstream := systemResolver()
-	n.logf("DNS listening on %s, upstream %s", meshDNSListen, upstream)
+	for _, listener := range listeners {
+		n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
+		go n.serveDNSListener(ctx, listener, upstream)
+	}
+	if err := configureSystemDNS(n.c.tun, n.c.meshIP); err != nil {
+		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, n.c.meshIP)
+	}
+}
+
+func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn, upstream string) {
 	buf := make([]byte, 4096)
 	for {
 		size, client, err := c.ReadFrom(buf)
@@ -100,7 +131,7 @@ func (n *node) serveDNS(ctx context.Context) {
 		query := append([]byte(nil), buf[:size]...)
 		go func() {
 			name, end, isA := dnsQuestion(query)
-			if isA && strings.HasSuffix(name, ".mesh") {
+			if isA {
 				if ip := n.meshDNSIP(name); ip != nil {
 					_, _ = c.WriteTo(dnsAnswer(query, end, ip), client)
 					return

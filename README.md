@@ -97,13 +97,17 @@ use `192.168.1.0/24`: they appear in the mesh as, for example,
 translation. Linux nodes install the virtual routes and remove stale routes.
 
 The gateway host must have IPv4 forwarding enabled, and its physical LAN must
-have a return route to the remote advertised networks (or use deliberate NAT on
+have a return route to the remote virtual networks (or use deliberate NAT on
 the gateway). The mesh process does not silently change forwarding or firewall
 policy.
 
-Each node also starts a small UDP DNS proxy on `127.0.0.1:5353`. Queries such as
+Each node also starts a small UDP DNS proxy on its mesh address at port 53 (and
+tries `127.0.0.1:53` plus `127.0.0.1:5353` as local fallbacks). Queries such as
 `office.mesh`, `printer.mesh`, and `<node-id-prefix>.mesh` resolve from the mesh directory; other
 queries are forwarded to the resolver from `/etc/resolv.conf` (with
 `1.1.1.1:53` as fallback). Point a local resolver at this listener, for example
-with dnsmasq/unbound forwarding for the `.mesh` zone. LAN objects are entered as
-`name=physical-ip`; DNS returns their automatically mapped `10.77.x.x` address.
+with dnsmasq/unbound forwarding for the `.mesh` zone. On systems without
+`systemd-resolved`, a regular `/etc/resolv.conf` is automatically updated with
+the node mesh address and `search mesh`; symlink-managed resolver files are not
+modified. LAN objects are entered as `name=physical-ip`; DNS returns their
+automatically mapped `10.77.x.x` address.
