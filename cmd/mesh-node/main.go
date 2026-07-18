@@ -188,6 +188,7 @@ type node struct {
 	dir             map[string]*peer
 	neighbors       map[string]*peer
 	links           []edge
+	topologyVersion string
 	routes          map[string]string
 	meshNodes       map[netip.Addr]string
 	subnetRoutes    []subnetRoute
@@ -707,6 +708,12 @@ func (n *node) bootstrap() error {
 	return nil
 }
 func (n *node) applyTopology(t topology) {
+	n.mu.RLock()
+	unchanged := t.Version != "" && n.topologyVersion == t.Version
+	n.mu.RUnlock()
+	if unchanged {
+		return
+	}
 	n.mu.Lock()
 	old := n.neighbors
 	n.dir = map[string]*peer{}
@@ -749,6 +756,7 @@ func (n *node) applyTopology(t topology) {
 		n.neighbors[p.ID] = &p
 	}
 	n.links = t.Links
+	n.topologyVersion = t.Version
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
 	if n.c.debug {

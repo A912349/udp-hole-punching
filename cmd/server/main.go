@@ -1585,10 +1585,20 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var owner string
-	s.db.QueryRow("SELECT node_id FROM nodes WHERE mesh_ip=? AND node_id!=?", ip, d.ID).Scan(&owner)
+	var ownerLastSeen int64
+	s.db.QueryRow("SELECT node_id,last_seen FROM nodes WHERE mesh_ip=? AND node_id!=?", ip, d.ID).Scan(&owner, &ownerLastSeen)
 	if owner != "" {
-		reply(w, 409, map[string]any{"error": "mesh_ip is already assigned"})
-		return
+		if ownerLastSeen >= now-int64(s.settings().TTL) {
+			reply(w, 409, map[string]any{"error": "mesh_ip is already assigned"})
+			return
+		}
+		// A crashed or replaced client may leave its last mesh address in the
+		// registry. It is safe to reclaim it once the previous registration is
+		// outside the online TTL; keep the old device row for offline inventory.
+		if _, e = s.db.Exec("UPDATE nodes SET mesh_ip='' WHERE node_id=?", owner); e != nil {
+			reply(w, 500, map[string]any{"error": e.Error()})
+			return
+		}
 	}
 	role, e := s.assign(d.ID, d.Role, d.NAT, relay, d.Capacity, now)
 	if e != nil {
