@@ -172,10 +172,48 @@ func configureSystemDNS(iface, meshIP, dnsTarget string) error {
 		return nil
 	}
 	if out, err := exec.Command(resolvectl, "dns", iface, meshIP).CombinedOutput(); err != nil {
+		if fallbackErr := configureFallbackDNS(meshIP, dnsTarget); fallbackErr == nil {
+			return nil
+		}
 		return fmt.Errorf("resolvectl dns: %s", string(out))
 	}
 	if out, err := exec.Command(resolvectl, "domain", iface, "~mesh", "mesh").CombinedOutput(); err != nil {
+		if fallbackErr := configureFallbackDNS(meshIP, dnsTarget); fallbackErr == nil {
+			return nil
+		}
 		return fmt.Errorf("resolvectl domain: %s", string(out))
+	}
+	return nil
+}
+
+func configureFallbackDNS(meshIP, dnsTarget string) error {
+	if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+		if dirInfo, e := os.Stat("/etc/dnsmasq.d"); e == nil && dirInfo.IsDir() {
+			path := filepath.Join("/etc/dnsmasq.d", "mesh-node.conf")
+			if e = os.WriteFile(path, []byte("server=/mesh/"+dnsTarget+"\n"), 0644); e == nil {
+				if _, e = exec.Command("pkill", "-HUP", "-x", "dnsmasq").CombinedOutput(); e == nil {
+					return nil
+				}
+			}
+		}
+	}
+	info, statErr := os.Lstat("/etc/resolv.conf")
+	if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	data, readErr := os.ReadFile("/etc/resolv.conf")
+	if readErr != nil {
+		return readErr
+	}
+	nameserver := meshIP
+	if strings.HasPrefix(dnsTarget, "127.0.0.1:") {
+		nameserver = "127.0.0.1"
+	}
+	text := string(data)
+	if !strings.Contains(text, "nameserver "+nameserver) && !strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+		if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+nameserver+"\nsearch mesh\n"+text), 0644); err != nil {
+			return err
+		}
 	}
 	return nil
 }
