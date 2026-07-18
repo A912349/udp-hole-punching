@@ -208,14 +208,54 @@ func configureTUN(name, ip string, prefix int) error {
 		return fmt.Errorf("invalid mesh IPv4 address %q/%d", ip, prefix)
 	}
 	mask := net.IP(net.CIDRMask(prefix, 32)).String()
-	if err := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "address="+ip, "mask="+mask, "gateway=none", "store=active"); err != nil {
+	if err := configureWindowsAddress(name, ip, prefix, mask); err != nil {
 		return err
 	}
-	addresses, err := exec.Command("netsh", "interface", "ipv4", "show", "addresses", "name="+name).CombinedOutput()
-	if err != nil || !strings.Contains(string(addresses), ip) {
-		return fmt.Errorf("Windows did not assign %s to adapter %q: %s", ip, name, strings.TrimSpace(string(addresses)))
-	}
 	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String())
+}
+
+func configureWindowsAddress(name, ip string, prefix int, mask string) error {
+	// New-NetIPAddress updates the NetTCPIP store directly and works for
+	// Wintun adapters that accept netsh's command but do not materialize the
+	// address. Values are passed through the child environment, not embedded
+	// in PowerShell source, so a custom adapter name cannot inject a command.
+	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'
+$name = $env:MESH_TUN_NAME
+$ip = $env:MESH_TUN_IP
+$prefix = [int]$env:MESH_TUN_PREFIX
+$old = Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne $ip }
+$old | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+if (-not (Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
+    New-NetIPAddress -InterfaceAlias $name -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 -PolicyStore ActiveStore | Out-Null
+}`)
+	ps.Env = append(os.Environ(), "MESH_TUN_NAME="+name, "MESH_TUN_IP="+ip, fmt.Sprintf("MESH_TUN_PREFIX=%d", prefix))
+	psOutput, psErr := ps.CombinedOutput()
+	if psErr == nil {
+		if err := windowsHasAddress(name, ip); err == nil {
+			return nil
+		}
+	}
+
+	// Keep netsh as a fallback for stripped-down Windows installations where
+	// the NetTCPIP PowerShell module is unavailable.
+	netshErr := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "address="+ip, "mask="+mask, "gateway=none", "store=active")
+	if netshErr == nil {
+		if err := windowsHasAddress(name, ip); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("Windows did not assign %s to adapter %q (PowerShell: %v, output: %s; netsh: %v)", ip, name, psErr, strings.TrimSpace(string(psOutput)), netshErr)
+}
+
+func windowsHasAddress(name, ip string) error {
+	addresses, err := exec.Command("netsh", "interface", "ipv4", "show", "addresses", "name="+name).CombinedOutput()
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(string(addresses), ip) {
+		return fmt.Errorf("address %s is absent", ip)
+	}
+	return nil
 }
 
 func addWindowsRoute(name, cidr string) error {
