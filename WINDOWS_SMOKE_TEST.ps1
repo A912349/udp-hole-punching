@@ -29,7 +29,7 @@ $routes | Sort-Object DestinationPrefix | ForEach-Object {
 }
 
 Write-Host '[4/4] Checking firewall rule...'
-$rules = @(Get-NetFirewallRule -DisplayName 'Home UDP Mesh inbound *' -ErrorAction SilentlyContinue | Where-Object Enabled -eq 'True')
+$rules = @(Get-NetFirewallRule -DisplayName 'Home UDP Mesh inbound *','Home UDP Mesh LAN discovery' -ErrorAction SilentlyContinue | Where-Object Enabled -eq 'True')
 if ($rules.Count -eq 0) {
     Write-Warning 'The mesh inbound firewall rule is absent; UDP replies may be blocked.'
 } else {

@@ -354,6 +354,8 @@ func windowsFirewallRuleName(port int) string {
 	return fmt.Sprintf("Home UDP Mesh inbound %d", port)
 }
 
+func windowsLANFirewallRuleName() string { return "Home UDP Mesh LAN discovery" }
+
 func configurePlatformNetwork(port int) error {
 	executable, err := os.Executable()
 	if err != nil {
@@ -363,11 +365,17 @@ func configurePlatformNetwork(port int) error {
 	// Replacing our own rule makes restarts with a different executable path
 	// deterministic and avoids accumulating stale rules for ephemeral ports.
 	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule)
-	return runWindows("netsh", "advfirewall", "firewall", "add", "rule", "name="+rule, "dir=in", "action=allow", "enable=yes", "profile=any", "protocol=UDP", fmt.Sprintf("localport=%d", port), "program="+executable)
+	if err := runWindows("netsh", "advfirewall", "firewall", "add", "rule", "name="+rule, "dir=in", "action=allow", "enable=yes", "profile=any", "protocol=UDP", fmt.Sprintf("localport=%d", port), "program="+executable); err != nil {
+		return err
+	}
+	lanRule := windowsLANFirewallRuleName()
+	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+lanRule)
+	return runWindows("netsh", "advfirewall", "firewall", "add", "rule", "name="+lanRule, "dir=in", "action=allow", "enable=yes", "profile=any", "protocol=UDP", fmt.Sprintf("localport=%d", lanDiscoveryPort), "program="+executable)
 }
 
 func cleanupPlatformNetwork(port int) {
 	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+windowsFirewallRuleName(port))
+	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+windowsLANFirewallRuleName())
 }
 
 func cleanupTUN(name string, installed map[string]bool) {

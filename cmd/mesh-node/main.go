@@ -62,6 +62,8 @@ const (
 	maxTUN                = 1279
 	fastBatchSize         = 32
 	fastQueueSize         = 1024
+	lanDiscoveryPort      = 37777
+	lanDiscoveryInterval  = 10 * time.Second
 	maxFastFrame          = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
 )
 
@@ -168,6 +170,9 @@ type node struct {
 	id              *protocol.Identity
 	key             []byte
 	conn            *net.UDPConn
+	lanConn         *net.UDPConn
+	udpReadMu       sync.Mutex
+	recoveryMu      sync.Mutex
 	control         *websocket.Conn
 	controlMu       sync.Mutex
 	controlCall     sync.Mutex
@@ -820,7 +825,7 @@ func (n *node) buildRoutes() map[string]string {
 }
 func (n *node) start() error {
 	if n.c.endpoint == "" {
-		endpoint, nat, e := stunEndpoint(n.conn)
+		endpoint, nat, e := n.detectEndpoint()
 		if e != nil {
 			return fmt.Errorf("detect external endpoint: %w", e)
 		}
@@ -887,7 +892,11 @@ func (n *node) start() error {
 			n.logf("telemetry failed: %v", e)
 		}
 	})
+	go n.periodic(ctx, heartbeat, n.recoverNetwork)
 	go n.linkHealth(ctx)
+	if err := n.startLANDiscovery(ctx); err != nil {
+		n.logf("LAN discovery unavailable: %v", err)
+	}
 	go n.serveDNS(ctx)
 	if n.c.statsInterval > 0 {
 		go n.statsLoop(ctx, n.c.statsInterval)
@@ -1003,9 +1012,11 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 		}
 	}
 	old := n.conn
+	n.udpReadMu.Lock()
 	n.conn = selected
+	n.udpReadMu.Unlock()
 	_ = old.Close()
-	if endpoint, _, err := stunEndpoint(selected); err == nil {
+	if endpoint, _, err := n.detectEndpoint(); err == nil {
 		n.c.endpoint = endpoint
 		if err := n.register(); err != nil {
 			n.logf("symmetric NAT endpoint update failed: %v", err)
@@ -1167,6 +1178,124 @@ func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 		}
 	}
 }
+
+// startLANDiscovery gives peers on the same broadcast domain a private
+// endpoint candidate. Public STUN endpoints are not guaranteed to support
+// NAT hairpinning, so two machines on one LAN must not be forced through the
+// public address of their router.
+func (n *node) startLANDiscovery(ctx context.Context) error {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: lanDiscoveryPort})
+	if err != nil {
+		return err
+	}
+	n.lanConn = conn
+	go n.lanDiscoveryLoop(ctx, conn)
+	n.broadcastLANDiscovery()
+	go n.periodic(ctx, lanDiscoveryInterval, n.broadcastLANDiscovery)
+	return nil
+}
+
+func (n *node) broadcastLANDiscovery() {
+	n.mu.RLock()
+	if n.lanConn == nil {
+		n.mu.RUnlock()
+		return
+	}
+	conn := n.lanConn
+	n.mu.RUnlock()
+	port := n.conn.LocalAddr().(*net.UDPAddr).Port
+	p := protocol.NewPacket("LAN_DISCOVERY", n.id.ID, "", map[string]any{"udp_port": port})
+	b, err := protocol.EncodePacket(p, n.key)
+	if err != nil {
+		return
+	}
+	if _, err = conn.WriteToUDP(b, &net.UDPAddr{IP: net.IPv4bcast, Port: lanDiscoveryPort}); err != nil {
+		n.debugf("LAN discovery broadcast failed: %v", err)
+	}
+}
+
+func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
+	buffer := make([]byte, protocol.MaxDatagramSize)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		length, address, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			n.debugf("LAN discovery receive failed: %v", err)
+			continue
+		}
+		packet, err := protocol.DecodePacket(buffer[:length], n.key)
+		if err != nil || packet.Type != "LAN_DISCOVERY" || packet.Source == n.id.ID {
+			continue
+		}
+		var payload struct {
+			Port int `json:"udp_port"`
+		}
+		raw, err := json.Marshal(packet.Payload)
+		if err != nil || json.Unmarshal(raw, &payload) != nil || payload.Port < 1 || payload.Port > 65535 {
+			continue
+		}
+		n.mu.Lock()
+		peer := n.neighbors[packet.Source]
+		if peer != nil {
+			peer.last = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: payload.Port}
+			peer.lastRX = time.Now()
+			peer.up = true
+			n.logf("LAN endpoint discovered for %s: %s", packet.Source[:8], peer.last)
+		}
+		n.mu.Unlock()
+	}
+}
+
+func (n *node) recoverNetwork() {
+	n.mu.RLock()
+	stale := false
+	for _, peer := range n.neighbors {
+		if !peer.lastRX.IsZero() && time.Since(peer.lastRX) >= linkTimeout {
+			stale = true
+			break
+		}
+	}
+	n.mu.RUnlock()
+	if !stale || !n.recoveryMu.TryLock() {
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	n.logf("network link stale; refreshing STUN endpoint and topology")
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		n.logf("STUN recovery failed: %v", err)
+		return
+	}
+	n.c.endpoint = endpoint
+	if n.c.nat == "auto" || n.c.nat == "cone" {
+		n.c.nat = nat
+	}
+	if err := n.register(); err != nil {
+		n.logf("re-register after network loss failed: %v", err)
+		return
+	}
+	if err := n.bootstrap(); err != nil {
+		n.logf("topology refresh after network loss failed: %v", err)
+		return
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.logf("symmetric transport recovery failed")
+	}
+	n.helloAll()
+}
+
+func (n *node) detectEndpoint() (string, string, error) {
+	n.udpReadMu.Lock()
+	defer n.udpReadMu.Unlock()
+	return stunEndpoint(n.conn)
+}
+
 func (n *node) helloAll() {
 	n.mu.RLock()
 	a := make([]string, 0, len(n.neighbors))
@@ -1175,7 +1304,19 @@ func (n *node) helloAll() {
 	}
 	n.mu.RUnlock()
 	for _, id := range a {
-		n.send(protocol.NewPacket("HELLO", n.id.ID, id, map[string]any{"public_key": n.id.Public}))
+		packet := protocol.NewPacket("HELLO", n.id.ID, id, map[string]any{"public_key": n.id.Public})
+		if !n.send(packet) {
+			n.mu.RLock()
+			peer := n.neighbors[id]
+			endpoint := ""
+			if peer != nil {
+				endpoint = peer.Endpoint
+			}
+			n.mu.RUnlock()
+			if address, err := net.ResolveUDPAddr("udp", endpoint); err == nil {
+				n.sendToAddress(packet, address)
+			}
+		}
 	}
 }
 func (n *node) pingAll() {
@@ -1435,7 +1576,9 @@ func (n *node) receive(ctx context.Context) {
 	for {
 		conn := n.conn
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		n.udpReadMu.Lock()
 		length, address, e := conn.ReadFromUDP(buffer)
+		n.udpReadMu.Unlock()
 		if e != nil {
 			if ctx.Err() != nil {
 				return
@@ -1850,6 +1993,9 @@ func (n *node) close() {
 	cleanupPlatformNetwork(n.conn.LocalAddr().(*net.UDPAddr).Port)
 	if n.tun != nil {
 		n.tun.Close()
+	}
+	if n.lanConn != nil {
+		_ = n.lanConn.Close()
 	}
 	n.controlMu.Lock()
 	if n.control != nil {

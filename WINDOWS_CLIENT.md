@@ -10,11 +10,12 @@ as on Linux; the Windows data-plane adapter is provided by the official
 1. Put `mesh-node.exe` and the matching `wintun.dll` in the same directory.
    The Windows CI artifact already contains both files.
 2. Open **PowerShell as Administrator**. Creating/configuring a virtual
-   adapter and changing its routes/DNS requires elevation.
+adapter and changing its routes/DNS requires elevation.
 3. Allow the selected UDP port through Windows Firewall if the machine is
    behind a restrictive local firewall. The client now attempts to create a
    program-scoped inbound UDP rule automatically; if it cannot, the log prints
-   the exact port to allow manually.
+   the exact port to allow manually. A second rule is created for the local
+   LAN discovery port (`37777/udp`).
 
 The first start creates a persistent adapter named `mesh0` and installs the
 signed Wintun driver. It does not install or require WireGuard itself.
@@ -47,6 +48,12 @@ Run the local smoke test from the repository after starting the client:
 
 It verifies the adapter state, assigned IPv4 address, routes and the inbound
 firewall rule before testing the selected mesh peers.
+
+Nodes periodically broadcast an authenticated LAN discovery packet on UDP
+port `37777`. When a peer is on the same LAN, its private UDP endpoint is used
+instead of relying on NAT hairpinning through the public STUN endpoint. If a
+link becomes stale, the node re-runs STUN, re-registers its endpoint, refreshes
+topology and retries the handshake.
 
 ## Troubleshooting
 
