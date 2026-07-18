@@ -84,6 +84,32 @@ func configureTUN(name, ip string, prefix int) error {
 	return nil
 }
 
+func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
+	ipCommand, err := findIPCommand()
+	if err != nil {
+		return err
+	}
+	run := func(args ...string) error {
+		if out, e := exec.Command(ipCommand, args...).CombinedOutput(); e != nil {
+			return fmt.Errorf("ip %v: %s", args, string(out))
+		}
+		return nil
+	}
+	for route := range installed {
+		if !wanted[route] {
+			if err := run("route", "del", route, "dev", name); err != nil {
+				return err
+			}
+		}
+	}
+	for route := range wanted {
+		if err := run("route", "replace", route, "dev", name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func findIPCommand() (string, error) {
 	if path, err := exec.LookPath("ip"); err == nil {
 		return path, nil

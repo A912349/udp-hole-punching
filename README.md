@@ -87,3 +87,23 @@ previous implementation, so a node can reuse an existing `identity.json`.
 The service transport remains request/response rather than a reliable TCP
 tunnel: it is appropriate for small requests and short HTTP responses, not
 for SSH, RDP, or long streams.
+## Site-to-site routes and mesh DNS
+
+Open a peer in **Admin → Topology** to assign a DNS name, one or more LAN CIDRs
+(for example `192.168.1.0/24`) and LAN object names. The coordinator assigns
+every LAN a stable, unique prefix from `10.77.0.0/16`. Thus two sites may both
+use `192.168.1.0/24`: they appear in the mesh as, for example,
+`10.77.1.0/24` and `10.77.2.0/24`. Gateway nodes perform stateless 1:1 prefix
+translation. Linux nodes install the virtual routes and remove stale routes.
+
+The gateway host must have IPv4 forwarding enabled, and its physical LAN must
+have a return route to the remote advertised networks (or use deliberate NAT on
+the gateway). The mesh process does not silently change forwarding or firewall
+policy.
+
+Each node also starts a small UDP DNS proxy on `127.0.0.1:5353`. Queries such as
+`office.mesh`, `printer.mesh`, and `<node-id-prefix>.mesh` resolve from the mesh directory; other
+queries are forwarded to the resolver from `/etc/resolv.conf` (with
+`1.1.1.1:53` as fallback). Point a local resolver at this listener, for example
+with dnsmasq/unbound forwarding for the `.mesh` zone. LAN objects are entered as
+`name=physical-ip`; DNS returns their automatically mapped `10.77.x.x` address.

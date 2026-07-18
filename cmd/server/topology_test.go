@@ -1,6 +1,26 @@
 package main
 
 import "testing"
+import "net/netip"
+
+func TestVirtualSubnetAllocationAvoidsDuplicatePhysicalLANs(t *testing.T) {
+	mesh := netip.MustParsePrefix("10.77.0.0/24")
+	first := allocateVirtual(24, []netip.Prefix{mesh})
+	if first != "10.77.1.0/24" {
+		t.Fatalf("first allocation = %s", first)
+	}
+	second := allocateVirtual(24, []netip.Prefix{mesh, netip.MustParsePrefix(first)})
+	if second != "10.77.2.0/24" {
+		t.Fatalf("second allocation = %s", second)
+	}
+}
+
+func TestObjectAddressUsesVirtualPrefix(t *testing.T) {
+	routes := []routeAdvertisement{{LAN: "192.168.1.0/24", Virtual: "10.77.9.0/24"}}
+	if got := translatedIP("192.168.1.42", routes, true); got != "10.77.9.42" {
+		t.Fatalf("translated object = %s", got)
+	}
+}
 
 func testNode(id, nat, role string, capacity int) node {
 	return node{ID: id, NAT: nat, Role: role, Capacity: capacity}

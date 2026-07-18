@@ -82,17 +82,29 @@ func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 
 type peer struct {
-	ID       string `json:"node_id"`
-	Public   string `json:"public_key"`
-	NAT      string `json:"nat_type"`
-	Role     string `json:"role"`
-	Endpoint string `json:"endpoint"`
-	Capacity int    `json:"capacity"`
-	MeshIP   string `json:"mesh_ip"`
-	last     net.Addr
-	lastRX   time.Time
-	up       bool
-	rttMS    float64
+	ID         string               `json:"node_id"`
+	Public     string               `json:"public_key"`
+	NAT        string               `json:"nat_type"`
+	Role       string               `json:"role"`
+	Endpoint   string               `json:"endpoint"`
+	Capacity   int                  `json:"capacity"`
+	MeshIP     string               `json:"mesh_ip"`
+	Name       string               `json:"name,omitempty"`
+	Routes     []routeAdvertisement `json:"routes,omitempty"`
+	DNSRecords []dnsRecord          `json:"dns_records,omitempty"`
+	last       net.Addr
+	lastRX     time.Time
+	up         bool
+	rttMS      float64
+}
+type routeAdvertisement struct {
+	LAN     string `json:"lan_cidr"`
+	Virtual string `json:"virtual_cidr"`
+}
+type dnsRecord struct {
+	Name      string `json:"name"`
+	IP        string `json:"ip"`
+	VirtualIP string `json:"virtual_ip"`
 }
 type edge struct {
 	A    string  `json:"a"`
@@ -105,6 +117,11 @@ type topology struct {
 	Neighbors []peer `json:"neighbors"`
 	Directory []peer `json:"directory"`
 	Links     []edge `json:"backbone_links"`
+}
+type subnetRoute struct {
+	Virtual netip.Prefix
+	LAN     netip.Prefix
+	Owner   string
 }
 type pending struct {
 	done   chan serviceResult
@@ -147,36 +164,39 @@ type fastStats struct {
 	deliveryDrops                    atomic.Uint64
 }
 type node struct {
-	c             config
-	requestedRole string
-	id            *protocol.Identity
-	key           []byte
-	conn          *net.UDPConn
-	packet        *ipv4.PacketConn
-	control       *websocket.Conn
-	controlMu     sync.Mutex
-	controlCall   sync.Mutex
-	controlReply  chan controlFrame
-	pingMu        sync.Mutex
-	pings         map[string]time.Time
-	mu            sync.RWMutex
-	dir           map[string]*peer
-	neighbors     map[string]*peer
-	links         []edge
-	routes        map[string]string
-	meshNodes     map[netip.Addr]string
-	seen          map[string]struct{}
-	pending       map[string]chan serviceResult
-	services      map[string]string
-	allow         map[string]bool
-	stop          context.CancelFunc
-	tun           *os.File
-	startedAt     time.Time
-	fastQueue     chan fastFrame
-	fastPool      sync.Pool
-	macPool       sync.Pool
-	deliverQueue  chan deliverFrame
-	stats         fastStats
+	c               config
+	requestedRole   string
+	id              *protocol.Identity
+	key             []byte
+	conn            *net.UDPConn
+	packet          *ipv4.PacketConn
+	control         *websocket.Conn
+	controlMu       sync.Mutex
+	controlCall     sync.Mutex
+	controlReply    chan controlFrame
+	pingMu          sync.Mutex
+	pings           map[string]time.Time
+	mu              sync.RWMutex
+	routeMu         sync.Mutex
+	dir             map[string]*peer
+	neighbors       map[string]*peer
+	links           []edge
+	routes          map[string]string
+	meshNodes       map[netip.Addr]string
+	subnetRoutes    []subnetRoute
+	installedRoutes map[string]bool
+	seen            map[string]struct{}
+	pending         map[string]chan serviceResult
+	services        map[string]string
+	allow           map[string]bool
+	stop            context.CancelFunc
+	tun             *os.File
+	startedAt       time.Time
+	fastQueue       chan fastFrame
+	fastPool        sync.Pool
+	macPool         sync.Pool
+	deliverQueue    chan deliverFrame
+	stats           fastStats
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -456,6 +476,7 @@ func newNode(c config) (*node, error) {
 		neighbors:          map[string]*peer{},
 		routes:             map[string]string{},
 		meshNodes:          map[netip.Addr]string{},
+		installedRoutes:    map[string]bool{},
 		seen:               map[string]struct{}{},
 		pending:            map[string]chan serviceResult{},
 		services:           map[string]string{},
@@ -684,17 +705,32 @@ func (n *node) applyTopology(t topology) {
 	old := n.neighbors
 	n.dir = map[string]*peer{}
 	n.meshNodes = map[netip.Addr]string{}
+	n.subnetRoutes = nil
 	for _, v := range t.Directory {
 		p := v
 		n.dir[p.ID] = &p
 		if ip, err := netip.ParseAddr(p.MeshIP); err == nil {
 			n.meshNodes[ip] = p.ID
 		}
+		for _, route := range p.Routes {
+			virtual, e1 := netip.ParsePrefix(route.Virtual)
+			lan, e2 := netip.ParsePrefix(route.LAN)
+			if e1 == nil && e2 == nil && virtual.Addr().Is4() && virtual.Bits() == lan.Bits() {
+				n.subnetRoutes = append(n.subnetRoutes, subnetRoute{virtual.Masked(), lan.Masked(), p.ID})
+			}
+		}
 	}
 	p := t.Self
 	n.dir[p.ID] = &p
 	if ip, err := netip.ParseAddr(p.MeshIP); err == nil {
 		n.meshNodes[ip] = p.ID
+	}
+	for _, route := range p.Routes {
+		virtual, e1 := netip.ParsePrefix(route.Virtual)
+		lan, e2 := netip.ParsePrefix(route.LAN)
+		if e1 == nil && e2 == nil && virtual.Addr().Is4() && virtual.Bits() == lan.Bits() {
+			n.subnetRoutes = append(n.subnetRoutes, subnetRoute{virtual.Masked(), lan.Masked(), p.ID})
+		}
 	}
 	n.neighbors = map[string]*peer{}
 	for _, v := range t.Neighbors {
@@ -709,6 +745,11 @@ func (n *node) applyTopology(t topology) {
 	n.links = t.Links
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
+	if n.tun != nil && n.c.autoTUN {
+		if err := n.syncTUNRoutes(); err != nil {
+			n.logf("subnet route sync failed: %v", err)
+		}
+	}
 	n.logf("topology=%s neighbors=%d", t.Version, len(t.Neighbors))
 	if n.c.role == "superpeer" {
 		for _, candidate := range t.Neighbors {
@@ -817,6 +858,9 @@ func (n *node) start() error {
 				return e
 			}
 			n.logf("TUN %s configured with %s/%d", n.c.tun, n.c.meshIP, n.c.prefix)
+			if e := n.syncTUNRoutes(); e != nil {
+				return e
+			}
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -840,6 +884,7 @@ func (n *node) start() error {
 		}
 	})
 	go n.linkHealth(ctx)
+	go n.serveDNS(ctx)
 	if n.c.statsInterval > 0 {
 		go n.statsLoop(ctx, n.c.statsInterval)
 	}
@@ -1912,13 +1957,11 @@ func (n *node) tunLoop(ctx context.Context) {
 		}
 		src := netip.AddrFrom4([4]byte(b[12:16])).String()
 		dstIP := netip.AddrFrom4([4]byte(b[16:20])).String()
-		if src != n.c.meshIP {
+		if src != n.c.meshIP && !n.translateLocalPacket(b[:l], true) {
 			n.debugf("drop TUN frame: source %s is not local mesh IP", src)
 			continue
 		}
-		n.mu.RLock()
-		dst := n.meshNodes[netip.AddrFrom4([4]byte(b[16:20]))]
-		n.mu.RUnlock()
+		dst := n.ownerOf(netip.AddrFrom4([4]byte(b[16:20])))
 		if dst == "" {
 			n.debugf("drop TUN frame: no node owns %s", dstIP)
 			continue
@@ -1968,14 +2011,13 @@ func (n *node) deliver(src string, p []byte) {
 		n.debugf("drop IP packet from %s: invalid packet or TUN disabled", src[:8])
 		return
 	}
-	n.mu.RLock()
-	expected := ""
-	if q := n.dir[src]; q != nil {
-		expected = q.MeshIP
-	}
-	n.mu.RUnlock()
-	if netip.AddrFrom4([4]byte(p[12:16])).String() != expected || netip.AddrFrom4([4]byte(p[16:20])).String() != n.c.meshIP {
+	sourceIP, destinationIP := netip.AddrFrom4([4]byte(p[12:16])), netip.AddrFrom4([4]byte(p[16:20]))
+	if !n.addressOwnedBy(src, sourceIP) || !(destinationIP.String() == n.c.meshIP || n.addressOwnedBy(n.id.ID, destinationIP)) {
 		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
+		return
+	}
+	if destinationIP.String() != n.c.meshIP && !n.translateLocalPacket(p, false) {
+		n.debugf("drop IP packet from %s: missing local translation", src[:8])
 		return
 	}
 	if _, err := n.tun.Write(p); err != nil {
@@ -1985,6 +2027,120 @@ func (n *node) deliver(src string, p []byte) {
 	n.stats.deliveredPackets.Add(1)
 	n.stats.deliveredBytes.Add(uint64(len(p)))
 	n.debugf("TUN IPv4 delivered from %s (%d bytes)", src[:8], len(p))
+}
+
+func (n *node) ownerOf(ip netip.Addr) string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if id := n.meshNodes[ip]; id != "" {
+		return id
+	}
+	owner, bits := "", -1
+	for _, route := range n.subnetRoutes {
+		if route.Virtual.Contains(ip) && route.Virtual.Bits() > bits {
+			owner, bits = route.Owner, route.Virtual.Bits()
+		}
+	}
+	return owner
+}
+
+func (n *node) addressOwnedBy(owner string, ip netip.Addr) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if p := n.dir[owner]; p != nil && p.MeshIP == ip.String() {
+		return true
+	}
+	for _, route := range n.subnetRoutes {
+		if route.Owner == owner && route.Virtual.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// translateLocalPacket performs a stateless 1:1 prefix translation. Host bits
+// are preserved, so identical physical LANs remain distinct inside the mesh.
+func (n *node) translateLocalPacket(packet []byte, source bool) bool {
+	if len(packet) < 20 {
+		return false
+	}
+	at := 16
+	if source {
+		at = 12
+	}
+	ip := netip.AddrFrom4([4]byte(packet[at : at+4]))
+	n.mu.RLock()
+	var from, to netip.Prefix
+	for _, r := range n.subnetRoutes {
+		if r.Owner != n.id.ID {
+			continue
+		}
+		candidateFrom, candidateTo := r.Virtual, r.LAN
+		if source {
+			candidateFrom, candidateTo = r.LAN, r.Virtual
+		}
+		if candidateFrom.Contains(ip) {
+			from, to = candidateFrom, candidateTo
+			break
+		}
+	}
+	n.mu.RUnlock()
+	if !from.IsValid() {
+		return false
+	}
+	a := ip.As4()
+	b := from.Addr().As4()
+	c := to.Addr().As4()
+	offset := binary.BigEndian.Uint32(a[:]) - binary.BigEndian.Uint32(b[:])
+	var replacement [4]byte
+	binary.BigEndian.PutUint32(replacement[:], binary.BigEndian.Uint32(c[:])+offset)
+	old := [4]byte(packet[at : at+4])
+	copy(packet[at:at+4], replacement[:])
+	adjustAddressChecksum(packet[10:12], old, replacement)
+	ihl := int(packet[0]&15) * 4
+	if ihl > len(packet) || binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+		return true
+	}
+	switch packet[9] {
+	case 6:
+		if ihl+18 <= len(packet) {
+			adjustAddressChecksum(packet[ihl+16:ihl+18], old, replacement)
+		}
+	case 17:
+		if ihl+8 <= len(packet) && binary.BigEndian.Uint16(packet[ihl+6:ihl+8]) != 0 {
+			adjustAddressChecksum(packet[ihl+6:ihl+8], old, replacement)
+		}
+	}
+	return true
+}
+
+func adjustAddressChecksum(field []byte, old, new [4]byte) {
+	sum := uint32(^binary.BigEndian.Uint16(field))
+	for i := 0; i < 4; i += 2 {
+		sum += uint32(^binary.BigEndian.Uint16(old[i : i+2]))
+		sum += uint32(binary.BigEndian.Uint16(new[i : i+2]))
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	sum = (sum & 0xffff) + (sum >> 16)
+	binary.BigEndian.PutUint16(field, ^uint16(sum))
+}
+
+func (n *node) syncTUNRoutes() error {
+	n.routeMu.Lock()
+	defer n.routeMu.Unlock()
+	n.mu.RLock()
+	wanted := map[string]bool{}
+	for _, r := range n.subnetRoutes {
+		if r.Owner != n.id.ID {
+			wanted[r.Virtual.String()] = true
+		}
+	}
+	n.mu.RUnlock()
+	if err := configureTUNRoutes(n.c.tun, wanted, n.installedRoutes); err != nil {
+		return err
+	}
+	n.installedRoutes = wanted
+	return nil
 }
 func min(a, b int) int {
 	if a < b {

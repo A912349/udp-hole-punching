@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"sort"
 	"strconv"
@@ -29,18 +30,30 @@ import (
 )
 
 type node struct {
-	ID            string `json:"node_id"`
-	PublicKey     string `json:"public_key"`
-	NAT           string `json:"nat_type"`
-	Role          string `json:"role"`
-	Endpoint      string `json:"endpoint"`
-	Capacity      int    `json:"capacity"`
-	MeshIP        string `json:"mesh_ip"`
-	RequestedRole string `json:"requested_role"`
-	Relay         bool   `json:"relay_capable"`
-	LastSeen      int64  `json:"last_seen"`
-	CreatedAt     int64  `json:"created_at"`
-	UptimeSeconds int64  `json:"uptime_seconds,omitempty"`
+	ID            string               `json:"node_id"`
+	PublicKey     string               `json:"public_key"`
+	NAT           string               `json:"nat_type"`
+	Role          string               `json:"role"`
+	Endpoint      string               `json:"endpoint"`
+	Capacity      int                  `json:"capacity"`
+	MeshIP        string               `json:"mesh_ip"`
+	RequestedRole string               `json:"requested_role"`
+	Relay         bool                 `json:"relay_capable"`
+	LastSeen      int64                `json:"last_seen"`
+	CreatedAt     int64                `json:"created_at"`
+	UptimeSeconds int64                `json:"uptime_seconds,omitempty"`
+	Name          string               `json:"name,omitempty"`
+	Routes        []routeAdvertisement `json:"routes,omitempty"`
+	DNSRecords    []dnsRecord          `json:"dns_records,omitempty"`
+}
+type routeAdvertisement struct {
+	LAN     string `json:"lan_cidr"`
+	Virtual string `json:"virtual_cidr"`
+}
+type dnsRecord struct {
+	Name      string `json:"name"`
+	IP        string `json:"ip"`
+	VirtualIP string `json:"virtual_ip,omitempty"`
 }
 type link struct {
 	A      string  `json:"a"`
@@ -157,6 +170,7 @@ func main() {
 	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
 	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/role", s.adminNodeRole)
+	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/network", s.adminNodeNetwork)
 	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
 	mux.HandleFunc("PUT /v1/admin/graph", s.adminGraph)
 	// Legacy endpoints intentionally stay unauthenticated: the experimental
@@ -301,7 +315,7 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);`)
+	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));`)
 	if err != nil {
 		return err
 	}
@@ -555,6 +569,7 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.enrichNodes(nodes)
 	for i := range nodes {
 		nodes[i].UptimeSeconds = now - nodes[i].CreatedAt
 		if nodes[i].UptimeSeconds < 0 {
@@ -562,6 +577,274 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	reply(w, http.StatusOK, map[string]any{"nodes": nodes, "links": s.links(nodes), "settings": s.settings()})
+}
+
+func (s *server) enrichNodes(nodes []node) {
+	rows, err := s.db.Query("SELECT node_id,name,routes,dns_ip FROM node_network")
+	if err != nil {
+		return
+	}
+	byID := map[string]*node{}
+	for i := range nodes {
+		byID[nodes[i].ID] = &nodes[i]
+	}
+	for rows.Next() {
+		var id, name, raw, legacyDNS string
+		if rows.Scan(&id, &name, &raw, &legacyDNS) != nil {
+			continue
+		}
+		if n := byID[id]; n != nil {
+			n.Name, n.Routes = name, parseRouteAds(raw)
+		}
+	}
+	rows.Close()
+	records, err := s.db.Query("SELECT node_id,name,lan_ip FROM dns_records ORDER BY name")
+	if err != nil {
+		return
+	}
+	defer records.Close()
+	for records.Next() {
+		var id string
+		var record dnsRecord
+		if records.Scan(&id, &record.Name, &record.IP) != nil {
+			continue
+		}
+		if n := byID[id]; n != nil {
+			record.VirtualIP = translatedIP(record.IP, n.Routes, true)
+			n.DNSRecords = append(n.DNSRecords, record)
+		}
+	}
+}
+
+func parseRouteAds(raw string) []routeAdvertisement {
+	var routes []routeAdvertisement
+	if json.Unmarshal([]byte(raw), &routes) == nil && routes != nil {
+		return routes
+	}
+	var legacy []string
+	if json.Unmarshal([]byte(raw), &legacy) == nil {
+		for _, lan := range legacy {
+			routes = append(routes, routeAdvertisement{LAN: lan})
+		}
+	}
+	return routes
+}
+
+func translatedIP(raw string, routes []routeAdvertisement, toVirtual bool) string {
+	ip, err := netip.ParseAddr(raw)
+	if err != nil {
+		return ""
+	}
+	for _, r := range routes {
+		lan, e1 := netip.ParsePrefix(r.LAN)
+		virtual, e2 := netip.ParsePrefix(r.Virtual)
+		if e1 != nil || e2 != nil {
+			continue
+		}
+		from, to := lan, virtual
+		if !toVirtual {
+			from, to = virtual, lan
+		}
+		if from.Contains(ip) {
+			a := ip.As4()
+			b := from.Addr().As4()
+			c := to.Addr().As4()
+			offset := binary.BigEndian.Uint32(a[:]) - binary.BigEndian.Uint32(b[:])
+			v := binary.BigEndian.Uint32(c[:]) + offset
+			var out [4]byte
+			binary.BigEndian.PutUint32(out[:], v)
+			return netip.AddrFrom4(out).String()
+		}
+	}
+	return ""
+}
+
+func validDNSName(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > 63 || s[0] == '-' || s[len(s)-1] == '-' {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *server) adminNodeNetwork(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	var d struct {
+		Name       string      `json:"name"`
+		Routes     []string    `json:"routes"`
+		DNSRecords []dnsRecord `json:"dns_records"`
+	}
+	if decodeJSON(w, r, &d) != nil {
+		reply(w, 400, map[string]string{"error": "invalid network settings"})
+		return
+	}
+	d.Name = strings.ToLower(strings.TrimSpace(d.Name))
+	if !validDNSName(d.Name) {
+		reply(w, 400, map[string]string{"error": "name must contain only lowercase letters, digits and hyphens"})
+		return
+	}
+	seen := map[string]bool{}
+	for i, raw := range d.Routes {
+		p, err := netip.ParsePrefix(strings.TrimSpace(raw))
+		if err != nil || !p.Addr().Is4() {
+			reply(w, 400, map[string]string{"error": "routes must be IPv4 CIDRs"})
+			return
+		}
+		p = p.Masked()
+		if p.Bits() < 16 || p.Bits() > 30 {
+			reply(w, 400, map[string]string{"error": "LAN routes must have prefixes between /16 and /30"})
+			return
+		}
+		d.Routes[i] = p.String()
+		if seen[d.Routes[i]] {
+			reply(w, 400, map[string]string{"error": "duplicate route"})
+			return
+		}
+		seen[d.Routes[i]] = true
+	}
+	rows, err := s.db.Query("SELECT node_id,routes FROM node_network")
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	used := []netip.Prefix{}
+	old := map[string]string{}
+	for rows.Next() {
+		var other, raw string
+		_ = rows.Scan(&other, &raw)
+		for _, route := range parseRouteAds(raw) {
+			if other == id {
+				old[route.LAN] = route.Virtual
+			} else if p, e := netip.ParsePrefix(route.Virtual); e == nil {
+				used = append(used, p)
+			}
+		}
+	}
+	rows.Close()
+	meshPrefix, _ := netip.ParsePrefix(s.network.String())
+	used = append(used, meshPrefix)
+	allocated := make([]routeAdvertisement, 0, len(d.Routes))
+	for _, lan := range d.Routes {
+		bits := mustPrefix(lan).Bits()
+		virtual := old[lan]
+		if p, e := netip.ParsePrefix(virtual); e != nil || prefixOverlapsAny(p, used) {
+			virtual = ""
+		}
+		if virtual == "" {
+			virtual = allocateVirtual(bits, used)
+			if virtual == "" {
+				reply(w, 409, map[string]string{"error": "10.77.0.0/16 virtual address pool is exhausted"})
+				return
+			}
+		}
+		p, _ := netip.ParsePrefix(virtual)
+		used = append(used, p)
+		allocated = append(allocated, routeAdvertisement{LAN: lan, Virtual: virtual})
+	}
+	var exists int
+	if s.db.QueryRow("SELECT 1 FROM nodes WHERE node_id=?", id).Scan(&exists) != nil {
+		reply(w, 404, map[string]string{"error": "unknown node"})
+		return
+	}
+	if d.Name != "" {
+		var owner string
+		_ = s.db.QueryRow("SELECT node_id FROM node_network WHERE name=? AND node_id!=?", d.Name, id).Scan(&owner)
+		if owner != "" {
+			reply(w, 409, map[string]string{"error": "name already used"})
+			return
+		}
+		_ = s.db.QueryRow("SELECT node_id FROM dns_records WHERE name=? AND node_id!=?", d.Name, id).Scan(&owner)
+		if owner != "" {
+			reply(w, 409, map[string]string{"error": "name already used by a LAN object"})
+			return
+		}
+	}
+	names := map[string]bool{}
+	for i := range d.DNSRecords {
+		r := &d.DNSRecords[i]
+		r.Name = strings.ToLower(strings.TrimSpace(r.Name))
+		r.IP = strings.TrimSpace(r.IP)
+		if !validDNSName(r.Name) || r.Name == "" || names[r.Name] || r.Name == d.Name {
+			reply(w, 400, map[string]string{"error": "invalid or duplicate DNS object name"})
+			return
+		}
+		names[r.Name] = true
+		if translatedIP(r.IP, allocated, true) == "" {
+			reply(w, 400, map[string]string{"error": fmt.Sprintf("DNS object %s is outside advertised LAN routes", r.Name)})
+			return
+		}
+		r.VirtualIP = translatedIP(r.IP, allocated, true)
+		var owner string
+		_ = s.db.QueryRow("SELECT node_id FROM dns_records WHERE name=? AND node_id!=?", r.Name, id).Scan(&owner)
+		if owner != "" {
+			reply(w, 409, map[string]string{"error": "DNS name already used"})
+			return
+		}
+		_ = s.db.QueryRow("SELECT node_id FROM node_network WHERE name=?", r.Name).Scan(&owner)
+		if owner != "" && owner != id {
+			reply(w, 409, map[string]string{"error": "DNS name already used"})
+			return
+		}
+	}
+	raw, _ := json.Marshal(allocated)
+	tx, err := s.db.Begin()
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("INSERT INTO node_network(node_id,name,routes,dns_ip) VALUES(?,?,?,'') ON CONFLICT(node_id) DO UPDATE SET name=excluded.name,routes=excluded.routes,dns_ip=''", id, d.Name, string(raw)); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = tx.Exec("DELETE FROM dns_records WHERE node_id=?", id)
+	for _, record := range d.DNSRecords {
+		if _, err = tx.Exec("INSERT INTO dns_records(node_id,name,lan_ip) VALUES(?,?,?)", id, record.Name, record.IP); err != nil {
+			reply(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	_, _ = tx.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_network", fmt.Sprintf("node=%s name=%s routes=%s", id, d.Name, string(raw)))
+	if err = tx.Commit(); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	s.pushTopologies()
+	reply(w, 200, map[string]any{"name": d.Name, "routes": allocated, "dns_records": d.DNSRecords})
+}
+
+func mustPrefix(raw string) netip.Prefix { p, _ := netip.ParsePrefix(raw); return p }
+func prefixOverlapsAny(p netip.Prefix, used []netip.Prefix) bool {
+	for _, u := range used {
+		if p.Overlaps(u) {
+			return true
+		}
+	}
+	return false
+}
+func allocateVirtual(bits int, used []netip.Prefix) string {
+	pool, _ := netip.ParsePrefix("10.77.0.0/16")
+	step := uint32(1) << uint(32-bits)
+	base := binary.BigEndian.Uint32(pool.Addr().AsSlice())
+	for value := base; value+step-1 <= base+65535; value += step {
+		var raw [4]byte
+		binary.BigEndian.PutUint32(raw[:], value)
+		p := netip.PrefixFrom(netip.AddrFrom4(raw), bits)
+		if !prefixOverlapsAny(p, used) {
+			return p.String()
+		}
+	}
+	return ""
 }
 
 func metricKey(a, b string) string {
@@ -800,6 +1083,8 @@ func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = s.db.Exec("DELETE FROM services WHERE node_id=?", id)
 	_, _ = s.db.Exec("DELETE FROM role_overrides WHERE node_id=?", id)
+	_, _ = s.db.Exec("DELETE FROM node_network WHERE node_id=?", id)
+	_, _ = s.db.Exec("DELETE FROM dns_records WHERE node_id=?", id)
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_deleted", id)
 	s.pushTopologies()
 	reply(w, 200, map[string]string{"status": "deleted"})
@@ -1363,6 +1648,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
 	}
+	s.enrichNodes(all)
 	var self *node
 	for i := range all {
 		if all[i].ID == id {
