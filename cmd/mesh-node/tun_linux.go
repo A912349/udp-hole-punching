@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -131,45 +132,21 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 // available. It is deliberately best-effort: distributions without
 // resolvectl can still use the listener through a local DNS forwarder.
 func configureSystemDNS(iface, meshIP, dnsTarget string) error {
-	if iface == "" || meshIP == "" {
+	if dnsTarget == "" {
 		return nil
+	}
+	// systemd-resolved accepts an address but not a custom DNS port. A
+	// loopback fallback therefore needs a local forwarder such as dnsmasq;
+	// never point resolved at 127.0.0.1:53 when our listener is on another port.
+	if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+		return configureFallbackDNS(meshIP, dnsTarget)
+	}
+	if iface == "" || meshIP == "" {
+		return configureFallbackDNS(meshIP, dnsTarget)
 	}
 	resolvectl, err := exec.LookPath("resolvectl")
 	if err != nil {
-		if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
-			if dirInfo, e := os.Stat("/etc/dnsmasq.d"); e == nil && dirInfo.IsDir() {
-				path := filepath.Join("/etc/dnsmasq.d", "mesh-node.conf")
-				if e = os.WriteFile(path, []byte("server=/mesh/"+dnsTarget+"\n"), 0644); e == nil {
-					if _, e = exec.Command("pkill", "-HUP", "-x", "dnsmasq").CombinedOutput(); e == nil {
-						return nil
-					}
-				}
-			}
-		}
-		// Small routers commonly have no systemd-resolved. If resolv.conf is a
-		// real file, make short names work locally by using the node's mesh IP
-		// as the DNS server and adding the mesh search suffix. Symlinks managed
-		// by resolvconf/NetworkManager are intentionally left untouched.
-		info, statErr := os.Lstat("/etc/resolv.conf")
-		if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
-			return nil
-		}
-		data, readErr := os.ReadFile("/etc/resolv.conf")
-		if readErr != nil {
-			return readErr
-		}
-		text := string(data)
-		nameserver := meshIP
-		if strings.HasPrefix(dnsTarget, "127.0.0.1:") {
-			nameserver = "127.0.0.1"
-		}
-		if !strings.Contains(text, "nameserver "+nameserver) && !strings.HasPrefix(dnsTarget, "127.0.0.1#") {
-			text = "nameserver " + nameserver + "\nsearch mesh\n" + text
-			if writeErr := os.WriteFile("/etc/resolv.conf", []byte(text), 0644); writeErr != nil {
-				return writeErr
-			}
-		}
-		return nil
+		return configureFallbackDNS(meshIP, dnsTarget)
 	}
 	if out, err := exec.Command(resolvectl, "dns", iface, meshIP).CombinedOutput(); err != nil {
 		if fallbackErr := configureFallbackDNS(meshIP, dnsTarget); fallbackErr == nil {
@@ -196,6 +173,7 @@ func configureFallbackDNS(meshIP, dnsTarget string) error {
 				}
 			}
 		}
+		return fmt.Errorf("local DNS listener %s requires dnsmasq forwarding", dnsTarget)
 	}
 	info, statErr := os.Lstat("/etc/resolv.conf")
 	if statErr != nil || info.Mode()&os.ModeSymlink != 0 {
@@ -206,14 +184,19 @@ func configureFallbackDNS(meshIP, dnsTarget string) error {
 		return readErr
 	}
 	nameserver := meshIP
-	if strings.HasPrefix(dnsTarget, "127.0.0.1:") {
-		nameserver = "127.0.0.1"
-	}
-	text := string(data)
-	if !strings.Contains(text, "nameserver "+nameserver) && !strings.HasPrefix(dnsTarget, "127.0.0.1#") {
-		if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+nameserver+"\nsearch mesh\n"+text), 0644); err != nil {
+	if nameserver == "" {
+		host, _, err := net.SplitHostPort(dnsTarget)
+		if err != nil {
 			return err
 		}
+		nameserver = host
+	}
+	text := string(data)
+	if strings.Contains(text, "nameserver "+nameserver) {
+		return nil
+	}
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+nameserver+"\nsearch mesh\n"+text), 0644); err != nil {
+		return err
 	}
 	return nil
 }

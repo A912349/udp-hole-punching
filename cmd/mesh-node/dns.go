@@ -9,7 +9,10 @@ import (
 	"time"
 )
 
-const meshDNSFallback = "127.0.0.1:5353"
+const (
+	meshDNSFallback      = "127.0.0.1:5353"
+	meshDNSVirtualPrefix = "10.77."
+)
 
 func dnsQuestion(packet []byte) (string, int, bool) {
 	if len(packet) < 17 || binary.BigEndian.Uint16(packet[4:6]) != 1 {
@@ -43,14 +46,35 @@ func dnsAnswer(query []byte, questionEnd int, ip net.IP) []byte {
 func systemResolver() string {
 	b, err := os.ReadFile("/etc/resolv.conf")
 	if err == nil {
-		for _, line := range strings.Split(string(b), "\n") {
-			f := strings.Fields(line)
-			if len(f) == 2 && f[0] == "nameserver" && net.ParseIP(f[1]) != nil {
-				return net.JoinHostPort(f[1], "53")
-			}
+		if resolver := resolverFromResolvConf(string(b)); resolver != "" {
+			return resolver
 		}
 	}
 	return "1.1.1.1:53"
+}
+
+// resolverFromResolvConf returns an upstream resolver, ignoring the address
+// range owned by the mesh. A previous mesh-node may have installed its mesh
+// address in resolv.conf; using that address as an upstream would make normal
+// DNS queries recurse through another mesh-node instance.
+func resolverFromResolvConf(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || f[0] != "nameserver" {
+			continue
+		}
+		ip := net.ParseIP(f[1])
+		if ip == nil || isMeshDNSAddress(ip) {
+			continue
+		}
+		return net.JoinHostPort(ip.String(), "53")
+	}
+	return ""
+}
+
+func isMeshDNSAddress(ip net.IP) bool {
+	ip = ip.To4()
+	return ip != nil && strings.HasPrefix(ip.String(), meshDNSVirtualPrefix)
 }
 
 func (n *node) meshDNSIP(name string) net.IP {
@@ -82,54 +106,59 @@ func (n *node) meshDNSIP(name string) net.IP {
 }
 
 func (n *node) serveDNS(ctx context.Context) {
-	addresses := []string{"127.0.0.1:53"}
-	if n.c.meshIP != "" {
-		addresses = append(addresses, net.JoinHostPort(n.c.meshIP, "53"))
-	}
-	addresses = append(addresses, meshDNSFallback)
-	listeners := make([]net.PacketConn, 0, len(addresses))
-	for _, address := range addresses {
-		c, err := net.ListenPacket("udp4", address)
-		if err != nil {
-			n.logf("DNS listener %s unavailable: %v", address, err)
-			continue
-		}
-		listeners = append(listeners, c)
-	}
-	if len(listeners) == 0 {
-		n.logf("DNS disabled: no listen address available")
+	listener, dnsTarget, err := n.openDNSListener()
+	if err != nil {
+		n.logf("DNS disabled: %v", err)
 		return
 	}
-	defer func() {
-		for _, c := range listeners {
-			c.Close()
-		}
-	}()
+	defer listener.Close()
 	go func() {
 		<-ctx.Done()
-		for _, c := range listeners {
-			c.Close()
-		}
+		listener.Close()
 	}()
 	upstream := systemResolver()
-	for _, listener := range listeners {
-		n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
-		go n.serveDNSListener(ctx, listener, upstream)
-	}
-	dnsTarget := "127.0.0.1#5353"
-	for _, listener := range listeners {
-		switch listener.LocalAddr().String() {
-		case n.c.meshIP + ":53":
-			dnsTarget = n.c.meshIP + ":53"
-		case "127.0.0.1:53":
-			if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
-				dnsTarget = "127.0.0.1:53"
-			}
-		}
-	}
+	n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
+	go n.serveDNSListener(ctx, listener, upstream)
 	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget); err != nil {
-		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, n.c.meshIP)
+		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, dnsTarget)
 	}
+}
+
+// openDNSListener prefers the node's unique mesh address. The old design also
+// claimed 127.0.0.1:53 and a shared 127.0.0.1:5353 socket, which caused noisy
+// bind failures whenever another resolver or another mesh-node was present on
+// the same host. A loopback listener is only a fallback when the mesh address
+// cannot be bound, and its port is allowed to move if 5353 is occupied.
+func (n *node) openDNSListener() (net.PacketConn, string, error) {
+	if n.c.meshIP != "" {
+		address := net.JoinHostPort(n.c.meshIP, "53")
+		listener, err := net.ListenPacket("udp4", address)
+		if err == nil {
+			return listener, address, nil
+		}
+		n.logf("DNS mesh listener %s unavailable: %v; trying local fallback", address, err)
+	}
+
+	listener, err := net.ListenPacket("udp4", meshDNSFallback)
+	if err != nil {
+		n.logf("DNS local fallback %s unavailable: %v; using an ephemeral port", meshDNSFallback, err)
+		listener, err = net.ListenPacket("udp4", "127.0.0.1:0")
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	return listener, dnsTargetForListener(listener.LocalAddr()), nil
+}
+
+func dnsTargetForListener(address net.Addr) string {
+	host, port, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return address.String()
+	}
+	if host == "127.0.0.1" {
+		return host + "#" + port
+	}
+	return address.String()
 }
 
 func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn, upstream string) {

@@ -102,13 +102,21 @@ is available, the node automatically installs narrowly scoped MASQUERADE rules
 for these site-to-site flows and enables IPv4 forwarding; otherwise configure
 equivalent forwarding/NAT policy manually.
 
-Each node also starts a small UDP DNS proxy on its mesh address at port 53 (and
-tries `127.0.0.1:53` plus `127.0.0.1:5353` as local fallbacks). Queries such as
-`office.mesh`, `printer.mesh`, and `<node-id-prefix>.mesh` resolve from the mesh directory; other
-queries are forwarded to the resolver from `/etc/resolv.conf` (with
-`1.1.1.1:53` as fallback). Point a local resolver at this listener, for example
-with dnsmasq/unbound forwarding for the `.mesh` zone. On systems without
-`systemd-resolved`, a regular `/etc/resolv.conf` is automatically updated with
-the node mesh address and `search mesh`; symlink-managed resolver files are not
-modified. LAN objects are entered as `name=physical-ip`; DNS returns their
-automatically mapped `10.77.x.x` address.
+Each node starts a small UDP DNS proxy on its unique mesh address at port 53.
+It does not claim `127.0.0.1:53`, because that address is commonly owned by a
+system resolver and is shared by all mesh-node processes on a host. If the mesh
+address is not available yet (for example, when TUN is disabled), the proxy
+falls back to `127.0.0.1:5353`, or an automatically selected local port if that
+port is already occupied. Queries such as `office.mesh`, `printer.mesh`, and
+`<node-id-prefix>.mesh` resolve from the mesh directory; other queries are
+forwarded to the resolver from `/etc/resolv.conf`, while addresses in the
+`10.77.0.0/16` mesh pool are ignored as upstreams to avoid resolver loops.
+`1.1.1.1:53` is used only when no usable upstream is found.
+
+On Linux with `systemd-resolved`, the mesh address is installed as the DNS
+server for the TUN interface and `~mesh` plus `mesh` search routing is enabled.
+Without it, a real `/etc/resolv.conf` is updated with the mesh address and
+`search mesh`; symlink-managed resolver files are not modified. A loopback
+fallback can be integrated automatically through dnsmasq using a
+`127.0.0.1#port` forwarding rule. LAN objects are entered as `name=physical-ip`;
+DNS returns their automatically mapped `10.77.x.x` address.
