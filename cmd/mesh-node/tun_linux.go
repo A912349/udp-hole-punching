@@ -248,6 +248,9 @@ func configureSiteNAT(localLAN, remoteVirtual []string) error {
 
 func cleanupTUN(string, map[string]bool) {}
 
+func configurePlatformNetwork(int) error { return nil }
+func cleanupPlatformNetwork(int)         {}
+
 func findIPCommand() (string, error) {
 	if path, err := exec.LookPath("ip"); err == nil {
 		return path, nil

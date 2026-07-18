@@ -12,7 +12,9 @@ as on Linux; the Windows data-plane adapter is provided by the official
 2. Open **PowerShell as Administrator**. Creating/configuring a virtual
    adapter and changing its routes/DNS requires elevation.
 3. Allow the selected UDP port through Windows Firewall if the machine is
-   behind a restrictive local firewall.
+   behind a restrictive local firewall. The client now attempts to create a
+   program-scoped inbound UDP rule automatically; if it cannot, the log prints
+   the exact port to allow manually.
 
 The first start creates a persistent adapter named `mesh0` and installs the
 signed Wintun driver. It does not install or require WireGuard itself.

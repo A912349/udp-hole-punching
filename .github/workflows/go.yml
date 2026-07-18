@@ -92,7 +92,7 @@ jobs:
         run: go mod download
 
       - name: Test Windows client
-        run: go test ./cmd/mesh-node ./cmd/punch-client ./internal/protocol
+        run: go test ./cmd/mesh-node ./internal/protocol
 
       - name: Build Windows client
         shell: pwsh
@@ -100,7 +100,6 @@ jobs:
           New-Item -ItemType Directory -Force bin | Out-Null
           $env:CGO_ENABLED = '0'
           go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o bin/mesh-node.exe ./cmd/mesh-node
-          go build -trimpath -buildvcs=false -ldflags='-s -w -buildid=' -o bin/punch-client.exe ./cmd/punch-client
 
       - name: Bundle official Wintun runtime
         shell: pwsh

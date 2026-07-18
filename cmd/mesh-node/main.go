@@ -898,6 +898,12 @@ func (n *node) start() error {
 	if n.tun != nil {
 		go n.tunLoop(ctx)
 	}
+	port := n.conn.LocalAddr().(*net.UDPAddr).Port
+	if err := configurePlatformNetwork(port); err != nil {
+		n.logf("automatic Windows firewall integration unavailable on UDP %d: %v", port, err)
+	} else if runtime.GOOS == "windows" {
+		n.logf("Windows firewall rule enabled for inbound UDP %d", port)
+	}
 	n.helloAll()
 	n.logf("listening on %s", n.conn.LocalAddr())
 	return nil
@@ -1856,6 +1862,7 @@ func (n *node) close() {
 	if n.tun != nil {
 		cleanupTUN(n.c.tun, n.installedRoutes)
 	}
+	cleanupPlatformNetwork(n.conn.LocalAddr().(*net.UDPAddr).Port)
 	if n.tun != nil {
 		n.tun.Close()
 	}

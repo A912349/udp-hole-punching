@@ -21,3 +21,5 @@ func configureTUNRoutes(string, map[string]bool, map[string]bool) error {
 func configureSystemDNS(string, string, string) error { return nil }
 func configureSiteNAT([]string, []string) error       { return nil }
 func cleanupTUN(string, map[string]bool)              {}
+func configurePlatformNetwork(int) error              { return nil }
+func cleanupPlatformNetwork(int)                      {}

@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -210,6 +211,10 @@ func configureTUN(name, ip string, prefix int) error {
 	if err := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "address="+ip, "mask="+mask, "gateway=none", "store=active"); err != nil {
 		return err
 	}
+	addresses, err := exec.Command("netsh", "interface", "ipv4", "show", "addresses", "name="+name).CombinedOutput()
+	if err != nil || !strings.Contains(string(addresses), ip) {
+		return fmt.Errorf("Windows did not assign %s to adapter %q: %s", ip, name, strings.TrimSpace(string(addresses)))
+	}
 	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String())
 }
 
@@ -268,6 +273,26 @@ func configureSystemDNS(iface, meshIP, dnsTarget string) error {
 }
 
 func configureSiteNAT([]string, []string) error { return nil }
+
+func windowsFirewallRuleName(port int) string {
+	return fmt.Sprintf("Home UDP Mesh inbound %d", port)
+}
+
+func configurePlatformNetwork(port int) error {
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("find mesh-node executable for firewall rule: %w", err)
+	}
+	rule := windowsFirewallRuleName(port)
+	// Replacing our own rule makes restarts with a different executable path
+	// deterministic and avoids accumulating stale rules for ephemeral ports.
+	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule)
+	return runWindows("netsh", "advfirewall", "firewall", "add", "rule", "name="+rule, "dir=in", "action=allow", "enable=yes", "profile=any", "protocol=UDP", fmt.Sprintf("localport=%d", port), "program="+executable)
+}
+
+func cleanupPlatformNetwork(port int) {
+	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+windowsFirewallRuleName(port))
+}
 
 func cleanupTUN(name string, installed map[string]bool) {
 	for route := range installed {
