@@ -566,6 +566,7 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	ttl := s.settings().TTL
 	now := time.Now().Unix()
 	scope := r.URL.Query().Get("scope")
@@ -1376,10 +1377,12 @@ func (s *server) adminPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, adminPageHTML)
 }
 func (s *server) adminAsset(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
 	switch r.URL.Path {
 	case "/admin.css":
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
