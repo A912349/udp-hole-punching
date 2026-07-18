@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -215,20 +216,27 @@ func configureTUN(name, ip string, prefix int) error {
 }
 
 func configureWindowsAddress(name, ip string, prefix int, mask string) error {
+	interfaceIndex, err := windowsInterfaceIndex(name)
+	if err != nil {
+		return err
+	}
 	// New-NetIPAddress updates the NetTCPIP store directly and works for
 	// Wintun adapters that accept netsh's command but do not materialize the
 	// address. Values are passed through the child environment, not embedded
 	// in PowerShell source, so a custom adapter name cannot inject a command.
 	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'
-$name = $env:MESH_TUN_NAME
+$index = [uint32]$env:MESH_TUN_IFINDEX
 $ip = $env:MESH_TUN_IP
 $prefix = [int]$env:MESH_TUN_PREFIX
-$old = Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne $ip }
+$old = Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -ne $ip }
 $old | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-if (-not (Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
-    New-NetIPAddress -InterfaceAlias $name -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 -PolicyStore ActiveStore | Out-Null
+if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
+    New-NetIPAddress -InterfaceIndex $index -IPAddress $ip -PrefixLength $prefix -AddressFamily IPv4 -PolicyStore ActiveStore -PassThru | Out-Null
+}
+if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -eq $ip })) {
+    throw "IPv4 address was not materialized on interface index $index"
 }`)
-	ps.Env = append(os.Environ(), "MESH_TUN_NAME="+name, "MESH_TUN_IP="+ip, fmt.Sprintf("MESH_TUN_PREFIX=%d", prefix))
+	ps.Env = append(os.Environ(), "MESH_TUN_IFINDEX="+interfaceIndex, "MESH_TUN_IP="+ip, fmt.Sprintf("MESH_TUN_PREFIX=%d", prefix))
 	psOutput, psErr := ps.CombinedOutput()
 	if psErr == nil {
 		if err := windowsHasAddress(name, ip); err == nil {
@@ -238,24 +246,52 @@ if (-not (Get-NetIPAddress -InterfaceAlias $name -AddressFamily IPv4 -ErrorActio
 
 	// Keep netsh as a fallback for stripped-down Windows installations where
 	// the NetTCPIP PowerShell module is unavailable.
-	netshErr := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "address="+ip, "mask="+mask, "gateway=none", "store=active")
-	if netshErr == nil {
+	netshSetErr := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "gateway=none", "store=active")
+	netshErr := runWindows("netsh", "interface", "ipv4", "add", "address", "name="+name, "address="+ip, "mask="+mask, "type=unicast", "gateway=none", "store=active")
+	if netshSetErr == nil && netshErr == nil {
 		if err := windowsHasAddress(name, ip); err == nil {
 			return nil
 		}
 	}
-	return fmt.Errorf("Windows did not assign %s to adapter %q (PowerShell: %v, output: %s; netsh: %v)", ip, name, psErr, strings.TrimSpace(string(psOutput)), netshErr)
+	return fmt.Errorf("Windows did not assign %s to adapter %q (PowerShell: %v, output: %s; netsh set: %v; netsh add: %v)", ip, name, psErr, strings.TrimSpace(string(psOutput)), netshSetErr, netshErr)
 }
 
 func windowsHasAddress(name, ip string) error {
-	addresses, err := exec.Command("netsh", "interface", "ipv4", "show", "addresses", "name="+name).CombinedOutput()
+	target := net.ParseIP(ip).To4()
+	if target == nil {
+		return fmt.Errorf("invalid IPv4 address %q", ip)
+	}
+	interfaceIndex, err := windowsInterfaceIndex(name)
 	if err != nil {
 		return err
 	}
-	if !strings.Contains(string(addresses), ip) {
-		return fmt.Errorf("address %s is absent", ip)
+	index, err := strconv.Atoi(interfaceIndex)
+	if err != nil {
+		return err
 	}
-	return nil
+	for attempt := 0; attempt < 10; attempt++ {
+		interfaces, err := net.Interfaces()
+		if err != nil {
+			return err
+		}
+		for _, iface := range interfaces {
+			if iface.Index != index {
+				continue
+			}
+			addresses, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, address := range addresses {
+				candidate, _, err := net.ParseCIDR(address.String())
+				if err == nil && candidate.To4() != nil && candidate.To4().Equal(target) {
+					return nil
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("address %s is absent from interface %q", ip, name)
 }
 
 func addWindowsRoute(name, cidr string) error {
