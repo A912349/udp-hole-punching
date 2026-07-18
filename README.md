@@ -97,9 +97,10 @@ use `192.168.1.0/24`: they appear in the mesh as, for example,
 translation. Linux nodes install the virtual routes and remove stale routes.
 
 The gateway host must have IPv4 forwarding enabled, and its physical LAN must
-have a return route to the remote virtual networks (or use deliberate NAT on
-the gateway). The mesh process does not silently change forwarding or firewall
-policy.
+have a return route to the remote virtual networks. On Linux, when `iptables`
+is available, the node automatically installs narrowly scoped MASQUERADE rules
+for these site-to-site flows and enables IPv4 forwarding; otherwise configure
+equivalent forwarding/NAT policy manually.
 
 Each node also starts a small UDP DNS proxy on its mesh address at port 53 (and
 tries `127.0.0.1:53` plus `127.0.0.1:5353` as local fallbacks). Queries such as

@@ -130,12 +130,22 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 // configureSystemDNS integrates the mesh resolver with systemd-resolved when
 // available. It is deliberately best-effort: distributions without
 // resolvectl can still use the listener through a local DNS forwarder.
-func configureSystemDNS(iface, meshIP string) error {
+func configureSystemDNS(iface, meshIP, dnsTarget string) error {
 	if iface == "" || meshIP == "" {
 		return nil
 	}
 	resolvectl, err := exec.LookPath("resolvectl")
 	if err != nil {
+		if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+			if dirInfo, e := os.Stat("/etc/dnsmasq.d"); e == nil && dirInfo.IsDir() {
+				path := filepath.Join("/etc/dnsmasq.d", "mesh-node.conf")
+				if e = os.WriteFile(path, []byte("server=/mesh/"+dnsTarget+"\n"), 0644); e == nil {
+					if _, e = exec.Command("pkill", "-HUP", "-x", "dnsmasq").CombinedOutput(); e == nil {
+						return nil
+					}
+				}
+			}
+		}
 		// Small routers commonly have no systemd-resolved. If resolv.conf is a
 		// real file, make short names work locally by using the node's mesh IP
 		// as the DNS server and adding the mesh search suffix. Symlinks managed
@@ -149,8 +159,12 @@ func configureSystemDNS(iface, meshIP string) error {
 			return readErr
 		}
 		text := string(data)
-		if !strings.Contains(text, "nameserver "+meshIP) {
-			text = "nameserver " + meshIP + "\nsearch mesh\n" + text
+		nameserver := meshIP
+		if strings.HasPrefix(dnsTarget, "127.0.0.1:") {
+			nameserver = "127.0.0.1"
+		}
+		if !strings.Contains(text, "nameserver "+nameserver) && !strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+			text = "nameserver " + nameserver + "\nsearch mesh\n" + text
 			if writeErr := os.WriteFile("/etc/resolv.conf", []byte(text), 0644); writeErr != nil {
 				return writeErr
 			}
@@ -162,6 +176,38 @@ func configureSystemDNS(iface, meshIP string) error {
 	}
 	if out, err := exec.Command(resolvectl, "domain", iface, "~mesh", "mesh").CombinedOutput(); err != nil {
 		return fmt.Errorf("resolvectl domain: %s", string(out))
+	}
+	return nil
+}
+
+// configureSiteNAT makes replies from ordinary LAN hosts work without adding
+// a route to every home router. Conntrack restores the original virtual source
+// on replies, which are then routed back through the TUN interface.
+func configureSiteNAT(localLAN, remoteVirtual []string) error {
+	if len(localLAN) == 0 || len(remoteVirtual) == 0 {
+		return nil
+	}
+	ipTables, err := exec.LookPath("iptables")
+	if err != nil {
+		return nil
+	}
+	run := func(args ...string) ([]byte, error) { return exec.Command(ipTables, args...).CombinedOutput() }
+	if _, err := run("-w", "-t", "nat", "-L"); err != nil {
+		return fmt.Errorf("iptables unavailable")
+	}
+	for _, src := range remoteVirtual {
+		for _, dst := range localLAN {
+			args := []string{"-w", "-t", "nat", "-C", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"}
+			if _, err := run(args...); err != nil {
+				add := []string{"-w", "-t", "nat", "-A", "POSTROUTING", "-s", src, "-d", dst, "-j", "MASQUERADE"}
+				if out, e := run(add...); e != nil {
+					return fmt.Errorf("iptables MASQUERADE %s to %s: %s", src, dst, string(out))
+				}
+			}
+		}
+	}
+	if out, err := exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").CombinedOutput(); err != nil {
+		return fmt.Errorf("enable IPv4 forwarding: %s", string(out))
 	}
 	return nil
 }

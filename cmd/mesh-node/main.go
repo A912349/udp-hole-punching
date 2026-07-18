@@ -2138,14 +2138,26 @@ func (n *node) syncTUNRoutes() error {
 	defer n.routeMu.Unlock()
 	n.mu.RLock()
 	wanted := map[string]bool{}
+	localLAN, remoteVirtual := []string{}, []string{}
+	if meshIP, err := netip.ParseAddr(n.c.meshIP); err == nil {
+		remoteVirtual = append(remoteVirtual, netip.PrefixFrom(meshIP, n.c.prefix).Masked().String())
+	}
 	for _, r := range n.subnetRoutes {
 		wanted[r.Virtual.String()] = true
+		if r.Owner == n.id.ID {
+			localLAN = append(localLAN, r.LAN.String())
+		} else {
+			remoteVirtual = append(remoteVirtual, r.Virtual.String())
+		}
 	}
 	n.mu.RUnlock()
 	if err := configureTUNRoutes(n.c.tun, wanted, n.installedRoutes); err != nil {
 		return err
 	}
 	n.installedRoutes = wanted
+	if err := configureSiteNAT(localLAN, remoteVirtual); err != nil {
+		n.logf("automatic site NAT unavailable: %v", err)
+	}
 	n.logf("TUN virtual routes synchronized: %d", len(wanted))
 	return nil
 }

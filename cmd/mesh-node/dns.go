@@ -116,7 +116,18 @@ func (n *node) serveDNS(ctx context.Context) {
 		n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
 		go n.serveDNSListener(ctx, listener, upstream)
 	}
-	if err := configureSystemDNS(n.c.tun, n.c.meshIP); err != nil {
+	dnsTarget := "127.0.0.1#5353"
+	for _, listener := range listeners {
+		switch listener.LocalAddr().String() {
+		case n.c.meshIP + ":53":
+			dnsTarget = n.c.meshIP + ":53"
+		case "127.0.0.1:53":
+			if strings.HasPrefix(dnsTarget, "127.0.0.1#") {
+				dnsTarget = "127.0.0.1:53"
+			}
+		}
+	}
+	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget); err != nil {
 		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, n.c.meshIP)
 	}
 }
