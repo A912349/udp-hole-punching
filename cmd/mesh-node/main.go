@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"golang.org/x/net/websocket"
+	"home-udp-mesh/internal/autostart"
 	"home-udp-mesh/internal/protocol"
 )
 
@@ -217,6 +218,27 @@ type node struct {
 }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "--add-autostart" || arg == "--del-autostart" {
+			var err error
+			if arg == "--add-autostart" {
+				startupArgs := make([]string, 0, len(os.Args)-2)
+				for _, a := range os.Args[1:] {
+					if a != "--add-autostart" {
+						startupArgs = append(startupArgs, a)
+					}
+				}
+				err = autostart.Install("mesh-node", startupArgs, os.Environ())
+			} else {
+				err = autostart.Remove("mesh-node")
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println("autostart updated")
+			return
+		}
+	}
 	log.Printf("[mesh-node] loading configuration; use --server and --network-token/--invite-token to skip interactive prompts")
 	c := parse()
 	if c.token != "" && len(c.token) < 24 {

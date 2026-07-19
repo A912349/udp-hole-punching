@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/websocket"
+	"home-udp-mesh/internal/autostart"
 	"home-udp-mesh/internal/protocol"
 	_ "modernc.org/sqlite"
 )
@@ -120,6 +121,19 @@ func envInt(name string, fallback int) int {
 	return fallback
 }
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--add-autostart" || os.Args[1] == "--del-autostart") {
+		var err error
+		if os.Args[1] == "--add-autostart" {
+			err = autostart.Install("mesh-server", os.Args[2:], os.Environ())
+		} else {
+			err = autostart.Remove("mesh-server")
+		}
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Println("autostart updated")
+		return
+	}
 	dsn := os.Getenv("MESH_DATABASE")
 	if dsn == "" {
 		dsn = "mesh.db"
