@@ -201,6 +201,9 @@ func TestAccountRegistrationLoginAndInvites(t *testing.T) {
 	if err := s.db.QueryRow("SELECT id FROM users WHERE username='alice'").Scan(&aliceID); err != nil {
 		t.Fatal(err)
 	}
+	if reusedToken, err := s.issueAccountToken(aliceID); err != nil || reusedToken != firstAccount.Token {
+		t.Fatalf("account enrollment did not reuse the account token: got %q", reusedToken)
+	}
 	if err := s.db.QueryRow("SELECT id FROM users WHERE username='bob'").Scan(&bobID); err != nil {
 		t.Fatal(err)
 	}

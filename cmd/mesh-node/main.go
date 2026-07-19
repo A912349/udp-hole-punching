@@ -217,6 +217,7 @@ type node struct {
 }
 
 func main() {
+	log.Printf("[mesh-node] loading configuration; use --server and --network-token/--invite-token to skip interactive prompts")
 	c := parse()
 	if c.token != "" && len(c.token) < 24 {
 		log.Fatal("--network-token must be at least 24 characters")
@@ -403,6 +404,7 @@ func saveInteractiveConfig(c config) error {
 	return os.WriteFile(interactiveConfigFile, b, 0600)
 }
 func askInteractiveConfig() config {
+	fmt.Fprintln(os.Stderr, "[mesh-node] first start: waiting for configuration input; network connection has not started yet")
 	in := bufio.NewReader(os.Stdin)
 	ask := func(label, fallback string) string {
 		fmt.Printf("%s [%s]: ", label, fallback)
