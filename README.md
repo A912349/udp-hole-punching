@@ -23,7 +23,8 @@ C compiler is not required.
 ## Run the coordinator
 
 ```bash
-export MESH_ACCOUNT_BOOTSTRAP_TOKEN='a-long-random-bootstrap-secret-of-at-least-24-characters'
+# Optional: if omitted, a token is generated and printed on first startup.
+# $env:MESH_ACCOUNT_BOOTSTRAP_TOKEN='a-long-random-bootstrap-secret'
 ./server
 ```
 
@@ -43,7 +44,7 @@ controls are `MESH_BACKBONE_DEGREE` (default `6`), `MESH_CLIENT_LINKS`
 ## Web administration
 
 Open `https://SERVER_IP:8001/admin` and create the first account using the
-bootstrap secret as the registration invite. Registration returns that
+bootstrap secret printed by the server as the registration invite. Registration returns that
 account's own network token. Passwords are stored as bcrypt hashes, and
 subsequent accounts can only be registered with a one-use account invitation.
 Sessions use an HttpOnly cookie plus a CSRF token; the raw session token is

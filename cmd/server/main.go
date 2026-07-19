@@ -122,8 +122,11 @@ func main() {
 	}
 	token := os.Getenv("MESH_NETWORK_TOKEN")
 	bootstrapToken := os.Getenv("MESH_ACCOUNT_BOOTSTRAP_TOKEN")
-	if len(token) < 24 && len(bootstrapToken) < 24 {
-		log.Fatal("set MESH_ACCOUNT_BOOTSTRAP_TOKEN (or legacy MESH_NETWORK_TOKEN) with at least 24 characters")
+	if token != "" && len(token) < 24 {
+		log.Fatal("MESH_NETWORK_TOKEN must contain at least 24 characters")
+	}
+	if bootstrapToken != "" && len(bootstrapToken) < 24 {
+		log.Fatal("MESH_ACCOUNT_BOOTSTRAP_TOKEN must contain at least 24 characters")
 	}
 	db, e := sql.Open("sqlite", dsn)
 	if e != nil {
@@ -150,6 +153,23 @@ func main() {
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
 		log.Fatal(e)
+	}
+	if s.bootstrapToken == "" && s.token != "" {
+		s.bootstrapToken = s.token
+	}
+	if s.bootstrapToken == "" {
+		var users int
+		if e = s.db.QueryRow("SELECT COUNT(*) FROM users").Scan(&users); e != nil {
+			log.Fatal(e)
+		}
+		if users == 0 {
+			s.bootstrapToken, e = randomToken(32)
+			if e != nil {
+				log.Fatal(e)
+			}
+			log.Printf("[SERVER] FIRST ACCOUNT REGISTRATION TOKEN: %s", s.bootstrapToken)
+			log.Printf("[SERVER] enter this token in the Registration invite field at /admin; it is not stored in the database")
+		}
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/register", s.register)
