@@ -132,6 +132,24 @@ func TestAccountRegistrationLoginAndInvites(t *testing.T) {
 	if protectedResponse.Code != http.StatusOK {
 		t.Fatalf("session did not authorize admin read: %d", protectedResponse.Code)
 	}
+	deviceInviteRequest := authRequest(http.MethodPost, "/v1/admin/invites", map[string]any{})
+	deviceInviteRequest.AddCookie(session)
+	deviceInviteRequest.AddCookie(csrf)
+	deviceInviteRequest.Header.Set("X-CSRF-Token", csrf.Value)
+	deviceInviteResponse := httptest.NewRecorder()
+	s.adminInvite(deviceInviteResponse, deviceInviteRequest)
+	if deviceInviteResponse.Code != http.StatusCreated {
+		t.Fatalf("account six-digit invite status = %d, body=%s", deviceInviteResponse.Code, deviceInviteResponse.Body.String())
+	}
+	var deviceInvite struct {
+		Token string `json:"invite_token"`
+	}
+	if err := json.Unmarshal(deviceInviteResponse.Body.Bytes(), &deviceInvite); err != nil || len(deviceInvite.Token) != 6 {
+		t.Fatalf("invalid six-digit device invite: %s", deviceInviteResponse.Body.String())
+	}
+	if !s.consumeInvite(deviceInvite.Token) {
+		t.Fatal("six-digit device invite could not be consumed")
+	}
 	forbiddenMutation := authRequest(http.MethodPost, "/v1/admin/account-invites", map[string]any{})
 	forbiddenMutation.AddCookie(session)
 	forbiddenResponse := httptest.NewRecorder()
