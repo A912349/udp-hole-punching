@@ -212,6 +212,12 @@ func configureTUN(name, ip string, prefix int) error {
 	if err := configureWindowsAddress(name, ip, prefix, mask); err != nil {
 		return err
 	}
+	// Keep the host adapter MTU aligned with the overlay. Without this,
+	// Windows emits 1500-byte packets while the overlay accepts at most 1279;
+	// a Wintun read could then terminate on io.ErrShortBuffer.
+	if err := runWindows("netsh", "interface", "ipv4", "set", "subinterface", "name="+name, "mtu=1279", "store=active"); err != nil {
+		return fmt.Errorf("set Wintun MTU: %w", err)
+	}
 	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String())
 }
 

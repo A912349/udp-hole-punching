@@ -2122,10 +2122,17 @@ func (n *node) sendFast(dst string, data []byte) bool {
 }
 func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
-	b := make([]byte, maxTUN+1)
+	// Read a complete native packet before applying the overlay MTU policy.
+	// Windows/Wintun can otherwise return io.ErrShortBuffer for a normal
+	// 1500-byte host packet and permanently stop the TUN loop.
+	b := make([]byte, 64<<10)
 	for {
 		l, e := readTUN(n.tun, b)
 		if e != nil {
+			if errors.Is(e, io.ErrShortBuffer) {
+				n.debugf("drop oversized TUN frame")
+				continue
+			}
 			if ctx.Err() == nil {
 				n.logf("TUN read failed: %v", e)
 			}
@@ -2134,7 +2141,7 @@ func (n *node) tunLoop(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if l < 20 || b[0]>>4 != 4 || l > maxTUN {
+		if l < 20 || l > maxTUN || b[0]>>4 != 4 {
 			n.debugf("drop TUN frame: invalid IPv4 or exceeds MTU (%d bytes)", l)
 			continue
 		}
