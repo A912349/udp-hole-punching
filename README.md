@@ -23,13 +23,14 @@ C compiler is not required.
 ## Run the coordinator
 
 ```bash
-export MESH_NETWORK_TOKEN='a-long-random-secret-of-at-least-24-characters'
+export MESH_ACCOUNT_BOOTSTRAP_TOKEN='a-long-random-bootstrap-secret-of-at-least-24-characters'
 ./server
 ```
 
 Useful optional environment variables are `MESH_DATABASE` (default
 `mesh.db`), `MESH_PORT` (default `8001`), `MESH_IP_NETWORK` (default
-`10.77.0.0/24`), and `MESH_NODE_TTL_SECONDS`.
+`10.77.0.0/24`), `MESH_NODE_TTL_SECONDS`, and `MESH_NETWORK_TOKEN` for
+legacy single-network compatibility.
 
 The coordinator builds a two-tier overlay. Cone NAT relays form the backbone;
 ordinary cone clients keep two relay links and symmetric NAT clients keep three
@@ -41,19 +42,33 @@ controls are `MESH_BACKBONE_DEGREE` (default `6`), `MESH_CLIENT_LINKS`
 
 ## Web administration
 
-Open `http://SERVER_IP:8001/admin`, enter `MESH_NETWORK_TOKEN`, and use the
-page to view active nodes and overlay links or change the topology settings.
+Open `https://SERVER_IP:8001/admin` and create the first account using the
+bootstrap secret as the registration invite. Registration returns that
+account's own network token. Passwords are stored as bcrypt hashes, and
+subsequent accounts can only be registered with a one-use account invitation.
+Sessions use an HttpOnly cookie plus a CSRF token; the raw session token is
+never stored in SQLite.
+
+Each account has an independent network token. Only devices registered with
+that token appear in the account's topology and can be administered by it.
+The legacy `MESH_NETWORK_TOKEN` is optional and remains available for old
+single-network deployments. Account login is for the web administration plane
+and does not require changing the node client or WebSocket protocol. For native HTTPS, set
+both `MESH_TLS_CERT` and `MESH_TLS_KEY`; otherwise put the coordinator behind
+an HTTPS reverse proxy. Do not expose the login endpoints over plain HTTP.
+`MESH_COOKIE_SECURE=true` can be set when TLS is terminated by a proxy.
+
 Changes are stored in `mesh.db`, survive a coordinator restart, immediately
 recompute automatic superpeers, and are pushed to connected nodes through the
-control WebSocket. The page itself exposes no data until the token is supplied;
-serve the coordinator behind HTTPS in production.
+control WebSocket. The page exposes no network data until an account or the
+legacy network token is authenticated.
 
 ## Run a node
 
 ```bash
 ./mesh-node \
-  --server http://SERVER_IP:8001 \
-  --network-token "$MESH_NETWORK_TOKEN" \
+  --server https://SERVER_IP:8001 \
+  --network-token "$ACCOUNT_NETWORK_TOKEN" \
   --state-dir state-node
 ```
 
@@ -65,15 +80,15 @@ directory because it holds its persistent X25519 identity.
 Publish a one-shot TCP service:
 
 ```bash
-./mesh-node --server http://SERVER_IP:8001 --network-token "$MESH_NETWORK_TOKEN" \
+./mesh-node --server https://SERVER_IP:8001 --network-token "$ACCOUNT_NETWORK_TOKEN" \
   --state-dir state-home --service web=127.0.0.1:8080
 ```
 
 Call it from another node (the destination can be a unique node-ID prefix):
 
 ```bash
-cat request.bin | ./mesh-node --server http://SERVER_IP:8001 \
-  --network-token "$MESH_NETWORK_TOKEN" --state-dir state-client \
+cat request.bin | ./mesh-node --server https://SERVER_IP:8001 \
+  --network-token "$ACCOUNT_NETWORK_TOKEN" --state-dir state-client \
   --call NODE_ID:web > response.bin
 ```
 

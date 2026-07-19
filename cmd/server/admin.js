@@ -1,3 +1,26 @@
+(function installAccountUI(){
+  const connect=document.querySelector('.connect');
+  if(!connect)return;
+  const auth=document.createElement('div');
+  auth.className='accountAuth';
+  auth.innerHTML='<input id="accountUsername" autocomplete="username" placeholder="Account"><input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password"><input id="accountRegistrationInvite" autocomplete="off" placeholder="Registration invite"><button id="accountLogin">Log in</button><button id="accountRegister" class="ghost">Register</button><button id="accountLogout" class="ghost" hidden>Log out</button>';
+  connect.insertBefore(auth,connect.firstChild);
+  const access=document.querySelector('#access .columns');
+  if(access){
+    const tokenCard=document.createElement('article');
+    tokenCard.className='card';
+    tokenCard.innerHTML='<h2>Your network token</h2><p class="muted">Use this separate token with <code>mesh-node --network-token</code>. It is shown after registration or rotation.</p><button id="rotateAccountToken">Rotate token</button><div id="accountNetworkToken" class="inviteCode">—</div>';
+    access.appendChild(tokenCard);
+    const card=document.createElement('article');
+    card.className='card';
+    card.innerHTML='<h2>Invite another account</h2><p class="muted">One-use invitation, valid for 24 hours. The raw token is shown once.</p><button id="createAccountInvite">Generate account invite</button><div id="newAccountInvite" class="inviteCode">—</div>';
+    access.appendChild(card);
+    const list=document.createElement('article');
+    list.className='card';
+    list.innerHTML='<h2>Account invitations</h2><table><thead><tr><th>Created</th><th>Expires</th><th>Status</th></tr></thead><tbody id="accountInviteRows"></tbody></table>';
+    access.appendChild(list);
+  }
+})();
 const $=id=>document.getElementById(id);
 let state={topology:{nodes:[],links:[]},topologies:{online:{nodes:[],links:[]},all:{nodes:[],links:[]}},scope:'online',audit:[],config:{},invites:[],manualLinks:[]},timer;
 let graphUI={positions:{},source:null,selectedNode:null,selectedEdge:null};
@@ -60,3 +83,21 @@ function load(){return loadScopes()}
 $('connect').onclick=()=>{sessionStorage.setItem('meshToken',$('token').value);loadScopes();clearInterval(timer);timer=setInterval(loadScopes,10000)};$('refresh').onclick=loadScopes;$('topologyScope').onchange=e=>{setScope(e.target.value)};
 function renderPeers(){let q=$('peerSearch').value.toLowerCase(),role=$('roleFilter').value,nat=$('natFilter').value,n=(state.topology.nodes||[]).filter(x=>(!role||x.role===role)&&(!nat||x.nat_type===nat)&&(!q||JSON.stringify(x).toLowerCase().includes(q)));$('peerRows').innerHTML=n.map(x=>{let online=x.online!==false;return `<tr><td><span class="statusDot ${online?'online':'offline'}"></span> ${online?'online':'offline'}</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`}).join('');$('peerRows').querySelectorAll('[data-inspect]').forEach(b=>b.onclick=()=>{page('topology');selectNode(b.dataset.inspect)})}
 if($('token').value)$('connect').click();
+
+function cookieValue(name){let prefix=name+'=';return document.cookie.split(';').map(x=>x.trim()).find(x=>x.startsWith(prefix))?.slice(prefix.length)||''}
+function sessionCredential(){let token=cookieValue('mesh_csrf');if(token)$('token').value=token;return token}
+async function authJSON(path,options={}){options.credentials='same-origin';options.headers={...(options.headers||{}),'Content-Type':'application/json'};let r=await fetch(path,options),body=await r.json();if(!r.ok)throw Error(body.error||r.statusText);return body}
+function accountError(e){toast(e.message||String(e))}
+async function accountLogin(){try{let u=$('accountUsername').value.trim().toLowerCase(),p=$('accountPassword').value;if(!u||!p)throw Error('Enter account and password');await authJSON('/v1/auth/login',{method:'POST',body:JSON.stringify({username:u,password:p})});sessionCredential();$('accountLogin').hidden=true;$('accountRegister').hidden=true;$('accountLogout').hidden=false;$('accountPassword').value='';$('accountRegistrationInvite').value='';toast('Signed in');await loadScopes()}catch(e){accountError(e)}}
+async function accountRegister(){try{let u=$('accountUsername').value.trim().toLowerCase(),p=$('accountPassword').value,invite=$('accountRegistrationInvite').value.trim();if(!u||!p)throw Error('Enter account and password');let created=await authJSON('/v1/auth/register',{method:'POST',body:JSON.stringify({username:u,password:p,invite_token:invite})});if(created.network_token)$('accountNetworkToken').textContent=created.network_token;toast('Account created; copy the network token and sign in');}catch(e){accountError(e)}}
+async function accountLogout(){try{await authJSON('/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':sessionCredential()}})}catch(e){}sessionStorage.removeItem('meshToken');location.reload()}
+function renderAccountInvites(items){let body=$('accountInviteRows');if(!body)return;body.innerHTML=(items||[]).map(x=>`<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${new Date(x.expires_at*1000).toLocaleString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('')||'<tr><td colspan="3" class="muted">No account invitations.</td></tr>'}
+async function loadAccountInvites(){let items=await api('/v1/admin/account-invites');renderAccountInvites(items)}
+const meshLoadScopes=loadScopes;
+loadScopes=async function(){await meshLoadScopes();try{await loadAccountInvites()}catch(e){}}
+$('accountLogin').onclick=accountLogin;
+$('accountRegister').onclick=accountRegister;
+$('accountLogout').onclick=accountLogout;
+$('rotateAccountToken').onclick=async()=>{try{let x=await authJSON('/v1/auth/token/rotate',{method:'POST',headers:{'X-CSRF-Token':sessionCredential()}});$('accountNetworkToken').textContent=x.network_token;toast('Network token rotated; reconnect your devices with the new token')}catch(e){accountError(e)}};
+$('createAccountInvite').onclick=async()=>{try{let x=await api('/v1/admin/account-invites',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('newAccountInvite').textContent=x.invite_token;toast('Account invitation created; copy it now');await loadAccountInvites()}catch(e){accountError(e)}};
+(async()=>{try{let me=await authJSON('/v1/auth/me');if(me.authenticated&&me.auth_type!=='network_token'){sessionCredential();$('accountLogin').hidden=true;$('accountRegister').hidden=true;$('accountLogout').hidden=false;await loadScopes()}}catch(e){}})();

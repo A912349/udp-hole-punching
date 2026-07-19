@@ -25,7 +25,7 @@ signed Wintun driver. It does not install or require WireGuard itself.
 ```powershell
 .\mesh-node.exe `
   --server http://LINUX_SERVER:8001 `
-  --network-token "a-long-random-secret-of-at-least-24-characters" `
+  --network-token "ACCOUNT_NETWORK_TOKEN" `
   --state-dir "$env:ProgramData\HomeUdpMesh\state" `
   --tun-name mesh0 `
   --tun-auto-configure

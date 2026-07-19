@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -25,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
 	"golang.org/x/net/websocket"
 	"home-udp-mesh/internal/protocol"
 	_ "modernc.org/sqlite"
@@ -67,6 +69,7 @@ type link struct {
 type server struct {
 	db                                          *sql.DB
 	token                                       string
+	bootstrapToken                              string
 	network                                     *net.IPNet
 	ttl                                         int64
 	auto                                        int // 0 selects ceil(sqrt(eligible cone relays)); a positive value is an override.
@@ -74,6 +77,8 @@ type server struct {
 	configMu                                    sync.RWMutex
 	inviteMu                                    sync.Mutex
 	inviteAttempts                              map[string][]time.Time
+	accountMu                                   sync.Mutex
+	accountAttempts                             map[string][]time.Time
 
 	sessionsMu sync.Mutex
 	sessions   map[string]map[string]*rendezvousPeer
@@ -89,9 +94,10 @@ type linkMetric struct {
 }
 
 type controlClient struct {
-	ws      sync.Mutex
-	c       *websocket.Conn
-	invited bool
+	ws         sync.Mutex
+	c          *websocket.Conn
+	invited    bool
+	credential string
 }
 
 type rendezvousPeer struct {
@@ -115,8 +121,9 @@ func main() {
 		dsn = "mesh.db"
 	}
 	token := os.Getenv("MESH_NETWORK_TOKEN")
-	if len(token) < 24 {
-		log.Fatal("MESH_NETWORK_TOKEN must be set and contain at least 24 characters")
+	bootstrapToken := os.Getenv("MESH_ACCOUNT_BOOTSTRAP_TOKEN")
+	if len(token) < 24 && len(bootstrapToken) < 24 {
+		log.Fatal("set MESH_ACCOUNT_BOOTSTRAP_TOKEN (or legacy MESH_NETWORK_TOKEN) with at least 24 characters")
 	}
 	db, e := sql.Open("sqlite", dsn)
 	if e != nil {
@@ -131,13 +138,14 @@ func main() {
 		log.Fatal(e)
 	}
 	s := &server{
-		db: db, token: token, ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)),
+		db: db, token: token, bootstrapToken: bootstrapToken, ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)),
 		auto: envInt("MESH_AUTO_SUPERPEERS", 0), backboneDegree: envInt("MESH_BACKBONE_DEGREE", 6),
 		clientLinks: envInt("MESH_CLIENT_LINKS", 2), symmetricLinks: envInt("MESH_SYMMETRIC_LINKS", 3),
-		sessions:       map[string]map[string]*rendezvousPeer{},
-		controls:       map[*controlClient]string{},
-		metrics:        map[string]linkMetric{},
-		inviteAttempts: map[string][]time.Time{},
+		sessions:        map[string]map[string]*rendezvousPeer{},
+		controls:        map[*controlClient]string{},
+		metrics:         map[string]linkMetric{},
+		inviteAttempts:  map[string][]time.Time{},
+		accountAttempts: map[string][]time.Time{},
 	}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
@@ -145,10 +153,17 @@ func main() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/register", s.register)
+	mux.HandleFunc("POST /v1/auth/register", s.accountRegister)
+	mux.HandleFunc("POST /v1/auth/login", s.accountLogin)
+	mux.HandleFunc("POST /v1/auth/logout", s.accountLogout)
+	mux.HandleFunc("POST /v1/auth/token/rotate", s.rotateAccountToken)
+	mux.HandleFunc("GET /v1/auth/me", s.accountMe)
+	mux.HandleFunc("GET /v1/admin/account-invites", s.accountInvite)
+	mux.HandleFunc("POST /v1/admin/account-invites", s.accountInvite)
 	mux.Handle("/v1/ws", websocket.Server{
 		Handler: websocket.Handler(s.controlWS),
 		Handshake: func(_ *websocket.Config, r *http.Request) error {
-			if s.token != "" && r.Header.Get("X-Mesh-Token") != s.token {
+			if !s.networkTokenValid(r) {
 				if !s.allowInviteAttempt(r.RemoteAddr) || !s.consumeInvite(r.Header.Get("X-Mesh-Invite")) {
 					return fmt.Errorf("unauthorized")
 				}
@@ -189,6 +204,13 @@ func main() {
 		WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second,
 		MaxHeaderBytes: 16 << 10,
 	}
+	if cert, key := os.Getenv("MESH_TLS_CERT"), os.Getenv("MESH_TLS_KEY"); cert != "" || key != "" {
+		if cert == "" || key == "" {
+			log.Fatal("MESH_TLS_CERT and MESH_TLS_KEY must be set together")
+		}
+		log.Fatal(server.ListenAndServeTLS(cert, key))
+	}
+	log.Printf("[SERVER] WARNING: TLS is disabled; use HTTPS/reverse proxy before exposing login endpoints")
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -196,6 +218,12 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; frame-ancestors 'none'; form-action 'self'")
+		if r.TLS != nil {
+			w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
 		next.ServeHTTP(w, r)
 	})
 }
@@ -212,7 +240,11 @@ type controlFrame struct {
 }
 
 func (s *server) controlWS(ws *websocket.Conn) {
-	client := &controlClient{c: ws, invited: ws.Request().Header.Get("X-Mesh-Invite") != ""}
+	credential := ws.Request().Header.Get("X-Mesh-Token")
+	if credential == "" {
+		credential = s.token
+	}
+	client := &controlClient{c: ws, invited: ws.Request().Header.Get("X-Mesh-Invite") != "", credential: credential}
 	defer func() {
 		s.controlMu.Lock()
 		delete(s.controls, client)
@@ -224,7 +256,7 @@ func (s *server) controlWS(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &in); err != nil {
 			return
 		}
-		out := s.controlRequest(in)
+		out := s.controlRequestWithToken(in, client.credential)
 		if client.invited && in.Method == http.MethodPost && in.Path == "/v1/register" && out.Status >= 200 && out.Status < 300 {
 			var body map[string]any
 			_ = json.Unmarshal(out.Body, &body)
@@ -265,7 +297,7 @@ func (s *server) pushTopologies() {
 	}
 	s.controlMu.Unlock()
 	for client, id := range clients {
-		out := s.controlRequest(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id})
+		out := s.controlRequestWithToken(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id}, client.credential)
 		if out.Status >= 200 && out.Status < 300 {
 			out.Event = "topology"
 			_ = client.send(out)
@@ -277,11 +309,17 @@ func (s *server) pushTopologies() {
 // authorization, validation and database semantics. The HTTP API remains for
 // older nodes and operational tooling.
 func (s *server) controlRequest(in controlFrame) controlFrame {
+	return s.controlRequestWithToken(in, s.token)
+}
+
+func (s *server) controlRequestWithToken(in controlFrame, credential string) controlFrame {
 	if in.Method == "" || in.Path == "" {
 		return controlFrame{Status: http.StatusBadRequest, Error: "missing method or path"}
 	}
 	r := httptest.NewRequest(in.Method, "http://control"+in.Path, bytes.NewReader(in.Body))
-	r.Header.Set("X-Mesh-Token", s.token)
+	if credential != "" {
+		r.Header.Set("X-Mesh-Token", credential)
+	}
 	w := httptest.NewRecorder()
 	switch {
 	case in.Method == http.MethodPost && in.Path == "/v1/register":
@@ -319,7 +357,7 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, err := s.db.Exec(`CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT);CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));`)
+	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);`)
 	if err != nil {
 		return err
 	}
@@ -353,6 +391,11 @@ func (s *server) init() error {
 			return err
 		}
 	}
+	if !columns["owner_id"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN owner_id INTEGER"); err != nil {
+			return err
+		}
+	}
 	if !columns["requested_role"] {
 		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN requested_role TEXT"); err != nil {
 			return err
@@ -368,13 +411,435 @@ func (s *server) init() error {
 	}
 	return s.loadSettings()
 }
-func (s *server) auth(w http.ResponseWriter, r *http.Request) bool {
+
+const (
+	sessionCookieName = "mesh_session"
+	csrfCookieName    = "mesh_csrf"
+	sessionLifetime   = 12 * time.Hour
+	bcryptCost        = 12
+)
+
+// This is only used to make a login for an unknown username perform the same
+// expensive password operation as a login for a real account. It is not a
+// credential and is never accepted for an account.
+var dummyPasswordHash = func() string {
+	hash, err := bcrypt.GenerateFromPassword([]byte("mesh-invalid-login-sentinel"), bcryptCost)
+	if err != nil {
+		panic("could not initialize password timing sentinel")
+	}
+	return string(hash)
+}()
+
+type authenticatedUser struct {
+	ID       int64  `json:"id"`
+	Username string `json:"username"`
+}
+
+func validUsername(username string) bool {
+	if len(username) < 3 || len(username) > 64 || strings.ToLower(username) != username {
+		return false
+	}
+	for _, c := range username {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func validPassword(password string) bool {
+	// bcrypt deliberately rejects passwords longer than 72 bytes. Rejecting
+	// them here avoids silently ignoring a user's password suffix.
+	return len(password) >= 12 && len(password) <= 72
+}
+
+func tokenDigest(raw string) string {
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
+func randomToken(bytesLen int) (string, error) {
+	raw := make([]byte, bytesLen)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
+}
+
+func requestHost(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil || host == "" {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// Keep account creation and password guessing bounded per source address.
+// This is intentionally process-local; HTTPS deployments should also put a
+// coarse rate limit at the reverse proxy for multi-instance deployments.
+func (s *server) allowAccountAttempt(r *http.Request) bool {
+	now := time.Now()
+	cutoff := now.Add(-5 * time.Minute)
+	host := requestHost(r)
+	s.accountMu.Lock()
+	defer s.accountMu.Unlock()
+	if s.accountAttempts == nil {
+		s.accountAttempts = map[string][]time.Time{}
+	}
+	old := s.accountAttempts[host]
+	kept := old[:0]
+	for _, attempt := range old {
+		if attempt.After(cutoff) {
+			kept = append(kept, attempt)
+		}
+	}
+	if len(kept) >= 10 {
+		s.accountAttempts[host] = kept
+		return false
+	}
+	s.accountAttempts[host] = append(kept, now)
+	return true
+}
+
+func (s *server) sessionUser(r *http.Request) (authenticatedUser, bool) {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" || s.db == nil {
+		return authenticatedUser{}, false
+	}
+	digest := tokenDigest(cookie.Value)
+	var user authenticatedUser
+	var expires int64
+	var revoked sql.NullInt64
+	err = s.db.QueryRow(`SELECT u.id,u.username,s.expires_at,s.revoked_at
+		FROM auth_sessions s JOIN users u ON u.id=s.user_id
+		WHERE s.token_hash=? AND u.disabled=0`, digest).Scan(&user.ID, &user.Username, &expires, &revoked)
+	if err != nil || revoked.Valid || expires < time.Now().Unix() {
+		if err == nil && (revoked.Valid || expires < time.Now().Unix()) {
+			_, _ = s.db.Exec("DELETE FROM auth_sessions WHERE token_hash=?", digest)
+		}
+		return authenticatedUser{}, false
+	}
+	return user, true
+}
+
+func (s *server) setAccountCookies(w http.ResponseWriter, r *http.Request, session, csrf string, expires time.Time) {
+	secure := r.TLS != nil || strings.EqualFold(os.Getenv("MESH_COOKIE_SECURE"), "true")
+	http.SetCookie(w, &http.Cookie{ // session token is never exposed to JavaScript.
+		Name: sessionCookieName, Value: session, Path: "/", Expires: expires,
+		MaxAge: int(time.Until(expires).Seconds()), HttpOnly: true, Secure: secure, SameSite: http.SameSiteStrictMode,
+	})
+	http.SetCookie(w, &http.Cookie{ // the CSRF token is intentionally readable by same-origin JS.
+		Name: csrfCookieName, Value: csrf, Path: "/", Expires: expires,
+		MaxAge: int(time.Until(expires).Seconds()), Secure: secure, SameSite: http.SameSiteStrictMode,
+	})
+}
+
+func clearAccountCookies(w http.ResponseWriter, r *http.Request) {
+	secure := r.TLS != nil || strings.EqualFold(os.Getenv("MESH_COOKIE_SECURE"), "true")
+	for _, name := range []string{sessionCookieName, csrfCookieName} {
+		http.SetCookie(w, &http.Cookie{Name: name, Value: "", Path: "/", MaxAge: -1, HttpOnly: name == sessionCookieName, Secure: secure, SameSite: http.SameSiteStrictMode})
+	}
+}
+
+func (s *server) csrfValid(r *http.Request) bool {
+	cookie, err := r.Cookie(csrfCookieName)
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	provided := r.Header.Get("X-CSRF-Token")
+	// Older embedded admin.js versions already send X-Mesh-Token on every
+	// request. For a session, the UI replaces that value with the CSRF token;
+	// accepting it as a fallback keeps that client backwards-compatible while
+	// retaining the same double-submit validation.
+	if provided == "" {
+		provided = r.Header.Get("X-Mesh-Token")
+	}
+	if len(provided) == 0 || len(provided) != len(cookie.Value) || subtle.ConstantTimeCompare([]byte(provided), []byte(cookie.Value)) != 1 {
+		return false
+	}
+	// Bind the double-submit token to the server-side session as well. This
+	// prevents a cookie planted by an unrelated subdomain from being enough.
+	session, err := r.Cookie(sessionCookieName)
+	if err != nil || session.Value == "" {
+		return false
+	}
+	var stored string
+	err = s.db.QueryRow("SELECT csrf_hash FROM auth_sessions WHERE token_hash=? AND revoked_at IS NULL", tokenDigest(session.Value)).Scan(&stored)
+	return err == nil && subtle.ConstantTimeCompare([]byte(stored), []byte(tokenDigest(provided))) == 1
+}
+
+func (s *server) adminAuth(w http.ResponseWriter, r *http.Request) bool {
+	if s.networkTokenValid(r) {
+		return true
+	}
+	if _, ok := s.sessionUser(r); !ok {
+		reply(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return false
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && !s.csrfValid(r) {
+		reply(w, http.StatusForbidden, map[string]string{"error": "csrf validation failed"})
+		return false
+	}
+	return true
+}
+
+func (s *server) accountRegister(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAccountAttempt(r) {
+		reply(w, http.StatusTooManyRequests, map[string]string{"error": "too many account attempts; try again later"})
+		return
+	}
+	var d struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+		Invite   string `json:"invite_token"`
+	}
+	if decodeJSON(w, r, &d) != nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid registration request"})
+		return
+	}
+	d.Username = strings.ToLower(strings.TrimSpace(d.Username))
+	if !validUsername(d.Username) || !validPassword(d.Password) {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "username or password does not meet the requirements"})
+		return
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(d.Password), bcryptCost)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not secure password"})
+		return
+	}
+	networkToken, err := randomToken(32)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create account token"})
+		return
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not start registration"})
+		return
+	}
+	defer tx.Rollback()
+	var users int
+	if err = tx.QueryRow("SELECT COUNT(*) FROM users").Scan(&users); err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not inspect accounts"})
+		return
+	}
+	if users > 0 {
+		if d.Invite == "" {
+			reply(w, http.StatusForbidden, map[string]string{"error": "registration requires an administrator invitation"})
+			return
+		}
+		result, updateErr := tx.Exec("UPDATE account_invites SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>=?", time.Now().Unix(), tokenDigest(d.Invite), time.Now().Unix())
+		if updateErr != nil {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": "could not validate invitation"})
+			return
+		}
+		used, rowsErr := result.RowsAffected()
+		if rowsErr != nil || used != 1 {
+			reply(w, http.StatusForbidden, map[string]string{"error": "invalid or expired invitation"})
+			return
+		}
+	} else {
+		// Bootstrap is deliberately tied to an operator-held secret. Without
+		// this check, the first internet client could race to become the first
+		// administrator account on a fresh coordinator.
+		bootstrap := s.bootstrapToken
+		if bootstrap == "" {
+			bootstrap = s.token
+		}
+		if bootstrap == "" || len(d.Invite) != len(bootstrap) || subtle.ConstantTimeCompare([]byte(d.Invite), []byte(bootstrap)) != 1 {
+			reply(w, http.StatusForbidden, map[string]string{"error": "first registration requires the coordinator bootstrap token"})
+			return
+		}
+	}
+	now := time.Now().Unix()
+	result, err := tx.Exec("INSERT INTO users(username,password_hash,created_at) VALUES(?,?,?)", d.Username, string(hash), now)
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			reply(w, http.StatusConflict, map[string]string{"error": "username is already registered"})
+		} else {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create account"})
+		}
+		return
+	}
+	userID, err := result.LastInsertId()
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not complete registration"})
+		return
+	}
+	if _, err = tx.Exec("INSERT INTO account_tokens(token_hash,user_id,created_at) VALUES(?,?,?)", tokenDigest(networkToken), userID, now); err != nil || tx.Commit() != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not complete registration"})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_registered", fmt.Sprintf("user_id=%d username=%s", userID, d.Username))
+	reply(w, http.StatusCreated, map[string]any{"status": "created", "username": d.Username, "network_token": networkToken})
+}
+
+func (s *server) accountLogin(w http.ResponseWriter, r *http.Request) {
+	if !s.allowAccountAttempt(r) {
+		reply(w, http.StatusTooManyRequests, map[string]string{"error": "too many account attempts; try again later"})
+		return
+	}
+	var d struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if decodeJSON(w, r, &d) != nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid login request"})
+		return
+	}
+	d.Username = strings.ToLower(strings.TrimSpace(d.Username))
+	var user authenticatedUser
+	var passwordHash string
+	var disabled int
+	err := s.db.QueryRow("SELECT id,username,password_hash,disabled FROM users WHERE username=?", d.Username).Scan(&user.ID, &user.Username, &passwordHash, &disabled)
+	if err != nil {
+		passwordHash = dummyPasswordHash
+	}
+	passwordOK := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(d.Password)) == nil
+	if err != nil || disabled != 0 || !passwordOK {
+		reply(w, http.StatusUnauthorized, map[string]string{"error": "invalid username or password"})
+		return
+	}
+	session, err := randomToken(32)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create session"})
+		return
+	}
+	csrf, err := randomToken(32)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create session"})
+		return
+	}
+	now := time.Now()
+	expires := now.Add(sessionLifetime)
+	if _, err = s.db.Exec("INSERT INTO auth_sessions(token_hash,csrf_hash,user_id,created_at,expires_at) VALUES(?,?,?,?,?)", tokenDigest(session), tokenDigest(csrf), user.ID, now.Unix(), expires.Unix()); err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not save session"})
+		return
+	}
+	_, _ = s.db.Exec("UPDATE users SET last_login_at=? WHERE id=?", now.Unix(), user.ID)
+	_, _ = s.db.Exec("DELETE FROM auth_sessions WHERE expires_at<? OR revoked_at IS NOT NULL", now.Unix())
+	s.setAccountCookies(w, r, session, csrf, expires)
+	reply(w, http.StatusOK, map[string]any{"authenticated": true, "username": user.Username, "expires_at": expires.Unix()})
+}
+
+func (s *server) accountLogout(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
+		_, _ = s.db.Exec("UPDATE auth_sessions SET revoked_at=? WHERE token_hash=?", time.Now().Unix(), tokenDigest(cookie.Value))
+	}
+	clearAccountCookies(w, r)
+	reply(w, http.StatusOK, map[string]bool{"authenticated": false})
+}
+
+func (s *server) rotateAccountToken(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	userID, scoped := s.accountIDForRequest(r)
+	if !scoped {
+		reply(w, http.StatusForbidden, map[string]string{"error": "only an account can rotate its token"})
+		return
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create account token"})
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not rotate account token"})
+		return
+	}
+	defer tx.Rollback()
+	now := time.Now().Unix()
+	if _, err = tx.Exec("UPDATE account_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL", now, userID); err == nil {
+		_, err = tx.Exec("INSERT INTO account_tokens(token_hash,user_id,created_at) VALUES(?,?,?)", tokenDigest(token), userID, now)
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not rotate account token"})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_token_rotated", fmt.Sprintf("user_id=%d", userID))
+	reply(w, http.StatusOK, map[string]any{"network_token": token, "rotated_at": now})
+}
+
+func (s *server) accountMe(w http.ResponseWriter, r *http.Request) {
+	if user, ok := s.sessionUser(r); ok {
+		reply(w, http.StatusOK, map[string]any{"authenticated": true, "username": user.Username})
+		return
+	}
+	if s.networkTokenValid(r) {
+		if userID, ok := s.accountTokenUser(r); ok {
+			reply(w, http.StatusOK, map[string]any{"authenticated": true, "auth_type": "account_token", "user_id": userID})
+			return
+		}
+		reply(w, http.StatusOK, map[string]any{"authenticated": true, "auth_type": "legacy_network_token"})
+		return
+	}
+	reply(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+}
+
+// accountTokenUser resolves a per-account bearer token. Raw tokens are never
+// stored; the client keeps the returned token and passes it as X-Mesh-Token,
+// exactly like the unchanged mesh-node client already does.
+func (s *server) accountTokenUser(r *http.Request) (int64, bool) {
 	provided := r.Header.Get("X-Mesh-Token")
-	if len(provided) != len(s.token) || subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) != 1 {
+	if provided == "" || s.db == nil {
+		return 0, false
+	}
+	var userID int64
+	err := s.db.QueryRow(`SELECT t.user_id FROM account_tokens t JOIN users u ON u.id=t.user_id
+		WHERE t.token_hash=? AND t.revoked_at IS NULL AND u.disabled=0`, tokenDigest(provided)).Scan(&userID)
+	if err != nil {
+		return 0, false
+	}
+	return userID, true
+}
+
+func (s *server) accountIDForRequest(r *http.Request) (int64, bool) {
+	if user, ok := s.sessionUser(r); ok {
+		return user.ID, true
+	}
+	return s.accountTokenUser(r)
+}
+
+func (s *server) nodeOwnedByAccount(nodeID string, accountID int64) bool {
+	var owner sql.NullInt64
+	if err := s.db.QueryRow("SELECT owner_id FROM nodes WHERE node_id=?", nodeID).Scan(&owner); err != nil {
+		return false
+	}
+	return owner.Valid && owner.Int64 == accountID
+}
+
+func (s *server) requireNodeAccess(w http.ResponseWriter, r *http.Request, nodeID string) bool {
+	if accountID, scoped := s.accountIDForRequest(r); scoped && !s.nodeOwnedByAccount(nodeID, accountID) {
+		reply(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+		return false
+	}
+	return true
+}
+
+func (s *server) auth(w http.ResponseWriter, r *http.Request) bool {
+	if !s.networkTokenValid(r) {
 		reply(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return false
 	}
 	return true
+}
+
+func (s *server) networkTokenValid(r *http.Request) bool {
+	provided := r.Header.Get("X-Mesh-Token")
+	if len(provided) != 0 && len(provided) == len(s.token) && subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1 {
+		return true
+	}
+	_, ok := s.accountTokenUser(r)
+	return ok
 }
 func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -471,11 +936,15 @@ func validSettings(c topologySettings) error {
 }
 
 func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	if r.Method == http.MethodGet {
 		reply(w, http.StatusOK, s.settings())
+		return
+	}
+	if _, scoped := s.accountIDForRequest(r); scoped {
+		reply(w, http.StatusForbidden, map[string]string{"error": "topology policy is coordinator-wide and can only be changed with the legacy administrator credential"})
 		return
 	}
 	var next topologySettings
@@ -512,8 +981,18 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 // rebalanceRoles makes an auto-superpeer setting take effect immediately for
 // already registered nodes, not only when their next heartbeat arrives.
 func (s *server) rebalanceRoles() error {
+	return s.rebalanceRolesFor(nil)
+}
+
+func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	c := s.settings()
-	nodes, err := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?", time.Now().Unix()-int64(c.TTL))
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	args := []any{time.Now().Unix() - int64(c.TTL)}
+	if ownerID != nil {
+		query += " AND owner_id=?"
+		args = append(args, *ownerID)
+	}
+	nodes, err := s.rows(query, args...)
 	if err != nil {
 		return err
 	}
@@ -563,7 +1042,7 @@ func (s *server) rebalanceRoles() error {
 }
 
 func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -571,12 +1050,21 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 	scope := r.URL.Query().Get("scope")
 	all := scope == "all"
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id"
+	accountID, scoped := s.accountIDForRequest(r)
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
 	args := []any{now - int64(ttl)}
 	if all {
-		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes ORDER BY node_id"
+		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes"
 		args = nil
 	}
+	if scoped {
+		query += " WHERE owner_id=?"
+		args = append(args, accountID)
+		if !all {
+			query = strings.Replace(query, " WHERE last_seen>=? WHERE owner_id=?", " WHERE last_seen>=? AND owner_id=?", 1)
+		}
+	}
+	query += " ORDER BY node_id"
 	nodes, err := s.rows(query, args...)
 	if err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -606,7 +1094,7 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 			seen[edgeKey(e.A, e.B)] = true
 		}
 		missing := []link{}
-		for _, e := range s.manualLinks() {
+		for _, e := range s.manualLinksForNodes(nodes) {
 			if !seen[edgeKey(e.A, e.B)] {
 				missing = append(missing, e)
 			}
@@ -712,10 +1200,13 @@ func validDNSName(s string) bool {
 }
 
 func (s *server) adminNodeNetwork(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
 	var d struct {
 		Name       string      `json:"name"`
 		Routes     []string    `json:"routes"`
@@ -877,10 +1368,13 @@ func parseLANRoute(raw string) (string, netip.Prefix, error) {
 }
 
 func (s *server) adminAddNodeRoute(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
 	var change routeChange
 	if err := decodeJSON(w, r, &change); err != nil {
 		reply(w, 400, map[string]string{"error": "invalid route request"})
@@ -943,10 +1437,13 @@ func (s *server) adminAddNodeRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminRemoveNodeRoute(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
 	var change routeChange
 	if err := decodeJSON(w, r, &change); err != nil {
 		reply(w, 400, map[string]string{"error": "invalid route request"})
@@ -1044,6 +1541,9 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]string{"error": "invalid telemetry"})
 		return
 	}
+	if !s.requireNodeAccess(w, r, report.NodeID) {
+		return
+	}
 	now := time.Now()
 	s.metricsMu.Lock()
 	defer s.metricsMu.Unlock()
@@ -1067,7 +1567,13 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]string{"status": "ok"})
 }
 func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	if _, scoped := s.accountIDForRequest(r); scoped {
+		// Legacy audit rows predate account ownership. Returning them to an
+		// account would disclose other tenants' node IDs and operations.
+		reply(w, http.StatusOK, []map[string]any{})
 		return
 	}
 	rows, err := s.db.Query("SELECT created_at,event,detail FROM audit_log ORDER BY created_at DESC LIMIT 30")
@@ -1185,7 +1691,15 @@ func (s *server) allowInviteAttempt(remote string) bool {
 }
 
 func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	if _, scoped := s.accountIDForRequest(r); scoped {
+		if r.Method == http.MethodGet {
+			reply(w, http.StatusOK, []map[string]any{})
+		} else {
+			reply(w, http.StatusForbidden, map[string]string{"error": "mesh nodes use the account network token; legacy setup keys require the coordinator administrator"})
+		}
 		return
 	}
 	if r.Method == http.MethodGet {
@@ -1237,11 +1751,60 @@ func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 30, "expires_in_seconds": 30})
 }
 
+// accountInvite manages high-entropy invitations for human accounts. The
+// short setup keys above remain dedicated to enrolling mesh nodes.
+func (s *server) accountInvite(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	now := time.Now().Unix()
+	if r.Method == http.MethodGet {
+		rows, err := s.db.Query("SELECT created_at,expires_at,used_at FROM account_invites WHERE expires_at>=? OR used_at IS NOT NULL ORDER BY created_at DESC LIMIT 50", now)
+		if err != nil {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": "could not list account invitations"})
+			return
+		}
+		defer rows.Close()
+		out := []map[string]any{}
+		for rows.Next() {
+			var created, expires int64
+			var used sql.NullInt64
+			if err = rows.Scan(&created, &expires, &used); err != nil {
+				reply(w, http.StatusInternalServerError, map[string]string{"error": "could not list account invitations"})
+				return
+			}
+			out = append(out, map[string]any{"created_at": created, "expires_at": expires, "used": used.Valid})
+		}
+		reply(w, http.StatusOK, out)
+		return
+	}
+	if r.Method != http.MethodPost {
+		reply(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	token, err := randomToken(32)
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not create invitation"})
+		return
+	}
+	expires := now + 24*60*60
+	if _, err = s.db.Exec("INSERT INTO account_invites(token_hash,created_at,expires_at) VALUES(?,?,?)", tokenDigest(token), now, expires); err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "could not save invitation"})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_invite_created", "account invitation created")
+	// The raw token is returned exactly once and is never logged or stored.
+	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": expires, "expires_in_seconds": 24 * 60 * 60})
+}
+
 func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
 	if id == "" {
 		reply(w, 400, map[string]string{"error": "missing node_id"})
 		return
@@ -1266,10 +1829,13 @@ func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
 	var input struct {
 		Role string `json:"role"`
 	}
@@ -1294,7 +1860,12 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := s.rebalanceRoles(); err != nil {
+	if accountID, scoped := s.accountIDForRequest(r); scoped {
+		if err := s.rebalanceRolesFor(&accountID); err != nil {
+			reply(w, 500, map[string]string{"error": err.Error()})
+			return
+		}
+	} else if err := s.rebalanceRoles(); err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
@@ -1304,11 +1875,12 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
+	accountID, scoped := s.accountIDForRequest(r)
 	if r.Method == http.MethodGet {
-		reply(w, 200, map[string]any{"links": s.manualLinks()})
+		reply(w, 200, map[string]any{"links": s.manualLinksForAccount(accountID, scoped)})
 		return
 	}
 	var input struct {
@@ -1323,6 +1895,10 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 			reply(w, 400, map[string]string{"error": "invalid graph link"})
 			return
 		}
+		if scoped && (!s.nodeOwnedByAccount(e.A, accountID) || !s.nodeOwnedByAccount(e.B, accountID)) {
+			reply(w, http.StatusNotFound, map[string]string{"error": "node not found"})
+			return
+		}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -1330,7 +1906,12 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec("DELETE FROM graph_links"); err == nil {
+	if scoped {
+		_, err = tx.Exec("DELETE FROM graph_links WHERE a IN (SELECT node_id FROM nodes WHERE owner_id=?) AND b IN (SELECT node_id FROM nodes WHERE owner_id=?)", accountID, accountID)
+	} else {
+		_, err = tx.Exec("DELETE FROM graph_links")
+	}
+	if err == nil {
 		for _, e := range input.Links {
 			a, b := e.A, e.B
 			if a > b {
@@ -1354,10 +1935,22 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) manualLinks() []link {
+	return s.manualLinksForAccount(0, false)
+}
+
+func (s *server) manualLinksForAccount(accountID int64, scoped bool) []link {
 	if s.db == nil {
 		return []link{}
 	}
-	rows, err := s.db.Query("SELECT a,b,cost FROM graph_links ORDER BY a,b")
+	query := "SELECT a,b,cost FROM graph_links ORDER BY a,b"
+	args := []any{}
+	if scoped {
+		query = `SELECT g.a,g.b,g.cost FROM graph_links g
+			JOIN nodes na ON na.node_id=g.a JOIN nodes nb ON nb.node_id=g.b
+			WHERE na.owner_id=? AND nb.owner_id=? ORDER BY g.a,g.b`
+		args = []any{accountID, accountID}
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return []link{}
 	}
@@ -1525,6 +2118,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
 	}
+	accountID, accountScoped := s.accountIDForRequest(r)
 	var d struct {
 		ID       string `json:"node_id"`
 		Public   string `json:"public_key"`
@@ -1546,6 +2140,11 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	pub, e := protocol.B64Decode(d.Public)
 	if e != nil || protocol.NodeID(pub) != d.ID {
 		reply(w, 400, map[string]any{"error": "node_id does not match public_key"})
+		return
+	}
+	var existingOwner sql.NullInt64
+	if s.db.QueryRow("SELECT owner_id FROM nodes WHERE node_id=?", d.ID).Scan(&existingOwner) == nil && accountScoped && existingOwner.Valid && existingOwner.Int64 != accountID {
+		reply(w, http.StatusForbidden, map[string]any{"error": "node belongs to another account"})
 		return
 	}
 	var roleOverride string
@@ -1605,12 +2204,21 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
 	}
-	_, e = s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,nat_type=excluded.nat_type,role=excluded.role,endpoint=excluded.endpoint,requested_role=excluded.requested_role,relay_capable=excluded.relay_capable,capacity=excluded.capacity,last_seen=excluded.last_seen,mesh_ip=excluded.mesh_ip`, d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, ip)
+	var ownerValue any
+	if accountScoped {
+		ownerValue = accountID
+	}
+	_, e = s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,nat_type=excluded.nat_type,role=excluded.role,endpoint=excluded.endpoint,requested_role=excluded.requested_role,relay_capable=excluded.relay_capable,capacity=excluded.capacity,last_seen=excluded.last_seen,mesh_ip=excluded.mesh_ip,owner_id=COALESCE(nodes.owner_id,excluded.owner_id)`, d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, ip, ownerValue)
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
 	}
-	if e = s.rebalanceRoles(); e != nil {
+	if accountScoped {
+		e = s.rebalanceRolesFor(&accountID)
+	} else {
+		e = s.rebalanceRoles()
+	}
+	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
 	}
@@ -1764,7 +2372,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 	return rank
 }
 func (s *server) links(nodes []node) []link {
-	if manual := s.manualLinks(); len(manual) > 0 {
+	if manual := s.manualLinksForNodes(nodes); len(manual) > 0 {
 		return s.decorateLinks(s.addAutomaticClientLinks(manual, nodes), nodes)
 	}
 	s.configMu.RLock()
@@ -1817,6 +2425,20 @@ func (s *server) links(nodes []node) []link {
 		}
 	}
 	return s.decorateLinks(out, nodes)
+}
+
+func (s *server) manualLinksForNodes(nodes []node) []link {
+	allowed := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		allowed[n.ID] = true
+	}
+	out := []link{}
+	for _, e := range s.manualLinks() {
+		if allowed[e.A] && allowed[e.B] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func edgeKey(a, b string) string {
@@ -1892,7 +2514,15 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("node_id")
 	ttl := s.settings().TTL
-	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? ORDER BY node_id", time.Now().Unix()-int64(ttl))
+	accountID, scoped := s.accountIDForRequest(r)
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	args := []any{time.Now().Unix() - int64(ttl)}
+	if scoped {
+		query += " AND owner_id=?"
+		args = append(args, accountID)
+	}
+	query += " ORDER BY node_id"
+	all, e := s.rows(query, args...)
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
@@ -1924,7 +2554,14 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 			peers = append(peers, n)
 		}
 	}
-	rs, _ := s.db.Query("SELECT node_id,name FROM services ORDER BY node_id,name")
+	serviceQuery := "SELECT services.node_id,services.name FROM services JOIN nodes ON nodes.node_id=services.node_id"
+	serviceArgs := []any{}
+	if scoped {
+		serviceQuery += " WHERE nodes.owner_id=?"
+		serviceArgs = append(serviceArgs, accountID)
+	}
+	serviceQuery += " ORDER BY services.node_id,services.name"
+	rs, _ := s.db.Query(serviceQuery, serviceArgs...)
 	var services []map[string]string
 	for rs.Next() {
 		var n, x string
@@ -1955,6 +2592,9 @@ func (s *server) service(w http.ResponseWriter, r *http.Request) {
 		reply(w, 404, map[string]any{"error": "unknown node"})
 		return
 	}
+	if !s.requireNodeAccess(w, r, d.Node) {
+		return
+	}
 	if d.Allowed == "" {
 		d.Allowed = "*"
 	}
@@ -1967,6 +2607,9 @@ func (s *server) service(w http.ResponseWriter, r *http.Request) {
 }
 func (s *server) serviceDetails(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
+		return
+	}
+	if !s.requireNodeAccess(w, r, r.PathValue("node_id")) {
 		return
 	}
 	var d struct {
