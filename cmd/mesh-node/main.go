@@ -551,6 +551,7 @@ func (n *node) connectControl() error {
 	default:
 		return fmt.Errorf("unsupported control-plane URL scheme %q", u.Scheme)
 	}
+	n.logf("connecting control WebSocket via %s", u.String())
 	origin := "http://" + u.Host
 	wsConfig, err := websocket.NewConfig(u.String(), origin)
 	if err != nil {
@@ -562,20 +563,11 @@ func (n *node) connectControl() error {
 	}
 	if u.Scheme == "wss" {
 		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
-		if n.c.controlCA != "" {
-			pem, err := os.ReadFile(n.c.controlCA)
-			if err != nil {
-				return fmt.Errorf("read --control-ca-file: %w", err)
-			}
-			pool, err := x509.SystemCertPool()
-			if err != nil || pool == nil {
-				pool = x509.NewCertPool()
-			}
-			if !pool.AppendCertsFromPEM(pem) {
-				return fmt.Errorf("no certificate found in --control-ca-file")
-			}
-			tlsConfig.RootCAs = pool
+		pool, err := controlCertPool(n.c.controlCA)
+		if err != nil {
+			return err
 		}
+		tlsConfig.RootCAs = pool
 		if n.c.controlInsecure {
 			tlsConfig.InsecureSkipVerify = true
 			n.logf("WARNING: TLS certificate verification is disabled")
@@ -591,6 +583,42 @@ func (n *node) connectControl() error {
 	go n.readControl(ws, n.controlReply)
 	n.logf("control WebSocket connected")
 	return nil
+}
+
+func controlCertPool(explicit string) (*x509.CertPool, error) {
+	pool, err := x509.SystemCertPool()
+	if err != nil || pool == nil {
+		pool = x509.NewCertPool()
+	}
+	if explicit != "" {
+		pem, err := os.ReadFile(explicit)
+		if err != nil {
+			return nil, fmt.Errorf("read --control-ca-file: %w", err)
+		}
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no certificate found in --control-ca-file")
+		}
+		return pool, nil
+	}
+	// Termux keeps its CA bundle outside the Android system paths. Add known
+	// OS/package-manager bundles without weakening verification or accepting
+	// an insecure TLS connection.
+	paths := []string{
+		os.Getenv("SSL_CERT_FILE"),
+		"/data/data/com.termux/files/usr/etc/tls/cert.pem",
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/etc/ssl/cert.pem",
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		pem, readErr := os.ReadFile(path)
+		if readErr == nil {
+			pool.AppendCertsFromPEM(pem)
+		}
+	}
+	return pool, nil
 }
 
 func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
@@ -839,11 +867,13 @@ func (n *node) buildRoutes() map[string]string {
 }
 func (n *node) start() error {
 	if n.c.endpoint == "" {
+		n.logf("detecting public UDP endpoint via STUN")
 		endpoint, nat, e := n.detectEndpoint()
 		if e != nil {
 			return fmt.Errorf("detect external endpoint: %w", e)
 		}
 		n.c.endpoint = endpoint
+		n.logf("public UDP endpoint detected: %s, NAT=%s", endpoint, nat)
 		if n.c.nat == "auto" {
 			n.c.nat = nat
 		}
