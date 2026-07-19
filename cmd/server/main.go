@@ -895,11 +895,23 @@ func (s *server) requireNodeAccess(w http.ResponseWriter, r *http.Request, nodeI
 }
 
 func (s *server) auth(w http.ResponseWriter, r *http.Request) bool {
-	if !s.networkTokenValid(r) {
+	if !s.networkTokenValid(r) && !s.inviteRegistrationAuthorized(r) {
 		reply(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return false
 	}
 	return true
+}
+
+func (s *server) inviteRegistrationAuthorized(r *http.Request) bool {
+	if r.Method != http.MethodPost || r.URL.Path != "/v1/register" {
+		return false
+	}
+	token := r.Header.Get("X-Mesh-Invite")
+	if token == "" {
+		return false
+	}
+	var used sql.NullInt64
+	return s.db.QueryRow("SELECT used_at FROM invites WHERE token=?", token).Scan(&used) == nil && used.Valid
 }
 
 func (s *server) networkTokenValid(r *http.Request) bool {
