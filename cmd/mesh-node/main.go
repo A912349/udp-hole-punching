@@ -168,44 +168,46 @@ type fastStats struct {
 	deliveryDrops                    atomic.Uint64
 }
 type node struct {
-	c               config
-	requestedRole   string
-	id              *protocol.Identity
-	key             []byte
-	conn            *net.UDPConn
-	lanConn         *net.UDPConn
-	udpReadMu       sync.Mutex
-	recoveryMu      sync.Mutex
-	recoveryNext    time.Time
-	recoveryFails   int
-	control         *websocket.Conn
-	controlMu       sync.Mutex
-	controlCall     sync.Mutex
-	controlReply    chan controlFrame
-	pingMu          sync.Mutex
-	pings           map[string]time.Time
-	mu              sync.RWMutex
-	routeMu         sync.Mutex
-	dir             map[string]*peer
-	neighbors       map[string]*peer
-	links           []edge
-	topologyVersion string
-	routes          map[string]string
-	meshNodes       map[netip.Addr]string
-	subnetRoutes    []subnetRoute
-	installedRoutes map[string]bool
-	seen            map[string]struct{}
-	pending         map[string]chan serviceResult
-	services        map[string]string
-	allow           map[string]bool
-	stop            context.CancelFunc
-	tun             tunDevice
-	startedAt       time.Time
-	fastQueue       chan fastFrame
-	fastPool        sync.Pool
-	macPool         sync.Pool
-	deliverQueue    chan deliverFrame
-	stats           fastStats
+	c                config
+	requestedRole    string
+	id               *protocol.Identity
+	key              []byte
+	conn             *net.UDPConn
+	lanConn          *net.UDPConn
+	udpReadMu        sync.Mutex
+	recoveryMu       sync.Mutex
+	recoveryNext     time.Time
+	recoveryFails    int
+	control          *websocket.Conn
+	controlMu        sync.Mutex
+	controlCall      sync.Mutex
+	controlReply     chan controlFrame
+	pingMu           sync.Mutex
+	pings            map[string]time.Time
+	mu               sync.RWMutex
+	routeMu          sync.Mutex
+	dir              map[string]*peer
+	neighbors        map[string]*peer
+	links            []edge
+	topologyVersion  string
+	lastLoggedMeshIP string
+	lastLoggedRole   string
+	routes           map[string]string
+	meshNodes        map[netip.Addr]string
+	subnetRoutes     []subnetRoute
+	installedRoutes  map[string]bool
+	seen             map[string]struct{}
+	pending          map[string]chan serviceResult
+	services         map[string]string
+	allow            map[string]bool
+	stop             context.CancelFunc
+	tun              tunDevice
+	startedAt        time.Time
+	fastQueue        chan fastFrame
+	fastPool         sync.Pool
+	macPool          sync.Pool
+	deliverQueue     chan deliverFrame
+	stats            fastStats
 
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
@@ -748,7 +750,18 @@ func (n *node) register() error {
 		}
 		n.logf("invite accepted; permanent network credentials saved")
 	}
-	n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
+	// Registration is repeated periodically to refresh the coordinator lease.
+	// Keep the normal log useful: report this state once and only when it changes.
+	n.mu.Lock()
+	changed := n.lastLoggedMeshIP != out.MeshIP || n.lastLoggedRole != out.Role
+	if changed {
+		n.lastLoggedMeshIP = out.MeshIP
+		n.lastLoggedRole = out.Role
+	}
+	n.mu.Unlock()
+	if n.c.debug || changed {
+		n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
+	}
 	return nil
 }
 func (n *node) bootstrap() error {
