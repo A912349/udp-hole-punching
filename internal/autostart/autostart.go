@@ -41,8 +41,10 @@ func Install(name string, args []string, env []string) error {
 		data += "</array><key>WorkingDirectory</key><string>" + xmlEscape(work) + "</string><key>StandardOutPath</key><string>" + xmlEscape(logPath) + "</string><key>StandardErrorPath</key><string>" + xmlEscape(logPath) + "</string><key>RunAtLoad</key><true/></dict></plist>\n"
 		return os.WriteFile(p, []byte(data), 0600)
 	}
-	// Linux and other Unix systems: systemd user unit.
-	dir := filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user")
+	// Linux and other Unix systems: always install a system-wide unit.
+	// This deliberately avoids systemd --user, which is unavailable in many
+	// containers and is unsuitable for a root-managed mesh service.
+	dir := "/etc/systemd/system"
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
@@ -59,8 +61,9 @@ func Install(name string, args []string, env []string) error {
 	if err := os.WriteFile(path, []byte(unit), 0600); err != nil {
 		return err
 	}
-	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
-	return exec.Command("systemctl", "--user", "enable", "--now", "mesh-"+name+".service").Run()
+	unitName := "mesh-" + name + ".service"
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	return exec.Command("systemctl", "enable", "--now", unitName).Run()
 }
 
 func Remove(name string) error {
@@ -71,8 +74,9 @@ func Remove(name string) error {
 		return os.Remove(filepath.Join(os.Getenv("HOME"), "Library", "LaunchAgents", "com.mesh."+name+".plist"))
 	}
 	unit := "mesh-" + name + ".service"
-	_ = exec.Command("systemctl", "--user", "disable", "--now", unit).Run()
-	return os.Remove(filepath.Join(os.Getenv("HOME"), ".config", "systemd", "user", unit))
+	_ = exec.Command("systemctl", "disable", "--now", unit).Run()
+	_ = exec.Command("systemctl", "daemon-reload").Run()
+	return os.Remove(filepath.Join("/etc/systemd/system", unit))
 }
 
 func configDir(name string) string {
