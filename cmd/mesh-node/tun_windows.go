@@ -24,6 +24,7 @@ import (
 
 const (
 	wintunSessionCapacity = 8 * 1024 * 1024
+	wintunPoolName        = "Home UDP Mesh"
 	waitObjectTimeout     = 100
 	waitObjectFailed      = 0xffffffff
 )
@@ -62,12 +63,18 @@ func openTUN(name string) (tunDevice, error) {
 		return nil, fmt.Errorf("load wintun.dll: %w (copy the official Wintun DLL next to mesh-node.exe)", err)
 	}
 	wname := syscall.StringToUTF16Ptr(name)
-	adapter, _, openErr := wintunOpenAdapter.Call(uintptr(unsafe.Pointer(wname)))
+	poolName := syscall.StringToUTF16Ptr(wintunPoolName)
+	adapter, _, openErr := wintunOpenAdapter.Call(
+		uintptr(unsafe.Pointer(poolName)),
+		uintptr(unsafe.Pointer(wname)),
+	)
 	if adapter == 0 {
+		var createErr uint32
 		adapter, _, openErr = wintunCreateAdapter.Call(
+			uintptr(unsafe.Pointer(poolName)),
 			uintptr(unsafe.Pointer(wname)),
-			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("Home UDP Mesh"))),
 			0,
+			uintptr(unsafe.Pointer(&createErr)),
 		)
 		if adapter == 0 {
 			return nil, fmt.Errorf("open or create Wintun adapter %q: %w", name, winCallError(openErr))

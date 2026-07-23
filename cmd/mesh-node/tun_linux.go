@@ -246,7 +246,23 @@ func configureSiteNAT(localLAN, remoteVirtual []string) error {
 	return nil
 }
 
-func cleanupTUN(string, map[string]bool) {}
+func cleanupTUN(name string, installed map[string]bool) {
+	if name == "" {
+		return
+	}
+	ipCommand, err := findIPCommand()
+	if err != nil {
+		return
+	}
+	// Closing a non-persistent TUN normally removes it. Explicitly deleting
+	// the named link as well also cleans up interfaces left behind when the
+	// process was killed between TUNSETIFF and close(). The name is supplied
+	// by the user and is never interpreted by a shell.
+	for route := range installed {
+		_, _ = exec.Command(ipCommand, "route", "del", route, "dev", name).CombinedOutput()
+	}
+	_, _ = exec.Command(ipCommand, "link", "del", "dev", name).CombinedOutput()
+}
 
 func configurePlatformNetwork(int) error { return nil }
 func cleanupPlatformNetwork(int)         {}

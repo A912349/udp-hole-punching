@@ -943,10 +943,14 @@ func (n *node) start() error {
 		n.tun = f
 		if n.c.autoTUN {
 			if e := configureTUN(n.c.tun, n.c.meshIP, n.c.prefix); e != nil {
+				_ = n.tun.Close()
+				n.tun = nil
 				return e
 			}
 			n.logf("TUN %s configured with %s/%d", n.c.tun, n.c.meshIP, n.c.prefix)
 			if e := n.syncTUNRoutes(); e != nil {
+				_ = n.tun.Close()
+				n.tun = nil
 				return e
 			}
 		}
