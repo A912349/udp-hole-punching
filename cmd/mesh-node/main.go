@@ -27,6 +27,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -305,7 +306,7 @@ func (n *node) debugStartupNetwork() {
 		host := u.Hostname()
 		n.logf("debug coordinator scheme=%s host=%s port=%s", u.Scheme, host, u.Port())
 		if host != "" {
-			addresses, resolveErr := net.LookupHost(host)
+			addresses, resolveErr := meshResolver().LookupHost(context.Background(), host)
 			if resolveErr != nil {
 				n.logf("debug DNS coordinator %s failed: %v", host, resolveErr)
 			} else {
@@ -314,7 +315,7 @@ func (n *node) debugStartupNetwork() {
 		}
 	}
 	for _, stun := range []string{"stun.nextcloud.com:3478", "stun.miwifi.com:3478", "stun.sipgate.net:3478"} {
-		addresses, resolveErr := net.LookupHost(strings.TrimSuffix(strings.Split(stun, ":")[0], "]"))
+		addresses, resolveErr := meshResolver().LookupHost(context.Background(), strings.TrimSuffix(strings.Split(stun, ":")[0], "]"))
 		if resolveErr != nil {
 			n.logf("debug DNS STUN %s failed: %v", stun, resolveErr)
 		} else {
@@ -625,6 +626,7 @@ func (n *node) connectControl() error {
 	if err != nil {
 		return err
 	}
+	wsConfig.Dialer = &net.Dialer{Timeout: 10 * time.Second, Resolver: meshResolver()}
 	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
 	if n.c.inviteToken != "" {
 		wsConfig.Header.Set("X-Mesh-Invite", n.c.inviteToken)
@@ -651,6 +653,36 @@ func (n *node) connectControl() error {
 	go n.readControl(ws, n.controlReply)
 	n.logf("control WebSocket connected")
 	return nil
+}
+
+// meshResolver avoids Android configurations that point libc DNS at an
+// unavailable IPv6 loopback resolver (::1). It deliberately resolves only
+// IPv4 addresses because the mesh transport is IPv4/UDP based.
+func meshResolver() *net.Resolver {
+	if runtime.GOOS != "android" {
+		return net.DefaultResolver
+	}
+	servers := []string{}
+	for _, prop := range []string{"net.dns1", "net.dns2", "net.dns3", "net.dns4"} {
+		if out, err := exec.Command("getprop", prop).Output(); err == nil {
+			v := strings.TrimSpace(string(out))
+			if ip := net.ParseIP(v); ip != nil && ip.To4() != nil {
+				servers = append(servers, net.JoinHostPort(v, "53"))
+			}
+		}
+	}
+	servers = append(servers, "1.1.1.1:53", "8.8.8.8:53")
+	var index atomic.Uint32
+	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		for i := 0; i < len(servers); i++ {
+			server := servers[int(index.Add(1)-1)%len(servers)]
+			conn, err := (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "udp4", server)
+			if err == nil {
+				return conn, nil
+			}
+		}
+		return nil, errors.New("no IPv4 DNS server available")
+	}}
 }
 
 func controlCertPool(explicit string) (*x509.CertPool, error) {
@@ -2501,7 +2533,7 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 	servers := []string{"stun.nextcloud.com:3478", "stun.miwifi.com:3478", "stun.sipgate.net:3478"}
 	var mapped []string
 	for _, server := range servers {
-		a, e := net.ResolveUDPAddr("udp", server)
+		a, e := resolveMeshUDPAddr(server)
 		if e != nil {
 			continue
 		}
@@ -2542,4 +2574,28 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 		return mapped[0], "cone", nil
 	}
 	return "", "", errors.New("no STUN server responded")
+}
+
+func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return net.ResolveUDPAddr("udp4", address)
+	}
+	ips, err := meshResolver().LookupHost(context.Background(), host)
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range ips {
+		if ip := net.ParseIP(raw).To4(); ip != nil {
+			p, err := net.LookupPort("udp", port)
+			if err != nil {
+				return nil, err
+			}
+			return &net.UDPAddr{IP: ip, Port: p}, nil
+		}
+	}
+	return nil, errors.New("DNS returned no IPv4 address")
 }
