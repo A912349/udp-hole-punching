@@ -252,6 +252,9 @@ func main() {
 	}
 	defer n.close()
 	log.Printf("[%s] Mesh node %s", n.id.ID[:8], n.id.ID)
+	if c.debug {
+		n.debugStartupNetwork()
+	}
 	if e = n.start(); e != nil {
 		log.Fatal(e)
 	}
@@ -277,6 +280,47 @@ func main() {
 		return
 	}
 	select {}
+}
+
+// debugStartupNetwork prints diagnostics before STUN/WebSocket traffic starts.
+// It is intentionally best-effort: diagnostics must never prevent startup.
+func (n *node) debugStartupNetwork() {
+	n.logf("debug startup: server=%s bind=%s udp=%s role=%s nat=%s tun=%s auto_tun=%t", n.c.server, n.c.bind, n.conn.LocalAddr(), n.c.role, n.c.nat, n.c.tun, n.c.autoTUN)
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		n.logf("debug network interfaces: %v", err)
+	} else {
+		for _, iface := range interfaces {
+			addrs, addrErr := iface.Addrs()
+			if addrErr != nil {
+				n.logf("debug interface %s flags=%s addresses unavailable: %v", iface.Name, iface.Flags, addrErr)
+				continue
+			}
+			n.logf("debug interface %s index=%d flags=%s mtu=%d addresses=%v", iface.Name, iface.Index, iface.Flags, iface.MTU, addrs)
+		}
+	}
+	if u, err := url.Parse(strings.TrimRight(n.c.server, "/")); err != nil {
+		n.logf("debug coordinator URL parse failed: %v", err)
+	} else {
+		host := u.Hostname()
+		n.logf("debug coordinator scheme=%s host=%s port=%s", u.Scheme, host, u.Port())
+		if host != "" {
+			addresses, resolveErr := net.LookupHost(host)
+			if resolveErr != nil {
+				n.logf("debug DNS coordinator %s failed: %v", host, resolveErr)
+			} else {
+				n.logf("debug DNS coordinator %s -> %v", host, addresses)
+			}
+		}
+	}
+	for _, stun := range []string{"stun.nextcloud.com:3478", "stun.miwifi.com:3478", "stun.sipgate.net:3478"} {
+		addresses, resolveErr := net.LookupHost(strings.TrimSuffix(strings.Split(stun, ":")[0], "]"))
+		if resolveErr != nil {
+			n.logf("debug DNS STUN %s failed: %v", stun, resolveErr)
+		} else {
+			n.logf("debug DNS STUN %s -> %v", stun, addresses)
+		}
+	}
 }
 func parse() config {
 	var c config
