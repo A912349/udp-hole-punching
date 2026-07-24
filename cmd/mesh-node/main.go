@@ -1349,16 +1349,7 @@ func (n *node) recoverNetwork() {
 		}
 	}
 	n.mu.RUnlock()
-	// Android may change the default route while the old UDP socket and
-	// WebSocket still look alive. Probe STUN even when peers have not timed
-	// out yet; this detects Wi-Fi <-> mobile-data transitions promptly.
-	if !stale && n.c.endpoint != "" {
-		endpoint, nat, err := n.detectEndpoint()
-		if err == nil && endpoint == n.c.endpoint && (n.c.nat == nat || n.c.nat == "auto") {
-			return
-		}
-	}
-	if !n.recoveryMu.TryLock() {
+	if !stale || !n.recoveryMu.TryLock() {
 		return
 	}
 	defer n.recoveryMu.Unlock()
@@ -1381,19 +1372,9 @@ func (n *node) recoverNetwork() {
 		return
 	}
 	n.c.endpoint = endpoint
-	// Always publish the freshly detected NAT type. In particular, a device
-	// that was cone/superpeer on Wi-Fi may become symmetric on mobile data.
-	// The coordinator can then assign the safe client role for this network.
-	if n.c.nat != nat {
-		n.logf("network changed: endpoint=%s NAT=%s (was %s)", endpoint, nat, n.c.nat)
+	if n.c.nat == "auto" || n.c.nat == "cone" {
+		n.c.nat = nat
 	}
-	n.c.nat = nat
-	n.controlMu.Lock()
-	if n.control != nil {
-		_ = n.control.Close()
-		n.control = nil
-	}
-	n.controlMu.Unlock()
 	if err := n.register(); err != nil {
 		n.logf("re-register after network loss failed: %v", err)
 		return
