@@ -173,21 +173,23 @@ func (d *wintunDevice) Close() error {
 }
 
 func windowsInterfaceIndex(name string) (string, error) {
-	out, err := exec.Command("netsh", "interface", "ipv4", "show", "interfaces").Output()
-	if err != nil {
-		return "", fmt.Errorf("find Windows interface %q: %w", name, err)
-	}
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) < 5 {
-			continue
+	for attempt := 0; attempt < 30; attempt++ {
+		out, err := exec.Command("netsh", "interface", "ipv4", "show", "interfaces").Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				fields := strings.Fields(strings.TrimSpace(line))
+				if len(fields) < 5 {
+					continue
+				}
+				if _, err := strconv.Atoi(fields[0]); err != nil {
+					continue
+				}
+				if strings.EqualFold(strings.Join(fields[4:], " "), name) {
+					return fields[0], nil
+				}
+			}
 		}
-		if _, err := strconv.Atoi(fields[0]); err != nil {
-			continue
-		}
-		if strings.EqualFold(strings.Join(fields[4:], " "), name) {
-			return fields[0], nil
-		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	return "", fmt.Errorf("Windows interface %q was not found", name)
 }

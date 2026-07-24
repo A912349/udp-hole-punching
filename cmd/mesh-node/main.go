@@ -1107,6 +1107,27 @@ func (n *node) start() error {
 // NAT allocates a mapping per destination, therefore one of these sockets must
 // receive the cone superpeer's HELLO before it becomes the node's transport.
 func (n *node) establishSymmetricTransport() bool {
+	// A long symmetric-NAT scan can outlive the coordinator's node TTL.
+	// Keep the registration lease alive before the normal periodic loops are
+	// started (start() blocks here until transport selection completes).
+	leaseStop := make(chan struct{})
+	leaseDone := make(chan struct{})
+	go func() {
+		defer close(leaseDone)
+		ticker := time.NewTicker(heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if err := n.register(); err != nil {
+					n.logf("symmetric scan lease refresh failed: %v", err)
+				}
+			case <-leaseStop:
+				return
+			}
+		}
+	}()
+	defer func() { close(leaseStop); <-leaseDone }()
 	for attempt := 1; attempt <= symmetricBurstRetries; attempt++ {
 		if n.establishSymmetricTransportOnce(attempt) {
 			return true
