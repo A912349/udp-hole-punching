@@ -149,3 +149,47 @@ jobs:
           path: bin/*
           compression-level: 0
           retention-days: 30
+
+release:
+  name: Publish Nightly Release
+  needs:
+    - build
+    - windows-client
+
+  runs-on: ubuntu-latest
+
+  permissions:
+    contents: write
+
+  steps:
+    - name: Download Linux artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: binaries
+        path: release
+
+    - name: Download Windows artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: windows-client
+        path: release
+
+    - name: Delete previous nightly release
+      continue-on-error: true
+      uses: dev-drprasad/delete-tag-and-release@v1.1
+      with:
+        delete_release: true
+        tag_name: nightly
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Create Nightly Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: nightly
+        name: Nightly Build
+        prerelease: true
+        generate_release_notes: false
+        files: release/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
