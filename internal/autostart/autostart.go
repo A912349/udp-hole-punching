@@ -48,7 +48,7 @@ func Install(name string, args []string, env []string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
-	unit := "[Unit]\nDescription=Mesh " + name + "\nAfter=network-online.target\n\n[Service]\nWorkingDirectory=" + escapeUnit(work) + "\nExecStart=" + quote(exe) + " " + joinArgs(args) + "\nRestart=always\nRestartSec=5\nStandardOutput=append:" + logPath + "\nStandardError=append:" + logPath + "\n"
+	unit := "[Unit]\nDescription=Mesh " + name + "\nAfter=network-online.target\n\n[Service]\nWorkingDirectory=" + escapeUnit(work) + "\nExecStart=" + quote(exe) + " " + joinArgs(args) + "\nRestart=always\nRestartSec=5\n"
 	for _, item := range env {
 		if strings.HasPrefix(item, "MESH_") {
 			if i := strings.IndexByte(item, '='); i > 5 {
