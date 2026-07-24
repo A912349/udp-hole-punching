@@ -858,7 +858,21 @@ func (n *node) register() error {
 func (n *node) bootstrap() error {
 	var t topology
 	if e := n.request("GET", "/v1/bootstrap/"+n.id.ID, nil, &t); e != nil {
-		return e
+		// The coordinator intentionally hides stale nodes from topology. A
+		// short control-plane/NAT interruption can therefore make bootstrap
+		// return 404 even though the node still exists. Refresh the lease and
+		// retry once instead of terminating the client.
+		if strings.Contains(e.Error(), "404: unknown node") {
+			n.logf("bootstrap returned unknown node; refreshing registration lease")
+			if registerErr := n.register(); registerErr != nil {
+				return fmt.Errorf("bootstrap unknown node; re-register failed: %w", registerErr)
+			}
+			if retryErr := n.request("GET", "/v1/bootstrap/"+n.id.ID, nil, &t); retryErr != nil {
+				return retryErr
+			}
+		} else {
+			return e
+		}
 	}
 	n.applyTopology(t)
 	return nil
