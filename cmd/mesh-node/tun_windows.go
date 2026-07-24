@@ -174,6 +174,18 @@ func (d *wintunDevice) Close() error {
 
 func windowsInterfaceIndex(name string) (string, error) {
 	for attempt := 0; attempt < 30; attempt++ {
+		// Wintun adapters are sometimes not visible to netsh immediately.
+		// PowerShell queries the adapter store directly and is not affected by
+		// the localized netsh column headers.
+		ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$n=$env:MESH_TUN_NAME; $a=Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $n -or $_.InterfaceAlias -eq $n }; if ($a) { $a[0].ifIndex }`)
+		ps.Env = append(os.Environ(), "MESH_TUN_NAME="+name)
+		if output, err := ps.Output(); err == nil {
+			if index := strings.TrimSpace(string(output)); index != "" {
+				if _, err := strconv.Atoi(index); err == nil {
+					return index, nil
+				}
+			}
+		}
 		out, err := exec.Command("netsh", "interface", "ipv4", "show", "interfaces").Output()
 		if err == nil {
 			for _, line := range strings.Split(string(out), "\n") {
