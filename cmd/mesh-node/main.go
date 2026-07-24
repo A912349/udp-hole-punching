@@ -659,7 +659,7 @@ func (n *node) connectControl() error {
 // unavailable IPv6 loopback resolver (::1). It deliberately resolves only
 // IPv4 addresses because the mesh transport is IPv4/UDP based.
 func meshResolver() *net.Resolver {
-	if runtime.GOOS != "android" {
+	if !androidRuntime() {
 		return net.DefaultResolver
 	}
 	servers := []string{}
@@ -747,6 +747,21 @@ func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
 			n.logf("unexpected control-plane reply discarded")
 		}
 	}
+}
+
+func androidRuntime() bool {
+	if runtime.GOOS == "android" {
+		return true
+	}
+	// Android binaries are often built as linux/arm64 for Termux/Magisk.
+	// Detect the platform by the Android property service in that case.
+	if _, err := os.Stat("/system/bin/getprop"); err == nil {
+		return true
+	}
+	if _, err := exec.LookPath("getprop"); err == nil {
+		return true
+	}
+	return false
 }
 
 // request sends compact JSON frames over one long-lived WebSocket. A failed
