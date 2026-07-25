@@ -30,6 +30,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -44,6 +45,7 @@ const (
 	keepAlive          = 10 * time.Second
 	refresh            = 5 * time.Second
 	heartbeat          = 15 * time.Second
+	topologyPoll       = 37 * time.Second
 	linkTimeout        = 45 * time.Second
 	linkGrace          = 35 * time.Second
 	recoveryMinBackoff = 30 * time.Second
@@ -57,7 +59,10 @@ const (
 	scanInitialEnd        = 2000
 	scanExpand            = 2000
 	scanDelay             = 500 * time.Microsecond
-	symmetricScanRetries  = 5
+	// One scan is paired with one 45-second burst window. Retrying the same
+	// stale mapping for minutes makes the cone side drift into later bursts;
+	// a new burst starts a fresh scan around its newly observed endpoint.
+	symmetricScanRetries  = 1
 	symmetricRetryDelay   = 2 * time.Second
 	symmetricBurstRetries = 4
 	fastMagic             = "MIP1"
@@ -173,9 +178,11 @@ type fastStats struct {
 type node struct {
 	c                config
 	requestedRole    string
+	requestedNAT     string
 	id               *protocol.Identity
 	key              []byte
 	conn             *net.UDPConn
+	connMu           sync.RWMutex
 	lanConn          *net.UDPConn
 	udpReadMu        sync.Mutex
 	recoveryMu       sync.Mutex
@@ -554,6 +561,7 @@ func newNode(c config) (*node, error) {
 	n := &node{
 		c:                  c,
 		requestedRole:      c.role,
+		requestedNAT:       c.nat,
 		id:                 id,
 		key:                k[:],
 		conn:               conn,
@@ -795,10 +803,12 @@ func (n *node) request(method, path string, in, out any) error {
 		}
 		ws, replies := n.control, n.controlReply
 		frame := controlFrame{Method: method, Path: path, Body: body}
+		_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := websocket.JSON.Send(ws, frame); err != nil {
 			n.controlMu.Unlock()
 			last = err
 		} else {
+			_ = ws.SetWriteDeadline(time.Time{})
 			n.controlMu.Unlock()
 			select {
 			case reply := <-replies:
@@ -939,6 +949,7 @@ func (n *node) applyTopology(t topology) {
 	n.topologyVersion = t.Version
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
+	n.cancelObsoleteSymmetricScans()
 	if n.c.debug {
 		n.mu.RLock()
 		for _, r := range n.subnetRoutes {
@@ -952,12 +963,29 @@ func (n *node) applyTopology(t topology) {
 		}
 	}
 	n.logf("topology=%s neighbors=%d", t.Version, len(t.Neighbors))
-	if n.c.role == "superpeer" {
-		for _, candidate := range t.Neighbors {
-			if candidate.NAT == "symmetric" {
-				n.startSymmetricScan(candidate.ID, candidate.Endpoint, false)
-			}
+}
+
+// A cone relay must only scan after it has received a SYMMETRIC_BURST. Starting
+// from a topology push races ahead of the symmetric peer, while retaining a
+// scan after an edge disappears wastes tens of seconds probing an obsolete
+// mapping.
+func (n *node) cancelObsoleteSymmetricScans() {
+	n.mu.RLock()
+	neighbors := make(map[string]bool, len(n.neighbors))
+	for id := range n.neighbors {
+		neighbors[id] = true
+	}
+	n.mu.RUnlock()
+	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+	for id, cancel := range n.symmetricScans {
+		if neighbors[id] {
+			continue
 		}
+		delete(n.symmetricScans, id)
+		close(cancel)
+		delete(n.symmetricConnected, id)
+		delete(n.symmetricBurstAt, id)
 	}
 }
 
@@ -1097,6 +1125,11 @@ func (n *node) start() error {
 		}
 	})
 	go n.periodic(ctx, heartbeat, n.recoverNetwork)
+	go n.periodic(ctx, topologyPoll, func() {
+		if err := n.bootstrap(); err != nil {
+			n.logf("periodic topology refresh failed: %v", err)
+		}
+	})
 	go n.linkHealth(ctx)
 	if err := n.startLANDiscovery(ctx); err != nil {
 		n.logf("LAN discovery unavailable: %v", err)
@@ -1108,14 +1141,14 @@ func (n *node) start() error {
 	if n.tun != nil {
 		go n.tunLoop(ctx)
 	}
-	port := n.conn.LocalAddr().(*net.UDPAddr).Port
+	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
 	if err := configurePlatformNetwork(port); err != nil {
 		n.logf("automatic Windows firewall integration unavailable on UDP %d: %v", port, err)
 	} else if runtime.GOOS == "windows" {
 		n.logf("Windows firewall rule enabled for inbound UDP %d", port)
 	}
 	n.helloAll()
-	n.logf("listening on %s", n.conn.LocalAddr())
+	n.logf("listening on %s", n.currentUDPConn().LocalAddr())
 	return nil
 }
 
@@ -1170,16 +1203,7 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 	}
 	n.symmetricMu.Unlock()
 
-	n.mu.RLock()
-	var relay *peer
-	var relayID string
-	for id, candidate := range n.neighbors {
-		if candidate.Role == "superpeer" {
-			relayID, relay = id, candidate
-			break
-		}
-	}
-	n.mu.RUnlock()
+	relayID, relay := n.symmetricRelay()
 	if relay == nil {
 		n.logf("symmetric burst deferred: no superpeer in topology")
 		return false
@@ -1236,11 +1260,7 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 			_ = probe.Close()
 		}
 	}
-	old := n.conn
-	n.udpReadMu.Lock()
-	n.conn = selected
-	n.udpReadMu.Unlock()
-	_ = old.Close()
+	n.replaceUDPConn(selected)
 	if endpoint, _, err := n.detectEndpoint(); err == nil {
 		n.c.endpoint = endpoint
 		if err := n.register(); err != nil {
@@ -1254,6 +1274,50 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 	n.symmetricMu.Unlock()
 	n.logf("symmetric NAT synchronized through %s on %s", relayID[:8], selected.LocalAddr())
 	return true
+}
+
+func (n *node) symmetricRelay() (string, *peer) {
+	n.mu.RLock()
+	ids := make([]string, 0, len(n.neighbors))
+	for id, candidate := range n.neighbors {
+		if candidate.Role == "superpeer" {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	if len(ids) == 0 {
+		n.mu.RUnlock()
+		return "", nil
+	}
+	id := ids[0]
+	copy := *n.neighbors[id]
+	n.mu.RUnlock()
+	return id, &copy
+}
+
+func (n *node) currentUDPConn() *net.UDPConn {
+	n.connMu.RLock()
+	defer n.connMu.RUnlock()
+	return n.conn
+}
+
+func (n *node) replaceUDPConn(next *net.UDPConn) {
+	n.connMu.Lock()
+	old := n.conn
+	n.conn = next
+	n.connMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	if n.stop != nil && runtime.GOOS == "windows" {
+		newPort := next.LocalAddr().(*net.UDPAddr).Port
+		if old != nil {
+			cleanupPlatformNetwork(old.LocalAddr().(*net.UDPAddr).Port)
+		}
+		if err := configurePlatformNetwork(newPort); err != nil {
+			n.logf("Windows firewall update for recovered UDP port %d failed: %v", newPort, err)
+		}
+	}
 }
 
 func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses chan<- symmetricReply) {
@@ -1304,6 +1368,7 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 }
 
 func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct{}) {
+	deadline := time.Now().Add(symmetricBurstTimeout - symmetricRetryDelay)
 	// A full symmetric-NAT port scan is intentionally broad. Bound concurrent
 	// scans so several newly discovered peers cannot monopolize CPU and UDP
 	// bandwidth at once; queued scans remain cancellable by a newer topology.
@@ -1336,6 +1401,10 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct
 				start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
 				for port := start; port <= end; port++ {
 					if n.symmetricScanCancelled(cancel) {
+						return
+					}
+					if time.Now().After(deadline) {
+						n.logf("symmetric scan window expired for %s", peerID[:8])
 						return
 					}
 					if scanned[port] {
@@ -1390,7 +1459,7 @@ func (n *node) completeSymmetricScan(peerID string) {
 	n.debugf("symmetric scan completed for %s", peerID[:8])
 }
 
-func (n *node) handleSymmetricBurst(packet protocol.Packet) {
+func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAddr) {
 	if n.c.role != "superpeer" {
 		return
 	}
@@ -1410,7 +1479,14 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet) {
 	// A burst is a trigger to ensure that scanning is running. It must not
 	// cancel and restart an already active scan: doing so can invalidate a
 	// nearly completed HELLO/HELLO_ACK exchange on the other node.
-	n.startSymmetricScan(packet.Source, peer.Endpoint, false)
+	// The coordinator endpoint can already be stale: every probe socket of a
+	// symmetric NAT gets a distinct public mapping. Anchor the scan to the
+	// mapping from which this burst packet actually arrived.
+	endpoint := peer.Endpoint
+	if observed != nil {
+		endpoint = observed.String()
+	}
+	n.startSymmetricScan(packet.Source, endpoint, false)
 }
 
 func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
@@ -1418,7 +1494,7 @@ func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	_, _ = n.conn.WriteToUDP(encoded, address)
+	_, _ = n.currentUDPConn().WriteToUDP(encoded, address)
 }
 func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 	t := time.NewTicker(d)
@@ -1457,7 +1533,7 @@ func (n *node) broadcastLANDiscovery() {
 	}
 	conn := n.lanConn
 	n.mu.RUnlock()
-	port := n.conn.LocalAddr().(*net.UDPAddr).Port
+	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
 	p := protocol.NewPacket("LAN_DISCOVERY", n.id.ID, "", map[string]any{"udp_port": port})
 	b, err := protocol.EncodePacket(p, n.key)
 	if err != nil {
@@ -1494,16 +1570,50 @@ func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 		if err != nil || json.Unmarshal(raw, &payload) != nil || payload.Port < 1 || payload.Port > 65535 {
 			continue
 		}
+		candidate := &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: payload.Port}
 		n.mu.Lock()
 		peer := n.neighbors[packet.Source]
 		if peer != nil {
-			peer.last = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: payload.Port}
-			peer.lastRX = time.Now()
-			peer.up = true
-			n.logf("LAN endpoint discovered for %s: %s", packet.Source[:8], peer.last)
+			peer.last = candidate
 		}
 		n.mu.Unlock()
+		if peer != nil {
+			n.debugf("LAN endpoint candidate for %s: %s", packet.Source[:8], candidate)
+			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, packet.Source, map[string]any{"public_key": n.id.Public}), candidate)
+		}
 	}
+}
+
+func (n *node) resetTransportState() {
+	n.mu.Lock()
+	for _, peer := range n.neighbors {
+		peer.last = nil
+		peer.lastRX = time.Time{}
+		peer.up = false
+	}
+	n.mu.Unlock()
+	n.symmetricMu.Lock()
+	n.symmetricReady = false
+	for id, cancel := range n.symmetricScans {
+		delete(n.symmetricScans, id)
+		close(cancel)
+	}
+	n.symmetricConnected = map[string]bool{}
+	n.symmetricBurstAt = map[string]time.Time{}
+	n.symmetricMu.Unlock()
+}
+
+func (n *node) deferRecovery(err error, action string) {
+	n.recoveryFails++
+	backoff := recoveryMinBackoff
+	for i := 1; i < n.recoveryFails && backoff < recoveryMaxBackoff; i++ {
+		backoff *= 2
+	}
+	if backoff > recoveryMaxBackoff {
+		backoff = recoveryMaxBackoff
+	}
+	n.recoveryNext = time.Now().Add(backoff)
+	n.logf("%s: %v; retrying in %s", action, err, backoff)
 }
 
 func (n *node) recoverNetwork() {
@@ -1529,66 +1639,63 @@ func (n *node) recoverNetwork() {
 		return
 	}
 	n.logf("network link stale; refreshing STUN endpoint and topology")
+	n.resetTransportState()
 	endpoint, nat, err := n.detectEndpoint()
 	if err != nil {
-		n.recoveryFails++
-		backoff := recoveryMinBackoff
-		for i := 1; i < n.recoveryFails && backoff < recoveryMaxBackoff; i++ {
-			backoff *= 2
-		}
-		if backoff > recoveryMaxBackoff {
-			backoff = recoveryMaxBackoff
-		}
-		n.recoveryNext = time.Now().Add(backoff)
-		n.logf("STUN recovery failed: %v; retrying in %s", err, backoff)
+		n.deferRecovery(err, "STUN recovery failed")
 		return
 	}
 	n.c.endpoint = endpoint
-	if n.c.nat == "auto" || n.c.nat == "cone" {
+	if n.requestedNAT == "auto" {
 		n.c.nat = nat
 	}
 	if err := n.register(); err != nil {
-		n.logf("re-register after network loss failed: %v", err)
+		n.deferRecovery(err, "re-register after network loss failed")
 		return
 	}
 	if err := n.bootstrap(); err != nil {
-		n.logf("topology refresh after network loss failed: %v", err)
+		n.deferRecovery(err, "topology refresh after network loss failed")
+		return
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.deferRecovery(errors.New("symmetric handshake did not complete"), "symmetric transport recovery failed")
 		return
 	}
 	n.recoveryFails = 0
 	n.recoveryNext = time.Time{}
-	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
-		n.logf("symmetric transport recovery failed")
-	}
 	n.helloAll()
 }
 
 func (n *node) detectEndpoint() (string, string, error) {
 	n.udpReadMu.Lock()
 	defer n.udpReadMu.Unlock()
-	return stunEndpoint(n.conn)
+	return stunEndpoint(n.currentUDPConn())
 }
 
 func (n *node) helloAll() {
 	n.mu.RLock()
-	a := make([]string, 0, len(n.neighbors))
-	for id := range n.neighbors {
-		a = append(a, id)
+	type helloTarget struct {
+		id       string
+		observed *net.UDPAddr
+		declared string
+	}
+	targets := make([]helloTarget, 0, len(n.neighbors))
+	for id, peer := range n.neighbors {
+		target := helloTarget{id: id, declared: peer.Endpoint}
+		if address, ok := peer.last.(*net.UDPAddr); ok {
+			target.observed = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
+		}
+		targets = append(targets, target)
 	}
 	n.mu.RUnlock()
-	for _, id := range a {
-		packet := protocol.NewPacket("HELLO", n.id.ID, id, map[string]any{"public_key": n.id.Public})
-		if !n.send(packet) {
-			n.mu.RLock()
-			peer := n.neighbors[id]
-			endpoint := ""
-			if peer != nil {
-				endpoint = peer.Endpoint
-			}
-			n.mu.RUnlock()
-			if address, err := net.ResolveUDPAddr("udp", endpoint); err == nil {
-				n.sendToAddress(packet, address)
-			}
+	for _, target := range targets {
+		packet := protocol.NewPacket("HELLO", n.id.ID, target.id, map[string]any{"public_key": n.id.Public})
+		if target.observed != nil {
+			n.sendToAddress(packet, target.observed)
+		}
+		if address, err := net.ResolveUDPAddr("udp", target.declared); err == nil &&
+			(target.observed == nil || address.String() != target.observed.String()) {
+			n.sendToAddress(packet, address)
 		}
 	}
 }
@@ -1660,7 +1767,7 @@ func (n *node) send(p protocol.Packet) bool {
 	if e != nil {
 		return false
 	}
-	_, e = n.conn.WriteToUDP(b, a.(*net.UDPAddr))
+	_, e = n.currentUDPConn().WriteToUDP(b, a.(*net.UDPAddr))
 	return e == nil
 }
 
@@ -1869,7 +1976,7 @@ func (n *node) receive(ctx context.Context) {
 	buffer := make([]byte, protocol.MaxDatagramSize)
 	defer close(n.fastQueue)
 	for {
-		conn := n.conn
+		conn := n.currentUDPConn()
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n.udpReadMu.Lock()
 		length, address, e := conn.ReadFromUDP(buffer)
@@ -1893,7 +2000,9 @@ func (n *node) receive(ctx context.Context) {
 		if e != nil || !n.remember(p.ID) {
 			continue
 		}
-		n.touch(p.Source, address)
+		if p.Destination == n.id.ID && confirmsDirectPath(p.Type) {
+			n.touch(p.Source, address)
+		}
 		if p.Destination != n.id.ID {
 			if n.c.role == "superpeer" {
 				if q, e := p.DecTTL(); e == nil {
@@ -1927,13 +2036,23 @@ func (n *node) receive(ctx context.Context) {
 			}
 		case "SYMMETRIC_BURST":
 			n.ensureNeighbor(p.Source)
-			n.handleSymmetricBurst(p)
+			n.handleSymmetricBurst(p, address)
 		case "DATA":
 			n.ensureNeighbor(p.Source)
 			n.data(p)
 		}
 	}
 }
+
+func confirmsDirectPath(packetType string) bool {
+	switch packetType {
+	case "HELLO", "HELLO_ACK", "PING", "PONG":
+		return true
+	default:
+		return false
+	}
+}
+
 func (n *node) remember(id string) bool {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -1952,7 +2071,11 @@ func (n *node) remember(id string) bool {
 func (n *node) touch(id string, a net.Addr) {
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
-		p.last = a
+		if address, ok := a.(*net.UDPAddr); ok {
+			p.last = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
+		} else {
+			p.last = a
+		}
 		p.lastRX = time.Now()
 		p.up = true
 	}
@@ -2297,11 +2420,13 @@ func (n *node) close() {
 	if n.stop != nil {
 		n.stop()
 	}
-	n.conn.Close()
+	conn := n.currentUDPConn()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	conn.Close()
 	if n.tun != nil {
 		cleanupTUN(n.c.tun, n.installedRoutes, n.tunLUID)
 	}
-	cleanupPlatformNetwork(n.conn.LocalAddr().(*net.UDPAddr).Port)
+	cleanupPlatformNetwork(port)
 	if n.tun != nil {
 		n.tun.Close()
 	}
@@ -2386,7 +2511,7 @@ func (n *node) sendFast(dst string, data []byte) bool {
 			return false
 		}
 	}
-	_, e := n.conn.WriteToUDP(data, a.(*net.UDPAddr))
+	_, e := n.currentUDPConn().WriteToUDP(data, a.(*net.UDPAddr))
 	if e != nil {
 		n.debugf("fast send to %s via %s failed: %v", dst[:8], a, e)
 		return false

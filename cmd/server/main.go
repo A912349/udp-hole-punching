@@ -107,10 +107,27 @@ type linkMetric struct {
 
 type controlClient struct {
 	ws         sync.Mutex
+	auth       sync.RWMutex
 	c          *websocket.Conn
 	invited    bool
 	invite     string
 	credential string
+}
+
+func (c *controlClient) authState() (credential, invite string, invited bool) {
+	c.auth.RLock()
+	defer c.auth.RUnlock()
+	return c.credential, c.invite, c.invited
+}
+
+func (c *controlClient) finishInvite(token string) {
+	c.auth.Lock()
+	defer c.auth.Unlock()
+	if token != "" {
+		c.credential = token
+	}
+	c.invite = ""
+	c.invited = false
 }
 
 type rendezvousPeer struct {
@@ -303,19 +320,19 @@ func (s *server) controlWS(ws *websocket.Conn) {
 		if err := websocket.JSON.Receive(ws, &in); err != nil {
 			return
 		}
-		out := s.controlRequestWithAuth(in, client.credential, client.invite)
-		if client.invited && in.Method == http.MethodPost && in.Path == "/v1/register" && out.Status >= 200 && out.Status < 300 {
+		credential, invite, invited := client.authState()
+		out := s.controlRequestWithAuth(in, credential, invite)
+		if invited && in.Method == http.MethodPost && in.Path == "/v1/register" && out.Status >= 200 && out.Status < 300 {
 			var body map[string]any
 			_ = json.Unmarshal(out.Body, &body)
 			if _, exists := body["network_token"]; !exists && s.token != "" {
 				body["network_token"] = s.token
 			}
 			if token, ok := body["network_token"].(string); ok && token != "" {
-				client.credential = token
-				client.invite = ""
+				client.finishInvite(token)
 			}
 			out.Body, _ = json.Marshal(body)
-			client.invited = false
+			client.finishInvite("")
 		}
 		if err := client.send(out); err != nil {
 			return
@@ -352,7 +369,10 @@ func (s *server) controlWS(ws *websocket.Conn) {
 func (c *controlClient) send(frame controlFrame) error {
 	c.ws.Lock()
 	defer c.ws.Unlock()
-	return websocket.JSON.Send(c.c, frame)
+	_ = c.c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := websocket.JSON.Send(c.c, frame)
+	_ = c.c.SetWriteDeadline(time.Time{})
+	return err
 }
 
 // pushTopologies sends only to connected nodes, so a topology change becomes
@@ -364,16 +384,28 @@ func (s *server) pushTopologies() {
 		clients[client] = id
 	}
 	s.controlMu.Unlock()
+	var wg sync.WaitGroup
+	limit := make(chan struct{}, 8)
 	for client, id := range clients {
-		s.pushTopology(client, id)
+		wg.Add(1)
+		go func(client *controlClient, id string) {
+			defer wg.Done()
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			s.pushTopology(client, id)
+		}(client, id)
 	}
+	wg.Wait()
 }
 
 func (s *server) pushTopology(client *controlClient, id string) {
-	out := s.controlRequestWithToken(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id}, client.credential)
+	credential, _, _ := client.authState()
+	out := s.controlRequestWithToken(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id}, credential)
 	if out.Status >= 200 && out.Status < 300 {
 		out.Event = "topology"
-		_ = client.send(out)
+		if err := client.send(out); err != nil {
+			_ = client.c.Close()
+		}
 	}
 }
 
@@ -1745,12 +1777,7 @@ func allocateVirtual(bits int, used []netip.Prefix) string {
 	return ""
 }
 
-func metricKey(a, b string) string {
-	if a > b {
-		a, b = b, a
-	}
-	return a + "\x00" + b
-}
+func metricKey(from, to string) string { return from + "\x00" + to }
 func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
@@ -1831,7 +1858,21 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 		}
 	}
 	for i := range links {
-		m := s.metrics[metricKey(links[i].A, links[i].B)]
+		forward := s.metrics[metricKey(links[i].A, links[i].B)]
+		reverse := s.metrics[metricKey(links[i].B, links[i].A)]
+		freshForward := now.Sub(forward.Seen) < 45*time.Second
+		freshReverse := now.Sub(reverse.Seen) < 45*time.Second
+		m := linkMetric{}
+		if freshForward && forward.RTTMS > 0 {
+			m.RTTMS = forward.RTTMS
+		}
+		if freshReverse && reverse.RTTMS > 0 {
+			if m.RTTMS == 0 {
+				m.RTTMS = reverse.RTTMS
+			} else {
+				m.RTTMS = (m.RTTMS + reverse.RTTMS) / 2
+			}
+		}
 		baseCost := links[i].Cost
 		if baseCost <= 0 {
 			baseCost = 1
@@ -1853,13 +1894,14 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 				links[i].Cost *= 1 + 1/(1+hours)
 			}
 		}
-		if m.Up && now.Sub(m.Seen) < 45*time.Second {
+		if freshForward && freshReverse && forward.Up && reverse.Up {
 			links[i].Status = "up"
-		} else {
+		} else if (freshForward && !forward.Up) || (freshReverse && !reverse.Up) {
 			links[i].Status = "down"
-			// A stale/down link remains visible for diagnostics but is made
-			// expensive enough that routing avoids it while telemetry recovers.
 			links[i].Cost *= 4
+		} else {
+			links[i].Status = "unknown"
+			links[i].Cost *= 2
 		}
 	}
 	return links
@@ -2645,23 +2687,22 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 	defer s.metricsMu.RUnlock()
 	sort.Slice(rank, func(i, j int) bool {
 		a, b := s.metrics[metricKey(client.ID, rank[i].ID)], s.metrics[metricKey(client.ID, rank[j].ID)]
-		freshA := a.Up && time.Since(a.Seen) < 45*time.Second
-		freshB := b.Up && time.Since(b.Seen) < 45*time.Second
-		if freshA != freshB {
-			return freshA
+		state := func(m linkMetric) int {
+			if time.Since(m.Seen) >= 45*time.Second {
+				return 1 // unknown: preferable to a recently confirmed failure
+			}
+			if m.Up {
+				return 2
+			}
+			return 0
 		}
-		ra, rb := a.RTTMS, b.RTTMS
-		if ra == 0 {
-			ra = 1e9
+		if stateA, stateB := state(a), state(b); stateA != stateB {
+			return stateA > stateB
 		}
-		if rb == 0 {
-			rb = 1e9
-		}
-		if ra != rb {
-			return ra < rb
-		}
-		if rank[i].Capacity != rank[j].Capacity {
-			return rank[i].Capacity > rank[j].Capacity
+		si := rendezvousScore(client.ID, rank[i].ID, rank[i].Capacity)
+		sj := rendezvousScore(client.ID, rank[j].ID, rank[j].Capacity)
+		if si != sj {
+			return si < sj
 		}
 		return rank[i].ID < rank[j].ID
 	})

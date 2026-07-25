@@ -2,6 +2,7 @@ package main
 
 import "testing"
 import "net/netip"
+import "time"
 
 func TestVirtualSubnetAllocationAvoidsDuplicatePhysicalLANs(t *testing.T) {
 	mesh := netip.MustParsePrefix("10.77.0.0/24")
@@ -109,5 +110,35 @@ func TestBootstrapTopologyVersionCoversEffectiveLinksAndNetworkMetadata(t *testi
 	nodes[0].Routes = []routeAdvertisement{{LAN: "192.168.1.0/24", Virtual: "10.77.1.0/24"}}
 	if got := bootstrapTopologyVersion(nodes, []link{{A: "a", B: "b", Cost: 1}}); got == base {
 		t.Fatal("route change must change bootstrap topology version")
+	}
+}
+
+func TestTelemetryPeerOrderIsStableAcrossHealthyRTTNoise(t *testing.T) {
+	client := testNode("client", "cone", "client", 1)
+	peers := []node{testNode("sp-a", "cone", "superpeer", 1), testNode("sp-b", "cone", "superpeer", 1)}
+	expected := weightedPeerOrder(client, peers)
+	s := &server{metrics: map[string]linkMetric{
+		metricKey(client.ID, "sp-a"): {Up: true, RTTMS: 900, Seen: time.Now()},
+		metricKey(client.ID, "sp-b"): {Up: true, RTTMS: 1, Seen: time.Now()},
+	}}
+	got := s.telemetryPeerOrder(client, peers)
+	for i := range expected {
+		if got[i].ID != expected[i].ID {
+			t.Fatal("healthy RTT noise changed stable peer assignment")
+		}
+	}
+}
+
+func TestTelemetryPeerOrderDemotesConfirmedDirectionalFailure(t *testing.T) {
+	client := testNode("client", "cone", "client", 1)
+	peers := []node{testNode("sp-a", "cone", "superpeer", 1), testNode("sp-b", "cone", "superpeer", 1)}
+	s := &server{metrics: map[string]linkMetric{
+		metricKey(client.ID, "sp-a"): {Up: false, Seen: time.Now()},
+		// A reverse-direction success must not overwrite the client's failure.
+		metricKey("sp-a", client.ID): {Up: true, Seen: time.Now()},
+	}}
+	got := s.telemetryPeerOrder(client, peers)
+	if got[0].ID != "sp-b" {
+		t.Fatalf("unknown alternative was not preferred over failed direction: %s", got[0].ID)
 	}
 }
