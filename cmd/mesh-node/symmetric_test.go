@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"home-udp-mesh/internal/protocol"
 )
 
 func TestCancelObsoleteSymmetricScans(t *testing.T) {
@@ -30,13 +32,18 @@ func TestCancelObsoleteSymmetricScans(t *testing.T) {
 
 func TestOnlyDirectHandshakeTrafficRefreshesPath(t *testing.T) {
 	for _, packetType := range []string{"HELLO", "HELLO_ACK", "PING", "PONG"} {
-		if !confirmsDirectPath(packetType) {
+		if !confirmsDirectPath(packetType, protocol.DefaultTTL) {
 			t.Fatalf("%s should confirm a direct path", packetType)
 		}
 	}
 	for _, packetType := range []string{"SYMMETRIC_BURST", "DATA", "IP"} {
-		if confirmsDirectPath(packetType) {
+		if confirmsDirectPath(packetType, protocol.DefaultTTL) {
 			t.Fatalf("%s must not confirm a bidirectional direct path", packetType)
+		}
+	}
+	for _, packetType := range []string{"HELLO", "HELLO_ACK", "PING", "PONG"} {
+		if confirmsDirectPath(packetType, protocol.DefaultTTL-1) {
+			t.Fatalf("relayed %s must not refresh the direct path", packetType)
 		}
 	}
 }
@@ -50,6 +57,27 @@ func TestSymmetricRelaySelectionIsDeterministic(t *testing.T) {
 	id, _ := n.symmetricRelay()
 	if id != "relay-a" {
 		t.Fatalf("selected relay %q, want relay-a", id)
+	}
+}
+
+func TestNextHopBypassesDeadDirectNeighbor(t *testing.T) {
+	const selfID, destinationID, relayID = "self-0000", "dest-0000", "relay-00"
+	n := &node{
+		id:     &protocol.Identity{ID: selfID},
+		routes: map[string]string{destinationID: destinationID},
+		neighbors: map[string]*peer{
+			destinationID: {ID: destinationID},
+			relayID:       {ID: relayID, lastRX: time.Now()},
+		},
+		links: []edge{
+			{A: selfID, B: destinationID, Cost: 1},
+			{A: selfID, B: relayID, Cost: 1},
+			{A: relayID, B: destinationID, Cost: 1},
+		},
+	}
+	hop, peer := n.nextHop(destinationID)
+	if hop != relayID || peer != n.neighbors[relayID] {
+		t.Fatalf("dead direct neighbor selected: hop=%q, want relay %q", hop, relayID)
 	}
 }
 

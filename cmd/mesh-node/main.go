@@ -2139,7 +2139,7 @@ func (n *node) receive(ctx context.Context) {
 		if e != nil || !n.remember(p.ID) {
 			continue
 		}
-		if p.Destination == n.id.ID && confirmsDirectPath(p.Type) {
+		if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
 			n.touch(p.Source, address)
 		}
 		if p.Destination != n.id.ID {
@@ -2183,7 +2183,14 @@ func (n *node) receive(ctx context.Context) {
 	}
 }
 
-func confirmsDirectPath(packetType string) bool {
+// A relay preserves the original source but decrements TTL. Such a packet
+// proves that the routed path works, not that the UDP address it arrived from
+// belongs to the source peer. Treating it as direct poisons peer.last with the
+// relay address and makes a dead direct edge appear healthy again.
+func confirmsDirectPath(packetType string, ttl int) bool {
+	if ttl != protocol.DefaultTTL {
+		return false
+	}
 	switch packetType {
 	case "HELLO", "HELLO_ACK", "PING", "PONG":
 		return true
