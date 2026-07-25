@@ -132,6 +132,21 @@ func TestAccountRegistrationLoginAndInvites(t *testing.T) {
 	if protectedResponse.Code != http.StatusOK {
 		t.Fatalf("session did not authorize admin read: %d", protectedResponse.Code)
 	}
+	settingsRequest := authRequest(http.MethodPut, "/v1/admin/config", map[string]int{
+		"node_ttl_seconds": 60,
+		"auto_superpeers":  0,
+		"backbone_degree":  6,
+		"client_links":     2,
+		"symmetric_links":  3,
+	})
+	settingsRequest.AddCookie(session)
+	settingsRequest.AddCookie(csrf)
+	settingsRequest.Header.Set("X-CSRF-Token", csrf.Value)
+	settingsResponse := httptest.NewRecorder()
+	s.adminConfig(settingsResponse, settingsRequest)
+	if settingsResponse.Code != http.StatusOK {
+		t.Fatalf("account session could not update topology settings: status=%d body=%s", settingsResponse.Code, settingsResponse.Body.String())
+	}
 	deviceInviteRequest := authRequest(http.MethodPost, "/v1/admin/invites", map[string]any{})
 	deviceInviteRequest.AddCookie(session)
 	deviceInviteRequest.AddCookie(csrf)

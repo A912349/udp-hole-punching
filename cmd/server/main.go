@@ -1144,10 +1144,6 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, s.settings())
 		return
 	}
-	if _, scoped := s.accountIDForRequest(r); scoped {
-		reply(w, http.StatusForbidden, map[string]string{"error": "topology policy is coordinator-wide and can only be changed with the legacy administrator credential"})
-		return
-	}
 	var next topologySettings
 	if err := decodeJSON(w, r, &next); err != nil || validSettings(next) != nil {
 		message := "invalid topology settings"
