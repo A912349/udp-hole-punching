@@ -197,10 +197,10 @@ func (d *wintunDevice) Close() error {
 func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
 	luidStr := strconv.FormatUint(luid, 10)
 	windowsTUNDebugf("searching interface by LUID=%s", luidStr)
-	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-		`$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`)
-	ps.Env = append(os.Environ(), "MESH_TUN_LUID="+luidStr)
+	const query = `$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`
 	for attempt := 0; attempt < 30; attempt++ {
+		ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query)
+		ps.Env = append(os.Environ(), "MESH_TUN_LUID="+luidStr)
 		if output, err := ps.Output(); err == nil {
 			index := strings.TrimSpace(string(output))
 			if index != "" && index != "0" {
