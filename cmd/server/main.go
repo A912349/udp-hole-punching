@@ -62,6 +62,15 @@ type dnsRecord struct {
 	IP        string `json:"ip"`
 	VirtualIP string `json:"virtual_ip,omitempty"`
 }
+type portForward struct {
+	ID         int64  `json:"id"`
+	Source     string `json:"source_node_id"`
+	ListenHost string `json:"listen_host"`
+	ListenPort int    `json:"listen_port"`
+	Target     string `json:"target_node_id"`
+	TargetHost string `json:"target_host"`
+	TargetPort int    `json:"target_port"`
+}
 type link struct {
 	A      string  `json:"a"`
 	B      string  `json:"b"`
@@ -265,6 +274,9 @@ func main() {
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}/network/routes", s.adminRemoveNodeRoute)
 	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
 	mux.HandleFunc("PUT /v1/admin/graph", s.adminGraph)
+	mux.HandleFunc("GET /v1/admin/forwards", s.adminForwards)
+	mux.HandleFunc("POST /v1/admin/forwards", s.adminForwards)
+	mux.HandleFunc("DELETE /v1/admin/forwards/{id}", s.adminForward)
 	// Legacy endpoints intentionally stay unauthenticated: the experimental
 	// punch client predates the mesh network token and can use this coordinator.
 	mux.HandleFunc("POST /register", s.rendezvousRegister)
@@ -596,6 +608,9 @@ func value(k, d string) string {
 func (s *server) init() error {
 	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);`)
 	if err != nil {
+		return err
+	}
+	if _, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS port_forwards (id INTEGER PRIMARY KEY AUTOINCREMENT,source_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,listen_host TEXT NOT NULL,listen_port INTEGER NOT NULL,target_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,UNIQUE(source_node_id,listen_host,listen_port))`); err != nil {
 		return err
 	}
 	rows, err := s.db.Query("PRAGMA table_info(nodes)")
@@ -3057,7 +3072,96 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		services = append(services, map[string]string{"node_id": n, "name": x})
 	}
 	rs.Close()
-	reply(w, 200, map[string]any{"topology_version": bootstrapTopologyVersion(all, ls), "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "services": services, "graph_update_mode": "reserved"})
+	forwards := []portForward{}
+	rows, err := s.db.Query(`SELECT id,source_node_id,listen_host,listen_port,target_node_id,target_host,target_port FROM port_forwards WHERE source_node_id=? OR target_node_id=? ORDER BY id`, id, id)
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var f portForward
+			if rows.Scan(&f.ID, &f.Source, &f.ListenHost, &f.ListenPort, &f.Target, &f.TargetHost, &f.TargetPort) == nil {
+				forwards = append(forwards, f)
+			}
+		}
+	}
+	version := bootstrapTopologyVersion(all, ls)
+	encoded, _ := json.Marshal(forwards)
+	version += "-f" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
+	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
+}
+
+func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	accountID, scoped := s.accountIDForRequest(r)
+	if r.Method == http.MethodGet {
+		q := `SELECT f.id,f.source_node_id,f.listen_host,f.listen_port,f.target_node_id,f.target_host,f.target_port FROM port_forwards f`
+		args := []any{}
+		if scoped {
+			q += ` JOIN nodes n ON n.node_id=f.source_node_id WHERE n.owner_id=?`
+			args = append(args, accountID)
+		}
+		q += ` ORDER BY f.id DESC`
+		rows, err := s.db.Query(q, args...)
+		if err != nil {
+			reply(w, 500, map[string]any{"error": err.Error()})
+			return
+		}
+		defer rows.Close()
+		out := []portForward{}
+		for rows.Next() {
+			var f portForward
+			if rows.Scan(&f.ID, &f.Source, &f.ListenHost, &f.ListenPort, &f.Target, &f.TargetHost, &f.TargetPort) == nil {
+				out = append(out, f)
+			}
+		}
+		reply(w, 200, out)
+		return
+	}
+	var f portForward
+	if decodeJSON(w, r, &f) != nil || f.Source == "" || f.Target == "" || f.TargetHost == "" || f.ListenPort < 1 || f.ListenPort > 65535 || f.TargetPort < 1 || f.TargetPort > 65535 {
+		reply(w, 400, map[string]any{"error": "invalid forwarding rule"})
+		return
+	}
+	if f.ListenHost == "" {
+		f.ListenHost = "127.0.0.1"
+	}
+	if ip := net.ParseIP(f.ListenHost); ip == nil || !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsGlobalUnicast() {
+		reply(w, 400, map[string]any{"error": "listener must be an IP address"})
+		return
+	}
+	if !s.requireNodeAccess(w, r, f.Source) || !s.requireNodeAccess(w, r, f.Target) {
+		return
+	}
+	if _, err := s.db.Exec(`INSERT INTO port_forwards(source_node_id,listen_host,listen_port,target_node_id,target_host,target_port) VALUES(?,?,?,?,?,?)`, f.Source, f.ListenHost, f.ListenPort, f.Target, f.TargetHost, f.TargetPort); err != nil {
+		reply(w, 409, map[string]any{"error": "listener is already configured or node is unknown"})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "port_forward_created", f.Source+":"+strconv.Itoa(f.ListenPort)+" -> "+f.Target+":"+f.TargetHost+":"+strconv.Itoa(f.TargetPort))
+	s.pushTopologies()
+	reply(w, 201, map[string]any{"status": "ok"})
+}
+func (s *server) adminForward(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id < 1 {
+		reply(w, 400, map[string]any{"error": "invalid forwarding rule"})
+		return
+	}
+	var source string
+	if err = s.db.QueryRow(`SELECT source_node_id FROM port_forwards WHERE id=?`, id).Scan(&source); err != nil {
+		reply(w, 404, map[string]any{"error": "forwarding rule not found"})
+		return
+	}
+	if !s.requireNodeAccess(w, r, source) {
+		return
+	}
+	_, _ = s.db.Exec(`DELETE FROM port_forwards WHERE id=?`, id)
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "port_forward_removed", strconv.FormatInt(id, 10))
+	s.pushTopologies()
+	reply(w, 200, map[string]any{"status": "ok"})
 }
 func (s *server) service(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {

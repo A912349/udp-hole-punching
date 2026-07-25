@@ -46,7 +46,7 @@ function saveGraphPositions(){
   try{localStorage.setItem(graphPositionsStorage,JSON.stringify(stored))}catch(e){}
 }
 loadGraphPositions();
-const titles={overview:['Network overview','Health and connectivity at a glance'],peers:['Peers','Inventory, roles and endpoints'],topology:['Topology','Edit routes and roles directly on the graph'],access:['Setup keys','Enroll new devices securely'],events:['Events','Administrative audit trail'],settings:['Settings','Topology policy and device administration']};
+const titles={overview:['Network overview','Health and connectivity at a glance'],peers:['Peers','Inventory, roles and endpoints'],topology:['Topology','Edit routes and roles directly on the graph'],forwards:['Reverse ports','Forward a local source port to another peer’s LAN'],access:['Setup keys','Enroll new devices securely'],events:['Events','Administrative audit trail'],settings:['Settings','Topology policy and device administration']};
 const edgeKey=(a,b)=>a<b?a+'|'+b:b+'|'+a;
 const esc=value=>{let x=document.createElement('span');x.textContent=value??'';return x.innerHTML};
 const peerLabel=n=>n.name||n.node_id.slice(0,8);
@@ -123,3 +123,15 @@ $('accountLogout').onclick=accountLogout;
 $('rotateAccountToken').onclick=async()=>{if(!confirm('Rotate the network token? All devices using the current token will lose access and must be updated.'))return;let button=$('rotateAccountToken');button.disabled=true;try{let x=await authJSON('/v1/auth/token/rotate',{method:'POST',headers:{'X-CSRF-Token':sessionCredential()}});$('accountNetworkToken').textContent=x.network_token;toast('Network token rotated; reconnect your devices with the new token')}catch(e){accountError(e)}finally{button.disabled=false}};
 $('createAccountInvite').onclick=async()=>{try{let x=await api('/v1/admin/account-invites',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('newAccountInvite').textContent=x.invite_token;toast('Account invitation created; copy it now');await loadAccountInvites()}catch(e){accountError(e)}};
 (async()=>{try{let me=await authJSON('/v1/auth/me');if(me.authenticated&&me.auth_type!=='network_token'){sessionCredential();$('accountLogin').hidden=true;$('accountRegister').hidden=true;$('accountLogout').hidden=false;await loadScopes()}}catch(e){}})();
+
+// Reverse port forwarding is deliberately exposed as a separate page because
+// the listener is created on a peer, not on the coordinator.
+(()=>{
+  let nav=document.querySelector('nav'),button=document.createElement('button');
+  button.dataset.page='forwards';button.textContent='Reverse ports';nav.insertBefore(button,nav.querySelector('[data-page="access"]'));
+  button.onclick=()=>page('forwards');
+  function options(){let nodes=(state.topologies?.all?.nodes||state.topology.nodes||[]);let text=nodes.map(n=>`<option value="${esc(n.node_id)}">${esc(n.name||n.node_id.slice(0,12))} · ${esc(n.mesh_ip)}</option>`).join('');$('forwardSource').innerHTML=text;$('forwardTarget').innerHTML=text}
+  async function forwards(){try{let rows=await api('/v1/admin/forwards');options();$('forwardRows').innerHTML=rows.map(f=>`<tr><td>${esc(f.source_node_id.slice(0,12))}</td><td><code>${esc(f.listen_host)}:${f.listen_port}</code></td><td>${esc(f.target_node_id.slice(0,12))} → <code>${esc(f.target_host)}:${f.target_port}</code></td><td><button class="ghost" data-forward-delete="${f.id}">Remove</button></td></tr>`).join('')||'<tr><td colspan="4" class="muted">No reverse ports configured.</td></tr>';$('forwardRows').querySelectorAll('[data-forward-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Remove this forwarding?'))return;try{await api('/v1/admin/forwards/'+b.dataset.forwardDelete,{method:'DELETE'});toast('Forwarding removed');forwards()}catch(e){toast(e.message)}})}catch(e){}};
+  $('forwardForm').onsubmit=async e=>{e.preventDefault();try{await api('/v1/admin/forwards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_node_id:$('forwardSource').value,listen_host:$('forwardListenHost').value.trim(),listen_port:Number($('forwardListenPort').value),target_node_id:$('forwardTarget').value,target_host:$('forwardHost').value.trim(),target_port:Number($('forwardTargetPort').value)})});toast('Forwarding created and pushed');e.target.reset();$('forwardListenHost').value='127.0.0.1';await forwards()}catch(x){toast(x.message)}};
+  let original=loadScopes;loadScopes=async()=>{await original();await forwards()};forwards();
+})();

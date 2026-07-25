@@ -31,6 +31,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,11 +125,21 @@ type edge struct {
 	Cost float64 `json:"cost"`
 }
 type topology struct {
-	Version   string `json:"topology_version"`
-	Self      peer   `json:"self"`
-	Neighbors []peer `json:"neighbors"`
-	Directory []peer `json:"directory"`
-	Links     []edge `json:"backbone_links"`
+	Version   string        `json:"topology_version"`
+	Self      peer          `json:"self"`
+	Neighbors []peer        `json:"neighbors"`
+	Directory []peer        `json:"directory"`
+	Links     []edge        `json:"backbone_links"`
+	Forwards  []portForward `json:"forwards"`
+}
+type portForward struct {
+	ID         int64  `json:"id"`
+	Source     string `json:"source_node_id"`
+	ListenHost string `json:"listen_host"`
+	ListenPort int    `json:"listen_port"`
+	Target     string `json:"target_node_id"`
+	TargetHost string `json:"target_host"`
+	TargetPort int    `json:"target_port"`
 }
 type subnetRoute struct {
 	Virtual netip.Prefix
@@ -211,6 +222,10 @@ type node struct {
 	pending          map[string]chan serviceResult
 	services         map[string]string
 	allow            map[string]bool
+	forwardMu        sync.Mutex
+	forwardListeners map[int64]net.Listener
+	forwardRules     map[int64]portForward
+	tunnels          map[string]net.Conn
 	stop             context.CancelFunc
 	tun              tunDevice
 	tunLUID          uint64
@@ -577,6 +592,9 @@ func newNode(c config) (*node, error) {
 		pending:             map[string]chan serviceResult{},
 		services:            map[string]string{},
 		allow:               map[string]bool{"*": true},
+		forwardListeners:    map[int64]net.Listener{},
+		forwardRules:        map[int64]portForward{},
+		tunnels:             map[string]net.Conn{},
 		startedAt:           time.Now(),
 		sharedKeys:          map[string]cachedKey{},
 		reassembly:          map[string]*reassembly{},
@@ -1026,6 +1044,7 @@ func (n *node) applyTopology(t topology) {
 	n.topologyVersion = t.Version
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
+	n.syncPortForwards(t.Forwards)
 	n.cancelObsoleteSymmetricScans()
 	if n.c.debug {
 		n.mu.RLock()
@@ -1040,6 +1059,144 @@ func (n *node) applyTopology(t topology) {
 		}
 	}
 	n.logf("topology=%s neighbors=%d", t.Version, len(t.Neighbors))
+}
+
+func tunnelKey(peer, id string) string { return peer + ":" + id }
+
+func (n *node) syncPortForwards(rules []portForward) {
+	n.forwardMu.Lock()
+	n.forwardRules = map[int64]portForward{}
+	for _, rule := range rules {
+		n.forwardRules[rule.ID] = rule
+	}
+	n.forwardMu.Unlock()
+	want := map[int64]portForward{}
+	for _, rule := range rules {
+		if rule.Source == n.id.ID {
+			want[rule.ID] = rule
+		}
+	}
+	n.forwardMu.Lock()
+	for id, listener := range n.forwardListeners {
+		if _, ok := want[id]; !ok {
+			_ = listener.Close()
+			delete(n.forwardListeners, id)
+			n.logf("reverse forward %d stopped", id)
+		}
+	}
+	for id, rule := range want {
+		if _, ok := n.forwardListeners[id]; ok {
+			continue
+		}
+		listener, err := net.Listen("tcp", net.JoinHostPort(rule.ListenHost, strconv.Itoa(rule.ListenPort)))
+		if err != nil {
+			n.logf("reverse forward %d cannot listen: %v", id, err)
+			continue
+		}
+		n.forwardListeners[id] = listener
+		go n.acceptPortForward(listener, rule)
+		n.logf("reverse forward %s -> %s:%d via %s", listener.Addr(), rule.TargetHost, rule.TargetPort, rule.Target[:8])
+	}
+	n.forwardMu.Unlock()
+}
+func (n *node) acceptPortForward(listener net.Listener, rule portForward) {
+	for {
+		c, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go n.openTunnel(c, rule)
+	}
+}
+func (n *node) openTunnel(c net.Conn, rule portForward) {
+	id := protocol.NewPacket("", "", "", nil).ID
+	n.forwardMu.Lock()
+	n.tunnels[tunnelKey(rule.Target, id)] = c
+	n.forwardMu.Unlock()
+	defer n.closeTunnel(rule.Target, id)
+	if !n.encrypted(rule.Target, "TUNNEL_OPEN", map[string]any{"id": id, "host": rule.TargetHost, "port": rule.TargetPort}, "") {
+		return
+	}
+	n.copyTunnel(c, rule.Target, id)
+}
+func (n *node) copyTunnel(c net.Conn, peer, id string) {
+	b := make([]byte, 900)
+	for {
+		count, err := c.Read(b)
+		if count > 0 && !n.encrypted(peer, "TUNNEL_DATA", map[string]any{"id": id, "data": protocol.B64Encode(b[:count])}, "") {
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+func (n *node) closeTunnel(peer, id string) {
+	n.forwardMu.Lock()
+	c := n.tunnels[tunnelKey(peer, id)]
+	delete(n.tunnels, tunnelKey(peer, id))
+	n.forwardMu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
+	_ = n.encrypted(peer, "TUNNEL_CLOSE", map[string]any{"id": id}, "")
+}
+func (n *node) tunnelOpen(src string, body map[string]any) {
+	id, _ := body["id"].(string)
+	host, _ := body["host"].(string)
+	port, ok := body["port"].(float64)
+	if id == "" || host == "" || !ok || port < 1 || port > 65535 {
+		return
+	}
+	n.forwardMu.Lock()
+	allowed := false
+	for _, rule := range n.forwardRules {
+		if rule.Source == src && rule.Target == n.id.ID && rule.TargetHost == host && rule.TargetPort == int(port) {
+			allowed = true
+			break
+		}
+	}
+	n.forwardMu.Unlock()
+	if !allowed {
+		n.logf("rejected unauthorized reverse tunnel from %s", src[:8])
+		return
+	}
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(host, strconv.Itoa(int(port))), 5*time.Second)
+	if err != nil {
+		n.encrypted(src, "TUNNEL_CLOSE", map[string]any{"id": id}, "")
+		return
+	}
+	n.forwardMu.Lock()
+	n.tunnels[tunnelKey(src, id)] = c
+	n.forwardMu.Unlock()
+	go func() { defer n.closeTunnel(src, id); n.copyTunnel(c, src, id) }()
+}
+func (n *node) tunnelData(src string, body map[string]any) {
+	id, _ := body["id"].(string)
+	encoded, _ := body["data"].(string)
+	data, err := protocol.B64Decode(encoded)
+	if id == "" || err != nil || len(data) > 900 {
+		return
+	}
+	n.forwardMu.Lock()
+	c := n.tunnels[tunnelKey(src, id)]
+	n.forwardMu.Unlock()
+	if c != nil {
+		_, _ = c.Write(data)
+	}
+}
+func (n *node) tunnelClose(src string, body map[string]any) {
+	id, _ := body["id"].(string)
+	if id == "" {
+		return
+	}
+	n.forwardMu.Lock()
+	c := n.tunnels[tunnelKey(src, id)]
+	delete(n.tunnels, tunnelKey(src, id))
+	n.forwardMu.Unlock()
+	if c != nil {
+		_ = c.Close()
+	}
 }
 
 // A cone relay must only scan after it has received a SYMMETRIC_BURST. Starting
@@ -2502,6 +2659,12 @@ func (n *node) data(p protocol.Packet) {
 			default:
 			}
 		}
+	case "TUNNEL_OPEN":
+		n.tunnelOpen(p.Source, m.Body)
+	case "TUNNEL_DATA":
+		n.tunnelData(p.Source, m.Body)
+	case "TUNNEL_CLOSE":
+		n.tunnelClose(p.Source, m.Body)
 	case "IP_PACKET":
 		encoded, _ := m.Body["data"].(string)
 		if payload, err := protocol.B64Decode(encoded); err == nil {
