@@ -44,6 +44,8 @@ var (
 	wintunReleaseReceive     = wintunDLL.NewProc("WintunReleaseReceivePacket")
 	wintunAllocateSend       = wintunDLL.NewProc("WintunAllocateSendPacket")
 	wintunSendPacket         = wintunDLL.NewProc("WintunSendPacket")
+	iphlpapiDLL              = syscall.NewLazyDLL("iphlpapi.dll")
+	convertInterfaceLUID     = iphlpapiDLL.NewProc("ConvertInterfaceLuidToIndex")
 	kernel32WaitForSingleObj = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
 	wintunGetAdapterLUID     = wintunDLL.NewProc("WintunGetAdapterLUID")
 )
@@ -197,6 +199,16 @@ func (d *wintunDevice) Close() error {
 func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
 	luidStr := strconv.FormatUint(luid, 10)
 	windowsTUNDebugf("searching interface by LUID=%s", luidStr)
+	var index uint32
+	ret, _, callErr := convertInterfaceLUID.Call(
+		uintptr(unsafe.Pointer(&luid)),
+		uintptr(unsafe.Pointer(&index)),
+	)
+	if ret == 0 && index != 0 {
+		windowsTUNDebugf("LUID=%s resolved by Windows API to ifIndex=%d", luidStr, index)
+		return strconv.FormatUint(uint64(index), 10), nil
+	}
+	windowsTUNDebugf("Windows API LUID conversion failed for %s: return=%d error=%v; falling back to PowerShell", luidStr, ret, callErr)
 	const query = `$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.ifLuid.Value -eq $l -or $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`
 	for attempt := 0; attempt < 30; attempt++ {
 		ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query)
