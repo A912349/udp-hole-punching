@@ -75,3 +75,27 @@ func TestResetTransportStateForcesFreshHandshake(t *testing.T) {
 		t.Fatal("active scan was not cancelled")
 	}
 }
+
+func TestCompleteSymmetricScanRequiresMatchingSession(t *testing.T) {
+	cancel := make(chan struct{})
+	n := &node{
+		symmetricScans:     map[string]chan struct{}{"peer": cancel},
+		symmetricSessions:  map[string]string{"peer": "current"},
+		symmetricConnected: map[string]bool{},
+	}
+	n.completeSymmetricScan("peer", "stale")
+	select {
+	case <-cancel:
+		t.Fatal("stale session completed the current scan")
+	default:
+	}
+	n.completeSymmetricScan("peer", "current")
+	select {
+	case <-cancel:
+	default:
+		t.Fatal("matching session did not complete the scan")
+	}
+	if !n.symmetricConnected["peer"] {
+		t.Fatal("peer was not marked connected")
+	}
+}

@@ -84,15 +84,23 @@ type server struct {
 	accountMu                                   sync.Mutex
 	accountAttempts                             map[string][]time.Time
 
-	sessionsMu sync.Mutex
-	sessions   map[string]map[string]*rendezvousPeer
-	controlMu  sync.Mutex
-	controls   map[*controlClient]string
-	metricsMu  sync.RWMutex
-	metrics    map[string]linkMetric
-	topologyMu sync.Mutex
-	linkCache  map[string]cachedLinks
-	cacheEpoch uint64
+	sessionsMu          sync.Mutex
+	sessions            map[string]map[string]*rendezvousPeer
+	controlMu           sync.Mutex
+	controls            map[*controlClient]string
+	symmetricMu         sync.Mutex
+	symmetricRendezvous map[string]symmetricRendezvous
+	metricsMu           sync.RWMutex
+	metrics             map[string]linkMetric
+	topologyMu          sync.Mutex
+	linkCache           map[string]cachedLinks
+	cacheEpoch          uint64
+}
+
+type symmetricRendezvous struct {
+	source  string
+	target  string
+	expires time.Time
 }
 
 type cachedLinks struct {
@@ -187,12 +195,13 @@ func main() {
 		db: db, token: token, bootstrapToken: bootstrapToken, ttl: int64(envInt("MESH_NODE_TTL_SECONDS", 45)),
 		auto: envInt("MESH_AUTO_SUPERPEERS", 0), backboneDegree: envInt("MESH_BACKBONE_DEGREE", 6),
 		clientLinks: envInt("MESH_CLIENT_LINKS", 2), symmetricLinks: envInt("MESH_SYMMETRIC_LINKS", 3),
-		sessions:        map[string]map[string]*rendezvousPeer{},
-		controls:        map[*controlClient]string{},
-		metrics:         map[string]linkMetric{},
-		linkCache:       map[string]cachedLinks{},
-		inviteAttempts:  map[string][]time.Time{},
-		accountAttempts: map[string][]time.Time{},
+		sessions:            map[string]map[string]*rendezvousPeer{},
+		controls:            map[*controlClient]string{},
+		symmetricRendezvous: map[string]symmetricRendezvous{},
+		metrics:             map[string]linkMetric{},
+		linkCache:           map[string]cachedLinks{},
+		inviteAttempts:      map[string][]time.Time{},
+		accountAttempts:     map[string][]time.Time{},
 	}
 	_, s.network, _ = net.ParseCIDR(value("MESH_IP_NETWORK", "10.77.0.0/24"))
 	if e = s.init(); e != nil {
@@ -321,7 +330,15 @@ func (s *server) controlWS(ws *websocket.Conn) {
 			return
 		}
 		credential, invite, invited := client.authState()
-		out := s.controlRequestWithAuth(in, credential, invite)
+		var out controlFrame
+		switch {
+		case in.Method == http.MethodPost && in.Path == "/v1/symmetric-scan":
+			out = s.symmetricScanRequest(client, in)
+		case in.Method == http.MethodPost && in.Path == "/v1/symmetric-scan/ack":
+			out = s.symmetricScanACK(client, in)
+		default:
+			out = s.controlRequestWithAuth(in, credential, invite)
+		}
 		if invited && in.Method == http.MethodPost && in.Path == "/v1/register" && out.Status >= 200 && out.Status < 300 {
 			var body map[string]any
 			_ = json.Unmarshal(out.Body, &body)
@@ -364,6 +381,115 @@ func (s *server) controlWS(ws *websocket.Conn) {
 			}
 		}
 	}
+}
+
+func (s *server) registeredControlID(client *controlClient) string {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	return s.controls[client]
+}
+
+func (s *server) sendControlEvent(nodeID string, frame controlFrame) bool {
+	s.controlMu.Lock()
+	var target *controlClient
+	for client, id := range s.controls {
+		if id == nodeID {
+			target = client
+			break
+		}
+	}
+	s.controlMu.Unlock()
+	if target == nil {
+		return false
+	}
+	if err := target.send(frame); err != nil {
+		_ = target.c.Close()
+		return false
+	}
+	return true
+}
+
+func validSymmetricSessionID(id string) bool {
+	decoded, err := hex.DecodeString(id)
+	return err == nil && len(decoded) == 16
+}
+
+func (s *server) symmetricScanRequest(client *controlClient, in controlFrame) controlFrame {
+	sourceID := s.registeredControlID(client)
+	if sourceID == "" {
+		return controlFrame{Status: http.StatusConflict, Error: "control connection is not registered"}
+	}
+	var request struct {
+		TargetID  string `json:"target_node_id"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(in.Body, &request); err != nil || request.TargetID == "" || !validSymmetricSessionID(request.SessionID) {
+		return controlFrame{Status: http.StatusBadRequest, Error: "invalid symmetric scan request"}
+	}
+	var sourceNAT, sourceEndpoint, targetNAT, targetRole string
+	if err := s.db.QueryRow("SELECT nat_type,endpoint FROM nodes WHERE node_id=?", sourceID).Scan(&sourceNAT, &sourceEndpoint); err != nil {
+		return controlFrame{Status: http.StatusNotFound, Error: "source node not found"}
+	}
+	if err := s.db.QueryRow("SELECT nat_type,role FROM nodes WHERE node_id=?", request.TargetID).Scan(&targetNAT, &targetRole); err != nil {
+		return controlFrame{Status: http.StatusNotFound, Error: "target node not found"}
+	}
+	if sourceNAT != "symmetric" || targetNAT != "cone" || targetRole != "superpeer" || sourceEndpoint == "" {
+		return controlFrame{Status: http.StatusConflict, Error: "nodes are not a symmetric-to-superpeer pair"}
+	}
+
+	now := time.Now()
+	s.symmetricMu.Lock()
+	for id, pending := range s.symmetricRendezvous {
+		if now.After(pending.expires) {
+			delete(s.symmetricRendezvous, id)
+		}
+	}
+	s.symmetricRendezvous[request.SessionID] = symmetricRendezvous{source: sourceID, target: request.TargetID, expires: now.Add(30 * time.Second)}
+	s.symmetricMu.Unlock()
+	body, _ := json.Marshal(map[string]string{
+		"peer_node_id": sourceID,
+		"session_id":   request.SessionID,
+		"endpoint":     sourceEndpoint,
+	})
+	if !s.sendControlEvent(request.TargetID, controlFrame{Event: "symmetric_scan", Body: body}) {
+		s.symmetricMu.Lock()
+		delete(s.symmetricRendezvous, request.SessionID)
+		s.symmetricMu.Unlock()
+		return controlFrame{Status: http.StatusServiceUnavailable, Error: "target node is not connected"}
+	}
+	response, _ := json.Marshal(map[string]bool{"delivered": true})
+	return controlFrame{Status: http.StatusAccepted, Body: response}
+}
+
+func (s *server) symmetricScanACK(client *controlClient, in controlFrame) controlFrame {
+	targetID := s.registeredControlID(client)
+	if targetID == "" {
+		return controlFrame{Status: http.StatusConflict, Error: "control connection is not registered"}
+	}
+	var request struct {
+		SourceID  string `json:"source_node_id"`
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(in.Body, &request); err != nil || request.SourceID == "" || !validSymmetricSessionID(request.SessionID) {
+		return controlFrame{Status: http.StatusBadRequest, Error: "invalid symmetric scan ACK"}
+	}
+	s.symmetricMu.Lock()
+	pending, exists := s.symmetricRendezvous[request.SessionID]
+	if exists && pending.source == request.SourceID && pending.target == targetID && time.Now().Before(pending.expires) {
+		delete(s.symmetricRendezvous, request.SessionID)
+	} else {
+		exists = false
+	}
+	s.symmetricMu.Unlock()
+	if !exists {
+		return controlFrame{Status: http.StatusConflict, Error: "unknown or expired symmetric scan session"}
+	}
+	body, _ := json.Marshal(map[string]string{"session_id": request.SessionID, "peer_node_id": targetID})
+	if !s.sendControlEvent(request.SourceID, controlFrame{Event: "symmetric_scan_ack", Body: body}) {
+		return controlFrame{Status: http.StatusServiceUnavailable, Error: "source node is not connected"}
+	}
+	response, _ := json.Marshal(map[string]bool{"acknowledged": true})
+	return controlFrame{Status: http.StatusOK, Body: response}
 }
 
 func (c *controlClient) send(frame controlFrame) error {

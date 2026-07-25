@@ -226,12 +226,14 @@ type node struct {
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
 
-	symmetricMu        sync.Mutex
-	symmetricReady     bool
-	symmetricScans     map[string]chan struct{}
-	symmetricConnected map[string]bool
-	symmetricBurstAt   map[string]time.Time
-	symmetricScanSlots chan struct{}
+	symmetricMu         sync.Mutex
+	symmetricReady      bool
+	symmetricScans      map[string]chan struct{}
+	symmetricSessions   map[string]string
+	symmetricAckWaiters map[string]chan struct{}
+	symmetricConnected  map[string]bool
+	symmetricBurstAt    map[string]time.Time
+	symmetricScanSlots  chan struct{}
 }
 
 func main() {
@@ -559,29 +561,31 @@ func newNode(c config) (*node, error) {
 	}
 	k := sha256.Sum256([]byte(c.token))
 	n := &node{
-		c:                  c,
-		requestedRole:      c.role,
-		requestedNAT:       c.nat,
-		id:                 id,
-		key:                k[:],
-		conn:               conn,
-		dir:                map[string]*peer{},
-		neighbors:          map[string]*peer{},
-		routes:             map[string]string{},
-		meshNodes:          map[netip.Addr]string{},
-		installedRoutes:    map[string]bool{},
-		seen:               map[string]struct{}{},
-		pending:            map[string]chan serviceResult{},
-		services:           map[string]string{},
-		allow:              map[string]bool{"*": true},
-		startedAt:          time.Now(),
-		sharedKeys:         map[string]cachedKey{},
-		reassembly:         map[string]*reassembly{},
-		symmetricScans:     map[string]chan struct{}{},
-		symmetricConnected: map[string]bool{},
-		symmetricBurstAt:   map[string]time.Time{},
-		symmetricScanSlots: make(chan struct{}, 2),
-		pings:              map[string]time.Time{},
+		c:                   c,
+		requestedRole:       c.role,
+		requestedNAT:        c.nat,
+		id:                  id,
+		key:                 k[:],
+		conn:                conn,
+		dir:                 map[string]*peer{},
+		neighbors:           map[string]*peer{},
+		routes:              map[string]string{},
+		meshNodes:           map[netip.Addr]string{},
+		installedRoutes:     map[string]bool{},
+		seen:                map[string]struct{}{},
+		pending:             map[string]chan serviceResult{},
+		services:            map[string]string{},
+		allow:               map[string]bool{"*": true},
+		startedAt:           time.Now(),
+		sharedKeys:          map[string]cachedKey{},
+		reassembly:          map[string]*reassembly{},
+		symmetricScans:      map[string]chan struct{}{},
+		symmetricSessions:   map[string]string{},
+		symmetricAckWaiters: map[string]chan struct{}{},
+		symmetricConnected:  map[string]bool{},
+		symmetricBurstAt:    map[string]time.Time{},
+		symmetricScanSlots:  make(chan struct{}, 2),
+		pings:               map[string]time.Time{},
 	}
 	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
 	for _, v := range c.allows {
@@ -754,6 +758,36 @@ func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
 				n.logf("invalid pushed topology: %v", err)
 			} else {
 				n.applyTopology(t)
+			}
+			continue
+		}
+		if frame.Event == "symmetric_scan" {
+			var event struct {
+				PeerID    string `json:"peer_node_id"`
+				SessionID string `json:"session_id"`
+				Endpoint  string `json:"endpoint"`
+			}
+			if err := json.Unmarshal(frame.Body, &event); err != nil {
+				n.logf("invalid symmetric scan event: %v", err)
+			} else {
+				go n.handleSymmetricScanEvent(event.PeerID, event.SessionID, event.Endpoint)
+			}
+			continue
+		}
+		if frame.Event == "symmetric_scan_ack" {
+			var event struct {
+				SessionID string `json:"session_id"`
+			}
+			if json.Unmarshal(frame.Body, &event) == nil {
+				n.symmetricMu.Lock()
+				waiter := n.symmetricAckWaiters[event.SessionID]
+				n.symmetricMu.Unlock()
+				if waiter != nil {
+					select {
+					case waiter <- struct{}{}:
+					default:
+					}
+				}
 			}
 			continue
 		}
@@ -984,6 +1018,7 @@ func (n *node) cancelObsoleteSymmetricScans() {
 		}
 		delete(n.symmetricScans, id)
 		close(cancel)
+		delete(n.symmetricSessions, id)
 		delete(n.symmetricConnected, id)
 		delete(n.symmetricBurstAt, id)
 	}
@@ -1213,6 +1248,20 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 		n.logf("invalid superpeer endpoint: %v", err)
 		return false
 	}
+	sessionID, err := newSymmetricSessionID()
+	if err != nil {
+		n.logf("create symmetric rendezvous session: %v", err)
+		return false
+	}
+	proceed, coordinated := n.requestSymmetricScan(relayID, sessionID)
+	if !proceed {
+		return false
+	}
+	if !coordinated {
+		// Old peers do not echo a session identifier in HELLO. Keep the
+		// complete legacy wire format when the coordinator reports no API.
+		sessionID = ""
+	}
 
 	responses := make(chan symmetricReply, symmetricBurstSize)
 	sockets := make([]*net.UDPConn, 0, symmetricBurstSize)
@@ -1222,7 +1271,7 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 		if err != nil {
 			continue
 		}
-		burst := protocol.NewPacket("SYMMETRIC_BURST", n.id.ID, relayID, map[string]any{})
+		burst := protocol.NewPacket("SYMMETRIC_BURST", n.id.ID, relayID, map[string]any{"session_id": sessionID})
 		encoded, err := protocol.EncodePacket(burst, n.key)
 		if err != nil {
 			probe.Close()
@@ -1233,7 +1282,7 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 			continue
 		}
 		sockets = append(sockets, probe)
-		go n.awaitSymmetricHello(probe, relayID, responses)
+		go n.awaitSymmetricHello(probe, relayID, sessionID, responses)
 	}
 
 	deadline := time.NewTimer(symmetricBurstTimeout)
@@ -1243,7 +1292,7 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 		select {
 		case received := <-responses:
 			selected = received.conn
-			ack := protocol.NewPacket("HELLO_ACK", n.id.ID, relayID, map[string]any{})
+			ack := protocol.NewPacket("HELLO_ACK", n.id.ID, relayID, map[string]any{"session_id": sessionID})
 			if encoded, err := protocol.EncodePacket(ack, n.key); err == nil {
 				_, _ = selected.WriteToUDP(encoded, received.addr)
 			}
@@ -1274,6 +1323,50 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 	n.symmetricMu.Unlock()
 	n.logf("symmetric NAT synchronized through %s on %s", relayID[:8], selected.LocalAddr())
 	return true
+}
+
+func newSymmetricSessionID() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}
+
+func (n *node) requestSymmetricScan(relayID, sessionID string) (proceed, coordinated bool) {
+	waiter := make(chan struct{}, 1)
+	n.symmetricMu.Lock()
+	n.symmetricAckWaiters[sessionID] = waiter
+	n.symmetricMu.Unlock()
+	defer func() {
+		n.symmetricMu.Lock()
+		delete(n.symmetricAckWaiters, sessionID)
+		n.symmetricMu.Unlock()
+	}()
+
+	err := n.request("POST", "/v1/symmetric-scan", map[string]any{
+		"target_node_id": relayID,
+		"session_id":     sessionID,
+	}, &map[string]any{})
+	if err != nil {
+		// A 404 is the explicit compatibility signal from an older coordinator.
+		// Retain the UDP-triggered handshake only for that deployment case.
+		if strings.Contains(err.Error(), "status 404") {
+			n.logf("coordinator has no symmetric rendezvous API; using legacy UDP trigger")
+			return true, false
+		}
+		n.logf("symmetric rendezvous request failed: %v", err)
+		return false, false
+	}
+	n.logf("symmetric rendezvous requested from %s; waiting for scan ACK", relayID[:8])
+	select {
+	case <-waiter:
+		n.logf("symmetric scan ACK received from %s", relayID[:8])
+		return true, true
+	case <-time.After(10 * time.Second):
+		n.logf("symmetric rendezvous timed out waiting for scan ACK from %s", relayID[:8])
+		return false, true
+	}
 }
 
 func (n *node) symmetricRelay() (string, *peer) {
@@ -1322,7 +1415,7 @@ func (n *node) replaceUDPConn(next *net.UDPConn) {
 	}
 }
 
-func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses chan<- symmetricReply) {
+func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID, sessionID string, responses chan<- symmetricReply) {
 	_ = conn.SetReadDeadline(time.Now().Add(symmetricBurstTimeout))
 	buffer := make([]byte, 65535)
 	length, address, err := conn.ReadFromUDP(buffer)
@@ -1330,7 +1423,7 @@ func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses 
 		return
 	}
 	packet, err := protocol.DecodePacket(buffer[:length], n.key)
-	if err != nil || packet.Type != "HELLO" || packet.Source != relayID || packet.Destination != n.id.ID {
+	if err != nil || packet.Type != "HELLO" || packet.Source != relayID || packet.Destination != n.id.ID || payloadString(packet, "session_id") != sessionID {
 		return
 	}
 	select {
@@ -1339,7 +1432,7 @@ func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses 
 	}
 }
 
-func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
+func (n *node) startSymmetricScan(peerID, endpoint, sessionID string, force bool) {
 	n.mu.RLock()
 	peer := n.neighbors[peerID]
 	live := n.usable(peer)
@@ -1349,10 +1442,11 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 	defer n.symmetricMu.Unlock()
 
 	if existing := n.symmetricScans[peerID]; existing != nil {
-		if !force {
+		if !force && n.symmetricSessions[peerID] == sessionID {
 			return
 		}
 		delete(n.symmetricScans, peerID)
+		delete(n.symmetricSessions, peerID)
 		close(existing)
 	}
 
@@ -1366,10 +1460,11 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 
 	cancel := make(chan struct{})
 	n.symmetricScans[peerID] = cancel
-	go n.scanSymmetricNeighbor(peerID, endpoint, cancel)
+	n.symmetricSessions[peerID] = sessionID
+	go n.scanSymmetricNeighbor(peerID, endpoint, sessionID, cancel)
 }
 
-func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct{}) {
+func (n *node) scanSymmetricNeighbor(peerID, endpoint, sessionID string, cancel chan struct{}) {
 	deadline := time.Now().Add(symmetricBurstTimeout - symmetricRetryDelay)
 	// A full symmetric-NAT port scan is intentionally broad. Bound concurrent
 	// scans so several newly discovered peers cannot monopolize CPU and UDP
@@ -1386,6 +1481,7 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct
 		n.symmetricMu.Lock()
 		if n.symmetricScans[peerID] == cancel {
 			delete(n.symmetricScans, peerID)
+			delete(n.symmetricSessions, peerID)
 		}
 		n.symmetricMu.Unlock()
 	}()
@@ -1415,7 +1511,7 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct
 					scanned[port] = true
 					target := *address
 					target.Port = port
-					n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public}), &target)
+					n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public, "session_id": sessionID}), &target)
 					time.Sleep(scanDelay)
 				}
 				if start == 1 && end == 65535 {
@@ -1445,17 +1541,18 @@ func (n *node) symmetricScanCancelled(cancel chan struct{}) bool {
 	}
 }
 
-func (n *node) completeSymmetricScan(peerID string) {
+func (n *node) completeSymmetricScan(peerID, sessionID string) {
 	n.symmetricMu.Lock()
 	defer n.symmetricMu.Unlock()
 
 	cancel := n.symmetricScans[peerID]
-	if cancel == nil {
+	if cancel == nil || n.symmetricSessions[peerID] != sessionID {
 		// Обычный HELLO_ACK не доказывает успешный symmetric scan.
 		return
 	}
 
 	delete(n.symmetricScans, peerID)
+	delete(n.symmetricSessions, peerID)
 	close(cancel)
 	n.symmetricConnected[peerID] = true
 	n.debugf("symmetric scan completed for %s", peerID[:8])
@@ -1469,6 +1566,13 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	peer := n.neighbors[packet.Source]
 	n.mu.RUnlock()
 	if peer == nil || peer.NAT != "symmetric" {
+		return
+	}
+	sessionID := payloadString(packet, "session_id")
+	n.symmetricMu.Lock()
+	activeSession := n.symmetricSessions[packet.Source]
+	n.symmetricMu.Unlock()
+	if activeSession != "" && sessionID != activeSession {
 		return
 	}
 	n.symmetricMu.Lock()
@@ -1488,7 +1592,38 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	if observed != nil {
 		endpoint = observed.String()
 	}
-	n.startSymmetricScan(packet.Source, endpoint, false)
+	// The control event starts the worker around the registered endpoint. The
+	// first authenticated burst reveals the current per-destination mapping;
+	// restart this same session around that exact port.
+	n.startSymmetricScan(packet.Source, endpoint, sessionID, activeSession != "")
+}
+
+func payloadString(packet protocol.Packet, key string) string {
+	value, _ := packet.Payload[key].(string)
+	return value
+}
+
+func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
+	if n.c.role != "superpeer" || peerID == "" || sessionID == "" || endpoint == "" {
+		return
+	}
+	n.mu.RLock()
+	peer := n.neighbors[peerID]
+	n.mu.RUnlock()
+	if peer == nil || peer.NAT != "symmetric" {
+		return
+	}
+	n.symmetricMu.Lock()
+	delete(n.symmetricBurstAt, peerID)
+	n.symmetricMu.Unlock()
+	n.startSymmetricScan(peerID, endpoint, sessionID, true)
+	err := n.request("POST", "/v1/symmetric-scan/ack", map[string]any{
+		"source_node_id": peerID,
+		"session_id":     sessionID,
+	}, &map[string]any{})
+	if err != nil {
+		n.logf("symmetric scan ACK for %s failed: %v", peerID[:8], err)
+	}
 }
 
 func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
@@ -1600,6 +1735,8 @@ func (n *node) resetTransportState() {
 		delete(n.symmetricScans, id)
 		close(cancel)
 	}
+	n.symmetricSessions = map[string]string{}
+	n.symmetricAckWaiters = map[string]chan struct{}{}
 	n.symmetricConnected = map[string]bool{}
 	n.symmetricBurstAt = map[string]time.Time{}
 	n.symmetricMu.Unlock()
@@ -2016,10 +2153,10 @@ func (n *node) receive(ctx context.Context) {
 		switch p.Type {
 		case "HELLO":
 			n.ensureNeighbor(p.Source)
-			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
+			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{"session_id": payloadString(p, "session_id")}))
 		case "HELLO_ACK":
 			n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
-			n.completeSymmetricScan(p.Source)
+			n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
 		case "PING":
 			n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
 		case "PONG":
