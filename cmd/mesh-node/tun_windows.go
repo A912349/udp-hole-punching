@@ -197,7 +197,7 @@ func (d *wintunDevice) Close() error {
 func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
 	luidStr := strconv.FormatUint(luid, 10)
 	windowsTUNDebugf("searching interface by LUID=%s", luidStr)
-	const query = `$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`
+	const query = `$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.ifLuid.Value -eq $l -or $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`
 	for attempt := 0; attempt < 30; attempt++ {
 		ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query)
 		ps.Env = append(os.Environ(), "MESH_TUN_LUID="+luidStr)
@@ -206,6 +206,9 @@ func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
 			if index != "" && index != "0" {
 				windowsTUNDebugf("LUID=%s resolved to ifIndex=%s on attempt=%d", luidStr, index, attempt+1)
 				return index, nil
+			}
+			if attempt == 0 || attempt == 29 {
+				windowsTUNDebugf("LUID=%s query returned no interface on attempt=%d", luidStr, attempt+1)
 			}
 		} else if attempt == 0 || attempt == 29 {
 			windowsTUNDebugf("LUID=%s PowerShell query failed on attempt=%d: %v", luidStr, attempt+1, err)
