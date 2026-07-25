@@ -72,6 +72,7 @@ const (
 )
 
 var fastMagicBytes = []byte(fastMagic)
+var ipv4LimitedBroadcast = netip.MustParseAddr("255.255.255.255")
 
 type config struct {
 	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
@@ -856,7 +857,7 @@ func (n *node) register() error {
 		n.lastLoggedRole = out.Role
 	}
 	n.mu.Unlock()
-	if n.c.debug || changed {
+	if changed {
 		n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
 	}
 	return nil
@@ -1270,25 +1271,32 @@ func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID string, responses 
 }
 
 func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
+	n.mu.RLock()
+	peer := n.neighbors[peerID]
+	live := n.usable(peer)
+	n.mu.RUnlock()
+
 	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+
 	if existing := n.symmetricScans[peerID]; existing != nil {
 		if !force {
-			n.debugf("symmetric scan for %s already running; skip", peerID[:8])
-			n.symmetricMu.Unlock()
 			return
 		}
 		delete(n.symmetricScans, peerID)
 		close(existing)
 	}
+
+	if !live {
+		delete(n.symmetricConnected, peerID)
+	}
+
 	if n.symmetricConnected[peerID] && !force {
-		n.debugf("symmetric scan for %s already connected; skip", peerID[:8])
-		n.symmetricMu.Unlock()
 		return
 	}
+
 	cancel := make(chan struct{})
 	n.symmetricScans[peerID] = cancel
-	n.symmetricMu.Unlock()
-	n.debugf("symmetric scan started for %s endpoint=%s force=%t", peerID[:8], endpoint, force)
 	go n.scanSymmetricNeighbor(peerID, endpoint, cancel)
 }
 
@@ -1365,14 +1373,18 @@ func (n *node) symmetricScanCancelled(cancel chan struct{}) bool {
 
 func (n *node) completeSymmetricScan(peerID string) {
 	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+
 	cancel := n.symmetricScans[peerID]
-	if cancel != nil {
-		delete(n.symmetricScans, peerID)
-		close(cancel)
+	if cancel == nil {
+		// Обычный HELLO_ACK не доказывает успешный symmetric scan.
+		return
 	}
+
+	delete(n.symmetricScans, peerID)
+	close(cancel)
 	n.symmetricConnected[peerID] = true
-	n.symmetricMu.Unlock()
-	n.debugf("symmetric scan completed for %s (scan_was_active=%t)", peerID[:8], cancel != nil)
+	n.debugf("symmetric scan completed for %s", peerID[:8])
 }
 
 func (n *node) handleSymmetricBurst(packet protocol.Packet) {
@@ -2406,8 +2418,12 @@ func (n *node) tunLoop(ctx context.Context) {
 			continue
 		}
 		src := netip.AddrFrom4([4]byte(b[12:16])).String()
-		dstIP := netip.AddrFrom4([4]byte(b[16:20])).String()
-		dst := n.ownerOf(netip.AddrFrom4([4]byte(b[16:20])))
+		dstAddr := netip.AddrFrom4([4]byte(b[16:20]))
+		if n.isTUNBroadcast(dstAddr) {
+			continue
+		}
+		dstIP := dstAddr.String()
+		dst := n.ownerOf(dstAddr)
 		if dst == "" {
 			n.debugf("drop TUN frame: no node owns %s", dstIP)
 			continue
@@ -2429,6 +2445,31 @@ func (n *node) tunLoop(ctx context.Context) {
 			n.debugf("TUN IPv4 %s -> %s: send failed", src, dstIP)
 		}
 	}
+}
+
+// Broadcast is not an overlay unicast destination. Hosts commonly emit it
+// for discovery, and routing it through the mesh would only create repeated
+// failed lookups and debug-log floods.
+func (n *node) isTUNBroadcast(addr netip.Addr) bool {
+	if addr == ipv4LimitedBroadcast {
+		return true
+	}
+	local, err := netip.ParseAddr(n.c.meshIP)
+	if err != nil || !local.Is4() || n.c.prefix < 0 || n.c.prefix > 30 {
+		return false
+	}
+	prefix := netip.PrefixFrom(local, n.c.prefix).Masked()
+	if !prefix.Contains(addr) {
+		return false
+	}
+	base, value := prefix.Addr().As4(), addr.As4()
+	for bit := n.c.prefix; bit < 32; bit++ {
+		byteIndex, mask := bit/8, byte(1<<(7-bit%8))
+		if value[byteIndex]&mask == 0 || base[byteIndex]&mask != 0 {
+			return false
+		}
+	}
+	return true
 }
 func (n *node) sendIP(dst string, p []byte) bool {
 	aead, nonces, aad, e := n.peerCipher(dst)
