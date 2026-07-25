@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -30,6 +32,7 @@ const (
 )
 
 var (
+	windowsTUNDebug          atomic.Bool
 	wintunDLL                = syscall.NewLazyDLL("wintun.dll")
 	wintunOpenAdapter        = wintunDLL.NewProc("WintunOpenAdapter")
 	wintunCreateAdapter      = wintunDLL.NewProc("WintunCreateAdapter")
@@ -55,6 +58,14 @@ type wintunDevice struct {
 }
 
 func (d *wintunDevice) adapterLUID() uint64 { return d.luid }
+
+func (d *wintunDevice) setDebug(v bool) { windowsTUNDebug.Store(v) }
+
+func windowsTUNDebugf(format string, args ...any) {
+	if windowsTUNDebug.Load() {
+		log.Printf("[mesh-node] debug Windows TUN: "+format, args...)
+	}
+}
 
 func openTUN(name string) (tunDevice, error) {
 	if name == "" {
@@ -185,18 +196,23 @@ func (d *wintunDevice) Close() error {
 
 func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
 	luidStr := strconv.FormatUint(luid, 10)
+	windowsTUNDebugf("searching interface by LUID=%s", luidStr)
 	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
-		`$l=[uint64]$env:MESH_TUN_LUID; (Get-NetAdapter -IncludeHidden -Luid $l -ErrorAction Stop).ifIndex`)
+		`$l=[uint64]$env:MESH_TUN_LUID; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l -or $_.Luid.Value -eq $l }); if (-not $a) { $a=@(Get-NetIPInterface -IncludeAllCompartments -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceLuid.Value -eq $l }) }; if ($a) { $a[0].ifIndex }`)
 	ps.Env = append(os.Environ(), "MESH_TUN_LUID="+luidStr)
 	for attempt := 0; attempt < 30; attempt++ {
 		if output, err := ps.Output(); err == nil {
 			index := strings.TrimSpace(string(output))
 			if index != "" && index != "0" {
+				windowsTUNDebugf("LUID=%s resolved to ifIndex=%s on attempt=%d", luidStr, index, attempt+1)
 				return index, nil
 			}
+		} else if attempt == 0 || attempt == 29 {
+			windowsTUNDebugf("LUID=%s PowerShell query failed on attempt=%d: %v", luidStr, attempt+1, err)
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+	windowsTUNDebugf("LUID=%s was not resolved after 30 attempts", luidStr)
 	return "", fmt.Errorf("Windows interface for LUID %s was not found", luidStr)
 }
 

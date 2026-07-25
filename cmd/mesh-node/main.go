@@ -1047,6 +1047,9 @@ func (n *node) start() error {
 			return e
 		}
 		n.tun = f
+		if d, ok := f.(interface{ setDebug(bool) }); ok {
+			d.setDebug(n.c.debug)
+		}
 		if d, ok := f.(interface{ adapterLUID() uint64 }); ok {
 			n.tunLUID = d.adapterLUID()
 		}
