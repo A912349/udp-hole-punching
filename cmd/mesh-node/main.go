@@ -189,6 +189,7 @@ type node struct {
 	recoveryNext     time.Time
 	recoveryFails    int
 	control          *websocket.Conn
+	controlConnected bool
 	controlMu        sync.Mutex
 	controlCall      sync.Mutex
 	controlReply     chan controlFrame
@@ -624,13 +625,13 @@ type controlFrame struct {
 	Event  string          `json:"event,omitempty"`
 }
 
-func (n *node) connectControl() error {
+func (n *node) connectControl() (bool, error) {
 	if n.control != nil {
-		return nil
+		return false, nil
 	}
 	u, err := url.Parse(strings.TrimRight(n.c.server, "/") + "/v1/ws")
 	if err != nil {
-		return err
+		return false, err
 	}
 	switch u.Scheme {
 	case "http":
@@ -638,13 +639,13 @@ func (n *node) connectControl() error {
 	case "https":
 		u.Scheme = "wss"
 	default:
-		return fmt.Errorf("unsupported control-plane URL scheme %q", u.Scheme)
+		return false, fmt.Errorf("unsupported control-plane URL scheme %q", u.Scheme)
 	}
 	n.logf("connecting control WebSocket via %s", u.String())
 	origin := "http://" + u.Host
 	wsConfig, err := websocket.NewConfig(u.String(), origin)
 	if err != nil {
-		return err
+		return false, err
 	}
 	wsConfig.Dialer = &net.Dialer{Timeout: 10 * time.Second, Resolver: meshResolver()}
 	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
@@ -655,7 +656,7 @@ func (n *node) connectControl() error {
 		tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, ServerName: u.Hostname()}
 		pool, err := controlCertPool(n.c.controlCA)
 		if err != nil {
-			return err
+			return false, err
 		}
 		tlsConfig.RootCAs = pool
 		if n.c.controlInsecure {
@@ -666,13 +667,15 @@ func (n *node) connectControl() error {
 	}
 	ws, err := websocket.DialConfig(wsConfig)
 	if err != nil {
-		return fmt.Errorf("connect control websocket: %w", err)
+		return false, fmt.Errorf("connect control websocket: %w", err)
 	}
+	reconnected := n.controlConnected
 	n.control = ws
+	n.controlConnected = true
 	n.controlReply = make(chan controlFrame, 1)
 	go n.readControl(ws, n.controlReply)
 	n.logf("control WebSocket connected")
-	return nil
+	return reconnected, nil
 }
 
 // meshResolver avoids Android configurations that point libc DNS at an
@@ -830,7 +833,8 @@ func (n *node) request(method, path string, in, out any) error {
 	var last error
 	for attempt := 0; attempt < 2; attempt++ {
 		n.controlMu.Lock()
-		if err := n.connectControl(); err != nil {
+		reconnected, err := n.connectControl()
+		if err != nil {
 			n.controlMu.Unlock()
 			last = err
 			continue
@@ -846,6 +850,9 @@ func (n *node) request(method, path string, in, out any) error {
 			n.controlMu.Unlock()
 			select {
 			case reply := <-replies:
+				if reconnected {
+					go n.refreshEndpointAfterControlReconnect()
+				}
 				if reply.Status < 200 || reply.Status > 299 {
 					return fmt.Errorf("control plane: status %d: %s", reply.Status, reply.Error)
 				}
@@ -866,6 +873,42 @@ func (n *node) request(method, path string, in, out any) error {
 	}
 	return fmt.Errorf("control websocket request: %w", last)
 }
+
+// refreshEndpointAfterControlReconnect is intentionally asynchronous. A
+// restored WebSocket must not wait for STUN or topology rebuilding. A fresh
+// UDP socket is used because Android may keep the old socket on Wi-Fi after a
+// switch to LTE.
+func (n *node) refreshEndpointAfterControlReconnect() {
+	if !n.recoveryMu.TryLock() {
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	if err := n.rebindUDPConn(); err != nil {
+		n.logf("control reconnect: UDP rebind failed: %v", err)
+		return
+	}
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		n.logf("control reconnect: STUN check failed: %v", err)
+		return
+	}
+	if endpoint == n.c.endpoint {
+		return
+	}
+	n.logf("control reconnect: UDP endpoint changed %s -> %s; re-registering", n.c.endpoint, endpoint)
+	n.c.endpoint = endpoint
+	if n.requestedNAT == "auto" {
+		n.c.nat = nat
+	}
+	if err := n.register(); err != nil {
+		n.logf("control reconnect: re-register failed: %v", err)
+		return
+	}
+	if err := n.bootstrap(); err != nil {
+		n.logf("control reconnect: topology refresh failed: %v", err)
+	}
+}
+
 func (n *node) register() error {
 	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.requestedRole, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
 	var out struct {
