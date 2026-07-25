@@ -20,7 +20,7 @@ const (
 	iffNoPI   = 0x1000
 )
 
-func openTUN(name string) (*os.File, error) {
+func openTUN(name string) (tunDevice, error) {
 	if len(name) == 0 || len(name) > 15 {
 		return nil, fmt.Errorf("TUN interface name must be 1..15 bytes")
 	}
@@ -50,7 +50,7 @@ func readTUN(device tunDevice, buffer []byte) (int, error) {
 	return syscall.Read(int(file.Fd()), buffer)
 }
 
-func configureTUN(name, ip string, prefix int) error {
+func configureTUN(name, ip string, prefix int, _ uint64) error {
 	address, e := netip.ParseAddr(ip)
 	if e != nil || !address.Is4() {
 		return fmt.Errorf("invalid mesh IPv4 address %q", ip)
@@ -89,7 +89,7 @@ func configureTUN(name, ip string, prefix int) error {
 	return nil
 }
 
-func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
+func configureTUNRoutes(name string, wanted, installed map[string]bool, _ uint64) error {
 	ipCommand, err := findIPCommand()
 	if err != nil {
 		return err
@@ -135,7 +135,7 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 // configureSystemDNS integrates the mesh resolver with systemd-resolved when
 // available. It is deliberately best-effort: distributions without
 // resolvectl can still use the listener through a local DNS forwarder.
-func configureSystemDNS(iface, meshIP, dnsTarget string) error {
+func configureSystemDNS(iface, meshIP, dnsTarget string, _ uint64) error {
 	if dnsTarget == "" {
 		return nil
 	}
@@ -246,7 +246,7 @@ func configureSiteNAT(localLAN, remoteVirtual []string) error {
 	return nil
 }
 
-func cleanupTUN(name string, installed map[string]bool) {
+func cleanupTUN(name string, installed map[string]bool, _ uint64) {
 	if name == "" {
 		return
 	}
