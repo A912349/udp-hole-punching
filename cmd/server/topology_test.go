@@ -81,3 +81,21 @@ func TestManualBackboneStillAttachesNewClients(t *testing.T) {
 		t.Fatalf("new client has %d automatic superpeer links, want 2", got)
 	}
 }
+
+func TestRegistrationTopologyChangeIgnoresHeartbeat(t *testing.T) {
+	previous := &node{
+		PublicKey: "key", NAT: "cone", Role: "client", Endpoint: "198.51.100.1:1000",
+		RequestedRole: "auto", Relay: true, Capacity: 1, MeshIP: "10.77.0.2", LastSeen: 100,
+	}
+	next := *previous
+	if registrationChangesTopology(previous, 90, next) {
+		t.Fatal("unchanged online registration must be treated as a heartbeat")
+	}
+	if !registrationChangesTopology(previous, 101, next) {
+		t.Fatal("returning from offline must update topology")
+	}
+	next.Endpoint = "198.51.100.2:1000"
+	if !registrationChangesTopology(previous, 90, next) {
+		t.Fatal("endpoint change must update topology")
+	}
+}

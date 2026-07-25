@@ -90,6 +90,14 @@ type server struct {
 	controls   map[*controlClient]string
 	metricsMu  sync.RWMutex
 	metrics    map[string]linkMetric
+	topologyMu sync.Mutex
+	linkCache  map[string]cachedLinks
+	cacheEpoch uint64
+}
+
+type cachedLinks struct {
+	epoch uint64
+	links []link
 }
 type linkMetric struct {
 	RTTMS float64
@@ -165,6 +173,7 @@ func main() {
 		sessions:        map[string]map[string]*rendezvousPeer{},
 		controls:        map[*controlClient]string{},
 		metrics:         map[string]linkMetric{},
+		linkCache:       map[string]cachedLinks{},
 		inviteAttempts:  map[string][]time.Time{},
 		accountAttempts: map[string][]time.Time{},
 	}
@@ -317,9 +326,24 @@ func (s *server) controlWS(ws *websocket.Conn) {
 			}
 			if json.Unmarshal(in.Body, &registration) == nil && registration.ID != "" {
 				s.controlMu.Lock()
+				alreadySynced := s.controls[client] == registration.ID
 				s.controls[client] = registration.ID
 				s.controlMu.Unlock()
-				s.pushTopologies()
+				var result struct {
+					TopologyChanged bool `json:"topology_changed"`
+				}
+				_ = json.Unmarshal(out.Body, &result)
+				// Register is also the heartbeat. Pushing after every heartbeat made
+				// every node bootstrap for every other node (O(n²) database reads and
+				// link calculations). Only broadcast when the registration changed
+				// data that can affect the topology.
+				if result.TopologyChanged {
+					s.pushTopologies()
+				} else if !alreadySynced {
+					// A reconnecting node may have missed broadcasts while its
+					// websocket was down. Catch it up without a full fan-out.
+					s.pushTopology(client, registration.ID)
+				}
 			}
 		}
 	}
@@ -341,11 +365,15 @@ func (s *server) pushTopologies() {
 	}
 	s.controlMu.Unlock()
 	for client, id := range clients {
-		out := s.controlRequestWithToken(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id}, client.credential)
-		if out.Status >= 200 && out.Status < 300 {
-			out.Event = "topology"
-			_ = client.send(out)
-		}
+		s.pushTopology(client, id)
+	}
+}
+
+func (s *server) pushTopology(client *controlClient, id string) {
+	out := s.controlRequestWithToken(controlFrame{Method: http.MethodGet, Path: "/v1/bootstrap/" + id}, client.credential)
+	if out.Status >= 200 && out.Status < 300 {
+		out.Event = "topology"
+		_ = client.send(out)
 	}
 }
 
@@ -1167,6 +1195,7 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	s.clientLinks = next.ClientLinks
 	s.symmetricLinks = next.SymmetricLinks
 	s.configMu.Unlock()
+	s.invalidateLinkCache()
 	if err := s.rebalanceRoles(); err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1743,7 +1772,6 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now()
 	s.metricsMu.Lock()
-	defer s.metricsMu.Unlock()
 	for _, x := range report.Links {
 		if x.PeerID == "" || x.PeerID == report.NodeID {
 			continue
@@ -1761,6 +1789,9 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		old.Seen = now
 		s.metrics[k] = old
 	}
+	s.metricsMu.Unlock()
+	// Telemetry influences peer preference and link costs.
+	s.invalidateLinkCache()
 	reply(w, 200, map[string]string{"status": "ok"})
 }
 func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
@@ -2131,6 +2162,7 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
+	s.invalidateLinkCache()
 	s.pushTopologies()
 	reply(w, 200, map[string]any{"links": input.Links})
 }
@@ -2379,11 +2411,18 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		d.Capacity = 1000
 	}
 	now := time.Now().Unix()
-	var old sql.NullString
-	s.db.QueryRow("SELECT mesh_ip FROM nodes WHERE node_id=?", d.ID).Scan(&old)
+	previousRows, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE node_id=?", d.ID)
+	if e != nil {
+		reply(w, 500, map[string]any{"error": e.Error()})
+		return
+	}
+	var previous *node
+	if len(previousRows) > 0 {
+		previous = &previousRows[0]
+	}
 	ip := d.MeshIP
-	if ip == "" && old.Valid {
-		ip = old.String
+	if ip == "" && previous != nil {
+		ip = previous.MeshIP
 	}
 	if ip == "" {
 		ip, e = s.allocate()
@@ -2441,11 +2480,33 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
 	log.Printf("[SERVER] register node=%s role=%s mesh_ip=%s", d.ID[:8], role, ip)
-	response := map[string]any{"status": "ok", "mesh_ip": ip, "mesh_network": s.network.String(), "assigned_role": role}
+	topologyChanged := registrationChangesTopology(previous, now-int64(s.settings().TTL), node{
+		PublicKey: d.Public, NAT: d.NAT, Role: role, Endpoint: d.Endpoint,
+		RequestedRole: d.Role, Relay: relay, Capacity: d.Capacity, MeshIP: ip,
+	})
+	response := map[string]any{"status": "ok", "mesh_ip": ip, "mesh_network": s.network.String(), "assigned_role": role, "topology_changed": topologyChanged}
 	if enrollmentToken != "" {
 		response["network_token"] = enrollmentToken
 	}
 	reply(w, 200, response)
+}
+
+// registrationChangesTopology deliberately ignores LastSeen: a normal
+// heartbeat only renews the lease and must not trigger a network-wide
+// bootstrap broadcast. A node returning from offline is a topology change
+// because it becomes eligible for links again.
+func registrationChangesTopology(previous *node, onlineAfter int64, next node) bool {
+	if previous == nil || previous.LastSeen < onlineAfter {
+		return true
+	}
+	return previous.PublicKey != next.PublicKey ||
+		previous.NAT != next.NAT ||
+		previous.Role != next.Role ||
+		previous.Endpoint != next.Endpoint ||
+		previous.RequestedRole != next.RequestedRole ||
+		previous.Relay != next.Relay ||
+		previous.Capacity != next.Capacity ||
+		previous.MeshIP != next.MeshIP
 }
 func boolInt(b bool) int {
 	if b {
@@ -2648,6 +2709,31 @@ func (s *server) links(nodes []node) []link {
 	return s.decorateLinks(out, nodes)
 }
 
+// cachedTopologyLinks shares the graph calculation across all bootstrap
+// responses in one topology push. The directory remains freshly loaded per
+// request, so endpoint and lease data are never served from this cache.
+func (s *server) cachedTopologyLinks(nodes []node) []link {
+	key := topologyVersion(nodes)
+	s.topologyMu.Lock()
+	defer s.topologyMu.Unlock()
+	if entry, ok := s.linkCache[key]; ok && entry.epoch == s.cacheEpoch {
+		return append([]link(nil), entry.links...)
+	}
+	links := s.links(nodes)
+	if s.linkCache == nil {
+		s.linkCache = make(map[string]cachedLinks)
+	}
+	s.linkCache[key] = cachedLinks{epoch: s.cacheEpoch, links: append([]link(nil), links...)}
+	return links
+}
+
+func (s *server) invalidateLinkCache() {
+	s.topologyMu.Lock()
+	s.cacheEpoch++
+	s.linkCache = nil
+	s.topologyMu.Unlock()
+}
+
 func (s *server) manualLinksForNodes(nodes []node) []link {
 	allowed := make(map[string]bool, len(nodes))
 	for _, n := range nodes {
@@ -2759,7 +2845,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		reply(w, 404, map[string]any{"error": "unknown node"})
 		return
 	}
-	ls := s.links(all)
+	ls := s.cachedTopologyLinks(all)
 	neighbors := map[string]bool{}
 	for _, l := range ls {
 		if l.A == id {
