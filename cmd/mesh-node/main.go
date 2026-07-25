@@ -211,6 +211,9 @@ type node struct {
 	deliverQueue     chan deliverFrame
 	stats            fastStats
 
+	topologyRefreshMu   sync.Mutex
+	topologyRefreshNext time.Time
+
 	sharedKeys map[string]cachedKey
 	reassembly map[string]*reassembly
 
@@ -219,6 +222,7 @@ type node struct {
 	symmetricScans     map[string]chan struct{}
 	symmetricConnected map[string]bool
 	symmetricBurstAt   map[string]time.Time
+	symmetricScanSlots chan struct{}
 }
 
 func main() {
@@ -566,6 +570,7 @@ func newNode(c config) (*node, error) {
 		symmetricScans:     map[string]chan struct{}{},
 		symmetricConnected: map[string]bool{},
 		symmetricBurstAt:   map[string]time.Time{},
+		symmetricScanSlots: make(chan struct{}, 2),
 		pings:              map[string]time.Time{},
 	}
 	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
@@ -1288,6 +1293,17 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 }
 
 func (n *node) scanSymmetricNeighbor(peerID, endpoint string, cancel chan struct{}) {
+	// A full symmetric-NAT port scan is intentionally broad. Bound concurrent
+	// scans so several newly discovered peers cannot monopolize CPU and UDP
+	// bandwidth at once; queued scans remain cancellable by a newer topology.
+	if n.symmetricScanSlots != nil {
+		select {
+		case n.symmetricScanSlots <- struct{}{}:
+			defer func() { <-n.symmetricScanSlots }()
+		case <-cancel:
+			return
+		}
+	}
 	defer func() {
 		n.symmetricMu.Lock()
 		if n.symmetricScans[peerID] == cancel {
@@ -1567,12 +1583,27 @@ func (n *node) pingAll() {
 		ids = append(ids, id)
 	}
 	n.mu.RUnlock()
+	now := time.Now()
+	n.pingMu.Lock()
+	prunePings(n.pings, now.Add(-linkTimeout))
+	n.pingMu.Unlock()
 	for _, id := range ids {
 		p := protocol.NewPacket("PING", n.id.ID, id, map[string]any{})
 		n.pingMu.Lock()
-		n.pings[p.ID] = time.Now()
+		n.pings[p.ID] = now
 		n.pingMu.Unlock()
 		n.send(p)
+	}
+}
+
+// PONG removes its matching entry, but offline peers never answer. Bound the
+// bookkeeping for those peers so a long-running node does not accumulate one
+// ping timestamp per keepalive interval forever.
+func prunePings(pings map[string]time.Time, before time.Time) {
+	for id, sent := range pings {
+		if sent.Before(before) {
+			delete(pings, id)
+		}
 	}
 }
 func (n *node) reportTelemetry() error {
@@ -1919,10 +1950,25 @@ func (n *node) ensureNeighbor(id string) {
 	if known {
 		return
 	}
-	n.logf("received traffic from new node %s; refreshing topology", id[:8])
-	if err := n.bootstrap(); err != nil {
-		n.logf("topology refresh failed: %v", err)
+	// Unknown packets can arrive in bursts (or be sent by a stale/malicious
+	// member). Coalesce them into one asynchronous refresh so the UDP receive
+	// loop is never blocked and they cannot create a control-plane CPU storm.
+	if !n.topologyRefreshMu.TryLock() {
+		return
 	}
+	now := time.Now()
+	if now.Before(n.topologyRefreshNext) {
+		n.topologyRefreshMu.Unlock()
+		return
+	}
+	n.topologyRefreshNext = now.Add(refresh)
+	go func() {
+		defer n.topologyRefreshMu.Unlock()
+		n.logf("received traffic from new node %s; refreshing topology", id[:8])
+		if err := n.bootstrap(); err != nil {
+			n.logf("topology refresh failed: %v", err)
+		}
+	}()
 }
 
 func (n *node) linkHealth(ctx context.Context) {

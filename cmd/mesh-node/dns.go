@@ -11,7 +11,10 @@ import (
 const (
 	meshDNSFallback      = "127.0.0.1:5353"
 	meshDNSVirtualPrefix = "10.77."
+	maxDNSQueries        = 64
 )
+
+var dnsQuerySlots = make(chan struct{}, maxDNSQueries)
 
 func dnsQuestion(packet []byte) (string, int, bool) {
 	if len(packet) < 17 || binary.BigEndian.Uint16(packet[4:6]) != 1 {
@@ -162,7 +165,16 @@ func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn, upstream 
 			return
 		}
 		query := append([]byte(nil), buf[:size]...)
+		// DNS is UDP and clients retry. A bounded worker pool prevents a local
+		// query flood from creating an unbounded number of goroutines and
+		// upstream sockets.
+		select {
+		case dnsQuerySlots <- struct{}{}:
+		default:
+			continue
+		}
 		go func() {
+			defer func() { <-dnsQuerySlots }()
 			name, end, isA := dnsQuestion(query)
 			if isA {
 				if ip := n.meshDNSIP(name); ip != nil {
