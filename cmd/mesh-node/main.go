@@ -1399,6 +1399,57 @@ func (n *node) replaceUDPConn(next *net.UDPConn) {
 	old := n.conn
 	n.conn = next
 	n.connMu.Unlock()
+	n.finishUDPConnReplacement(old, next)
+}
+
+// rebindUDPConn drops the socket created on the previous network and creates
+// a new one. On Android a wildcard-bound UDP socket can remain associated with
+// the Wi-Fi Network after the default network changes to LTE; refreshing STUN
+// on that socket then keeps returning the dead mapping.
+func (n *node) rebindUDPConn() error {
+	// Do not close a socket while receive or STUN is using it. Read operations
+	// have a one-second deadline, so this lock also gives those loops a chance
+	// to leave the old socket cleanly.
+	n.udpReadMu.Lock()
+	defer n.udpReadMu.Unlock()
+
+	n.connMu.Lock()
+	old := n.conn
+	if old == nil {
+		n.connMu.Unlock()
+		return errors.New("UDP socket is not initialized")
+	}
+	oldAddr, ok := old.LocalAddr().(*net.UDPAddr)
+	if !ok {
+		n.connMu.Unlock()
+		return errors.New("UDP socket has an invalid local address")
+	}
+	port := oldAddr.Port
+	_ = old.Close()
+	bind, err := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", n.c.bind, port))
+	if err != nil {
+		n.connMu.Unlock()
+		return err
+	}
+	next, err := net.ListenUDP("udp4", bind)
+	if err != nil {
+		// If the original port was ephemeral, retaining it is not meaningful.
+		// A fresh ephemeral port is preferable to leaving the node offline.
+		if n.c.port == 0 {
+			next, err = net.ListenUDP("udp4", &net.UDPAddr{IP: bind.IP})
+		}
+	}
+	if err != nil {
+		n.connMu.Unlock()
+		return err
+	}
+	n.conn = next
+	n.connMu.Unlock()
+	n.finishUDPConnReplacement(old, next)
+	return nil
+}
+
+func (n *node) finishUDPConnReplacement(old, next *net.UDPConn) {
 	oldPort := 0
 	if old != nil {
 		oldPort = old.LocalAddr().(*net.UDPAddr).Port
@@ -1778,6 +1829,10 @@ func (n *node) recoverNetwork() {
 		return
 	}
 	n.logf("network link stale; refreshing STUN endpoint and topology")
+	if err := n.rebindUDPConn(); err != nil {
+		n.deferRecovery(err, "UDP socket recovery failed")
+		return
+	}
 	n.resetTransportState()
 	endpoint, nat, err := n.detectEndpoint()
 	if err != nil {
