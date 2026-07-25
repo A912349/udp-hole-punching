@@ -42,15 +42,19 @@ var (
 	wintunAllocateSend       = wintunDLL.NewProc("WintunAllocateSendPacket")
 	wintunSendPacket         = wintunDLL.NewProc("WintunSendPacket")
 	kernel32WaitForSingleObj = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
+	wintunGetAdapterLUID     = wintunDLL.NewProc("WintunGetAdapterLUID")
 )
 
 type wintunDevice struct {
 	adapter uintptr
 	session uintptr
 	event   uintptr
+	luid    uint64
 	mu      sync.Mutex
 	closed  bool
 }
+
+func (d *wintunDevice) adapterLUID() uint64 { return d.luid }
 
 func openTUN(name string) (tunDevice, error) {
 	if name == "" {
@@ -80,6 +84,15 @@ func openTUN(name string) (tunDevice, error) {
 			return nil, fmt.Errorf("open or create Wintun adapter %q: %w", name, winCallError(openErr))
 		}
 	}
+
+	// Получаем LUID адаптера
+	var luid uint64
+	ret, _, luidErr := wintunGetAdapterLUID.Call(adapter, uintptr(unsafe.Pointer(&luid)))
+	if ret == 0 {
+		wintunCloseAdapter.Call(adapter)
+		return nil, fmt.Errorf("get Wintun adapter LUID: %w", winCallError(luidErr))
+	}
+
 	session, _, sessionErr := wintunStartSession.Call(adapter, wintunSessionCapacity)
 	if session == 0 {
 		wintunCloseAdapter.Call(adapter)
@@ -91,7 +104,7 @@ func openTUN(name string) (tunDevice, error) {
 		wintunCloseAdapter.Call(adapter)
 		return nil, fmt.Errorf("get Wintun read event: %w", winCallError(eventErr))
 	}
-	return &wintunDevice{adapter: adapter, session: session, event: event}, nil
+	return &wintunDevice{adapter: adapter, session: session, event: event, luid: luid}, nil
 }
 
 func winCallError(err error) error {
@@ -123,8 +136,6 @@ func (d *wintunDevice) Read(buffer []byte) (int, error) {
 			return int(size), nil
 		}
 		if receiveErr != nil && receiveErr != syscall.Errno(0) {
-			// Wintun returns a null packet while its ring is empty. Waiting on
-			// the event is still the correct recovery path for that condition.
 			_ = receiveErr
 		}
 		result, _, waitErr := kernel32WaitForSingleObj.Call(event, waitObjectTimeout)
@@ -172,11 +183,31 @@ func (d *wintunDevice) Close() error {
 	return nil
 }
 
-func windowsInterfaceIndex(name string) (string, error) {
+func windowsInterfaceIndexByLUID(luid uint64) (string, error) {
+	luidStr := strconv.FormatUint(luid, 10)
+	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+		`$l=[uint64]$env:MESH_TUN_LUID; (Get-NetAdapter -IncludeHidden -Luid $l -ErrorAction Stop).ifIndex`)
+	ps.Env = append(os.Environ(), "MESH_TUN_LUID="+luidStr)
 	for attempt := 0; attempt < 30; attempt++ {
-		// Wintun adapters are sometimes not visible to netsh immediately.
-		// PowerShell queries the adapter store directly and is not affected by
-		// the localized netsh column headers.
+		if output, err := ps.Output(); err == nil {
+			index := strings.TrimSpace(string(output))
+			if index != "" && index != "0" {
+				return index, nil
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return "", fmt.Errorf("Windows interface for LUID %s was not found", luidStr)
+}
+
+func windowsInterfaceIndex(name string, luid uint64) (string, error) {
+	// Если LUID известен, используем быстрый надёжный способ
+	if luid != 0 {
+		return windowsInterfaceIndexByLUID(luid)
+	}
+
+	// Fallback – старый код (на случай, если LUID не определён)
+	for attempt := 0; attempt < 30; attempt++ {
 		ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", `$n=$env:MESH_TUN_NAME; $a=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $n -or $_.InterfaceAlias -eq $n }); if (-not $a) { $w=@(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.DriverDescription -match 'Wintun' }); if ($w.Count -eq 1) { $a=$w } }; if ($a) { $a[0].ifIndex }`)
 		ps.Env = append(os.Environ(), "MESH_TUN_NAME="+name)
 		if output, err := ps.Output(); err == nil {
@@ -224,33 +255,26 @@ func runWindows(command string, args ...string) error {
 	return nil
 }
 
-func configureTUN(name, ip string, prefix int) error {
+func configureTUN(name, ip string, prefix int, luid uint64) error {
 	address, err := netip.ParseAddr(ip)
 	if err != nil || !address.Is4() || prefix < 1 || prefix > 32 {
 		return fmt.Errorf("invalid mesh IPv4 address %q/%d", ip, prefix)
 	}
 	mask := net.IP(net.CIDRMask(prefix, 32)).String()
-	if err := configureWindowsAddress(name, ip, prefix, mask); err != nil {
+	if err := configureWindowsAddress(name, ip, prefix, mask, luid); err != nil {
 		return err
 	}
-	// Keep the host adapter MTU aligned with the overlay. Without this,
-	// Windows emits 1500-byte packets while the overlay accepts at most 1279;
-	// a Wintun read could then terminate on io.ErrShortBuffer.
 	if err := runWindows("netsh", "interface", "ipv4", "set", "subinterface", "name="+name, "mtu=1279", "store=active"); err != nil {
 		return fmt.Errorf("set Wintun MTU: %w", err)
 	}
-	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String())
+	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String(), luid)
 }
 
-func configureWindowsAddress(name, ip string, prefix int, mask string) error {
-	interfaceIndex, err := windowsInterfaceIndex(name)
+func configureWindowsAddress(name, ip string, prefix int, mask string, luid uint64) error {
+	interfaceIndex, err := windowsInterfaceIndex(name, luid)
 	if err != nil {
 		return err
 	}
-	// New-NetIPAddress updates the NetTCPIP store directly and works for
-	// Wintun adapters that accept netsh's command but do not materialize the
-	// address. Values are passed through the child environment, not embedded
-	// in PowerShell source, so a custom adapter name cannot inject a command.
 	ps := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", `$ErrorActionPreference = 'Stop'
 $index = [uint32]$env:MESH_TUN_IFINDEX
 $ip = $env:MESH_TUN_IP
@@ -266,29 +290,27 @@ if (-not @(Get-NetIPAddress -InterfaceIndex $index -AddressFamily IPv4 -ErrorAct
 	ps.Env = append(os.Environ(), "MESH_TUN_IFINDEX="+interfaceIndex, "MESH_TUN_IP="+ip, fmt.Sprintf("MESH_TUN_PREFIX=%d", prefix))
 	psOutput, psErr := ps.CombinedOutput()
 	if psErr == nil {
-		if err := windowsHasAddress(name, ip); err == nil {
+		if err := windowsHasAddress(name, ip, luid); err == nil {
 			return nil
 		}
 	}
 
-	// Keep netsh as a fallback for stripped-down Windows installations where
-	// the NetTCPIP PowerShell module is unavailable.
 	netshSetErr := runWindows("netsh", "interface", "ipv4", "set", "address", "name="+name, "source=static", "gateway=none", "store=active")
 	netshErr := runWindows("netsh", "interface", "ipv4", "add", "address", "name="+name, "address="+ip, "mask="+mask, "type=unicast", "store=active")
 	if netshSetErr == nil && netshErr == nil {
-		if err := windowsHasAddress(name, ip); err == nil {
+		if err := windowsHasAddress(name, ip, luid); err == nil {
 			return nil
 		}
 	}
 	return fmt.Errorf("Windows did not assign %s to adapter %q (PowerShell: %v, output: %s; netsh set: %v; netsh add: %v)", ip, name, psErr, strings.TrimSpace(string(psOutput)), netshSetErr, netshErr)
 }
 
-func windowsHasAddress(name, ip string) error {
+func windowsHasAddress(name, ip string, luid uint64) error {
 	target := net.ParseIP(ip).To4()
 	if target == nil {
 		return fmt.Errorf("invalid IPv4 address %q", ip)
 	}
-	interfaceIndex, err := windowsInterfaceIndex(name)
+	interfaceIndex, err := windowsInterfaceIndex(name, luid)
 	if err != nil {
 		return err
 	}
@@ -321,8 +343,8 @@ func windowsHasAddress(name, ip string) error {
 	return fmt.Errorf("address %s is absent from interface %q", ip, name)
 }
 
-func addWindowsRoute(name, cidr string) error {
-	idx, err := windowsInterfaceIndex(name)
+func addWindowsRoute(name, cidr string, luid uint64) error {
+	idx, err := windowsInterfaceIndex(name, luid)
 	if err != nil {
 		return err
 	}
@@ -330,16 +352,12 @@ func addWindowsRoute(name, cidr string) error {
 	if err != nil {
 		return err
 	}
-	// Delete is intentionally best-effort: route.exe returns an error when
-	// the route is not present, which is normal on the first start.
 	_ = runWindows("route", "delete", destination, "mask", mask, "if", idx)
-	// A zero next hop creates an on-link route. This is required for Wintun's
-	// layer-3 adapter, which does not perform ARP for a synthetic gateway.
 	return runWindows("route", "add", destination, "mask", mask, "0.0.0.0", "metric", "1", "if", idx)
 }
 
-func deleteWindowsRoute(name, cidr string) error {
-	idx, err := windowsInterfaceIndex(name)
+func deleteWindowsRoute(name, cidr string, luid uint64) error {
+	idx, err := windowsInterfaceIndex(name, luid)
 	if err != nil {
 		return err
 	}
@@ -350,17 +368,17 @@ func deleteWindowsRoute(name, cidr string) error {
 	return runWindows("route", "delete", destination, "mask", mask, "if", idx)
 }
 
-func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
+func configureTUNRoutes(name string, wanted, installed map[string]bool, luid uint64) error {
 	for route := range installed {
 		if !wanted[route] {
-			if err := deleteWindowsRoute(name, route); err != nil {
+			if err := deleteWindowsRoute(name, route, luid); err != nil {
 				return err
 			}
 		}
 	}
 	for route := range wanted {
 		if !installed[route] {
-			if err := addWindowsRoute(name, route); err != nil {
+			if err := addWindowsRoute(name, route, luid); err != nil {
 				return err
 			}
 		}
@@ -368,7 +386,7 @@ func configureTUNRoutes(name string, wanted, installed map[string]bool) error {
 	return nil
 }
 
-func configureSystemDNS(iface, meshIP, dnsTarget string) error {
+func configureSystemDNS(iface, meshIP, dnsTarget string, luid uint64) error {
 	if dnsTarget != net.JoinHostPort(meshIP, "53") {
 		return fmt.Errorf("Windows split-DNS is unavailable for local listener %s; use the mesh adapter DNS manually", dnsTarget)
 	}
@@ -389,8 +407,6 @@ func configurePlatformNetwork(port int) error {
 		return fmt.Errorf("find mesh-node executable for firewall rule: %w", err)
 	}
 	rule := windowsFirewallRuleName(port)
-	// Replacing our own rule makes restarts with a different executable path
-	// deterministic and avoids accumulating stale rules for ephemeral ports.
 	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+rule)
 	if err := runWindows("netsh", "advfirewall", "firewall", "add", "rule", "name="+rule, "dir=in", "action=allow", "enable=yes", "profile=any", "protocol=UDP", fmt.Sprintf("localport=%d", port), "program="+executable); err != nil {
 		return err
@@ -405,11 +421,9 @@ func cleanupPlatformNetwork(port int) {
 	_ = runWindows("netsh", "advfirewall", "firewall", "delete", "rule", "name="+windowsLANFirewallRuleName())
 }
 
-func cleanupTUN(name string, installed map[string]bool) {
+func cleanupTUN(name string, installed map[string]bool, luid uint64) {
 	for route := range installed {
-		_ = deleteWindowsRoute(name, route)
+		_ = deleteWindowsRoute(name, route, luid)
 	}
-	// The adapter is intentionally retained so its signed driver installation
-	// is reusable. Only the settings owned by this process are reset.
 	_ = runWindows("netsh", "interface", "ipv4", "set", "dnsservers", "name="+name, "source=dhcp")
 }

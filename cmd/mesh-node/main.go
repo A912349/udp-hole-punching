@@ -203,6 +203,7 @@ type node struct {
 	allow            map[string]bool
 	stop             context.CancelFunc
 	tun              tunDevice
+	tunLUID          uint64
 	startedAt        time.Time
 	fastQueue        chan fastFrame
 	fastPool         sync.Pool
@@ -1046,8 +1047,11 @@ func (n *node) start() error {
 			return e
 		}
 		n.tun = f
+		if d, ok := f.(interface{ adapterLUID() uint64 }); ok {
+			n.tunLUID = d.adapterLUID()
+		}
 		if n.c.autoTUN {
-			if e := configureTUN(n.c.tun, n.c.meshIP, n.c.prefix); e != nil {
+			if e := configureTUN(n.c.tun, n.c.meshIP, n.c.prefix, n.tunLUID); e != nil {
 				_ = n.tun.Close()
 				n.tun = nil
 				return e
@@ -2218,7 +2222,7 @@ func (n *node) close() {
 	}
 	n.conn.Close()
 	if n.tun != nil {
-		cleanupTUN(n.c.tun, n.installedRoutes)
+		cleanupTUN(n.c.tun, n.installedRoutes, n.tunLUID)
 	}
 	cleanupPlatformNetwork(n.conn.LocalAddr().(*net.UDPAddr).Port)
 	if n.tun != nil {
@@ -2563,7 +2567,7 @@ func (n *node) syncTUNRoutes() error {
 		}
 	}
 	n.mu.RUnlock()
-	if err := configureTUNRoutes(n.c.tun, wanted, n.installedRoutes); err != nil {
+	if err := configureTUNRoutes(n.c.tun, wanted, n.installedRoutes, n.tunLUID); err != nil {
 		return err
 	}
 	n.installedRoutes = wanted

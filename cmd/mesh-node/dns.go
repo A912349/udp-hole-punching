@@ -112,7 +112,7 @@ func (n *node) serveDNS(ctx context.Context) {
 	upstream := systemResolver()
 	n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
 	go n.serveDNSListener(ctx, listener, upstream)
-	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget); err != nil {
+	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget, n.tunLUID); err != nil {
 		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, dnsTarget)
 	}
 }
