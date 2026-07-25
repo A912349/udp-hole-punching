@@ -44,7 +44,7 @@ const (
 	keepAlive          = 10 * time.Second
 	refresh            = 5 * time.Second
 	heartbeat          = 15 * time.Second
-	linkTimeout        = 30 * time.Second
+	linkTimeout        = 45 * time.Second
 	linkGrace          = 35 * time.Second
 	recoveryMinBackoff = 30 * time.Second
 	recoveryMaxBackoff = 5 * time.Minute
@@ -100,6 +100,7 @@ type peer struct {
 	DNSRecords []dnsRecord          `json:"dns_records,omitempty"`
 	last       net.Addr
 	lastRX     time.Time
+	discovered time.Time
 	up         bool
 	rttMS      float64
 }
@@ -925,10 +926,12 @@ func (n *node) applyTopology(t topology) {
 	n.neighbors = map[string]*peer{}
 	for _, v := range t.Neighbors {
 		p := v
+		p.discovered = time.Now()
 		if q := old[p.ID]; q != nil {
 			p.last = q.last
 			p.lastRX = q.lastRX
 			p.up = q.up
+			p.discovered = q.discovered
 		}
 		n.neighbors[p.ID] = &p
 	}
@@ -1511,7 +1514,8 @@ func (n *node) recoverNetwork() {
 		// local NAT mapping is only justified when every observed neighbor is
 		// stale; otherwise an unrelated peer can repeatedly disrupt healthy
 		// traffic on this node.
-		if peer.lastRX.IsZero() || time.Since(peer.lastRX) < linkTimeout {
+		if (!peer.lastRX.IsZero() && time.Since(peer.lastRX) < linkTimeout) ||
+			(peer.lastRX.IsZero() && time.Since(peer.discovered) < linkGrace) {
 			stale = false
 			break
 		}

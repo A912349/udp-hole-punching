@@ -2601,6 +2601,20 @@ func topologyVersion(nodes []node) string {
 	h := sha256.Sum256([]byte(strings.Join(a, "|")))
 	return hex.EncodeToString(h[:])[:16]
 }
+
+// bootstrapTopologyVersion fingerprints everything that can change a node's
+// forwarding view. topologyVersion is intentionally kept as the link-cache
+// key, while this version also covers enriched network metadata and the
+// effective edges. Otherwise a pushed manual/config/route change can carry
+// the old version and be silently discarded by clients.
+func bootstrapTopologyVersion(nodes []node, links []link) string {
+	b, _ := json.Marshal(struct {
+		Nodes []node `json:"nodes"`
+		Links []link `json:"links"`
+	}{nodes, links})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])[:16]
+}
 func weightedPeerOrder(client node, peers []node) []node {
 	rank := append([]node(nil), peers...)
 	sort.Slice(rank, func(i, j int) bool {
@@ -2876,7 +2890,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		services = append(services, map[string]string{"node_id": n, "name": x})
 	}
 	rs.Close()
-	reply(w, 200, map[string]any{"topology_version": topologyVersion(all), "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "services": services, "graph_update_mode": "reserved"})
+	reply(w, 200, map[string]any{"topology_version": bootstrapTopologyVersion(all, ls), "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "services": services, "graph_update_mode": "reserved"})
 }
 func (s *server) service(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {

@@ -99,3 +99,15 @@ func TestRegistrationTopologyChangeIgnoresHeartbeat(t *testing.T) {
 		t.Fatal("endpoint change must update topology")
 	}
 }
+
+func TestBootstrapTopologyVersionCoversEffectiveLinksAndNetworkMetadata(t *testing.T) {
+	nodes := []node{{ID: "a", PublicKey: "key-a", MeshIP: "10.77.0.1"}, {ID: "b", PublicKey: "key-b", MeshIP: "10.77.0.2"}}
+	base := bootstrapTopologyVersion(nodes, []link{{A: "a", B: "b", Cost: 1}})
+	if got := bootstrapTopologyVersion(nodes, []link{{A: "a", B: "b", Cost: 2}}); got == base {
+		t.Fatal("link cost change must change bootstrap topology version")
+	}
+	nodes[0].Routes = []routeAdvertisement{{LAN: "192.168.1.0/24", Virtual: "10.77.1.0/24"}}
+	if got := bootstrapTopologyVersion(nodes, []link{{A: "a", B: "b", Cost: 1}}); got == base {
+		t.Fatal("route change must change bootstrap topology version")
+	}
+}
