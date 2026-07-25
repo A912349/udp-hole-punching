@@ -1268,6 +1268,7 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 	n.symmetricMu.Lock()
 	if existing := n.symmetricScans[peerID]; existing != nil {
 		if !force {
+			n.debugf("symmetric scan for %s already running; skip", peerID[:8])
 			n.symmetricMu.Unlock()
 			return
 		}
@@ -1275,12 +1276,14 @@ func (n *node) startSymmetricScan(peerID, endpoint string, force bool) {
 		close(existing)
 	}
 	if n.symmetricConnected[peerID] && !force {
+		n.debugf("symmetric scan for %s already connected; skip", peerID[:8])
 		n.symmetricMu.Unlock()
 		return
 	}
 	cancel := make(chan struct{})
 	n.symmetricScans[peerID] = cancel
 	n.symmetricMu.Unlock()
+	n.debugf("symmetric scan started for %s endpoint=%s force=%t", peerID[:8], endpoint, force)
 	go n.scanSymmetricNeighbor(peerID, endpoint, cancel)
 }
 
@@ -1350,9 +1353,10 @@ func (n *node) completeSymmetricScan(peerID string) {
 	if cancel != nil {
 		delete(n.symmetricScans, peerID)
 		close(cancel)
-		n.symmetricConnected[peerID] = true
 	}
+	n.symmetricConnected[peerID] = true
 	n.symmetricMu.Unlock()
+	n.debugf("symmetric scan completed for %s (scan_was_active=%t)", peerID[:8], cancel != nil)
 }
 
 func (n *node) handleSymmetricBurst(packet protocol.Packet) {
@@ -1372,7 +1376,10 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet) {
 	if time.Since(previous) < 5*time.Second {
 		return
 	}
-	n.startSymmetricScan(packet.Source, peer.Endpoint, true)
+	// A burst is a trigger to ensure that scanning is running. It must not
+	// cancel and restart an already active scan: doing so can invalidate a
+	// nearly completed HELLO/HELLO_ACK exchange on the other node.
+	n.startSymmetricScan(packet.Source, peer.Endpoint, false)
 }
 
 func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
@@ -1583,7 +1590,11 @@ func (n *node) reportTelemetry() error {
 	return n.request("POST", "/v1/telemetry", map[string]any{"node_id": n.id.ID, "links": links}, &map[string]any{})
 }
 func (n *node) usable(p *peer) bool {
-	return p != nil && (p.lastRX.IsZero() || time.Since(p.lastRX) < linkTimeout)
+	// A topology entry is only a candidate endpoint. Do not report or route
+	// through it until this node has actually received traffic from the peer.
+	// Treating a zero lastRX as usable made one side show link up immediately
+	// while the other side was still establishing the UDP path.
+	return p != nil && !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout
 }
 func (n *node) send(p protocol.Packet) bool {
 	_, q := n.nextHop(p.Destination)
@@ -1849,6 +1860,7 @@ func (n *node) receive(ctx context.Context) {
 			n.ensureNeighbor(p.Source)
 			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{}))
 		case "HELLO_ACK":
+			n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
 			n.completeSymmetricScan(p.Source)
 		case "PING":
 			n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
