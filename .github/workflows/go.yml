@@ -20,8 +20,27 @@ jobs:
           go-version: '1.24'
           cache: true
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
       - name: Download dependencies
         run: go mod download
+
+      - name: Minify embedded admin assets
+        run: |
+          npx --yes terser@5 cmd/server/admin.js --compress --mangle --output cmd/server/admin.js
+          npx --yes clean-css-cli@5 -o cmd/server/admin.css -- cmd/server/admin.css
+          npx --yes clean-css-cli@5 -o cmd/server/admin-interactive.css -- cmd/server/admin-interactive.css
+          npx --yes html-minifier-terser@7 \
+            --collapse-whitespace \
+            --remove-comments \
+            --minify-css true \
+            --minify-js true \
+            cmd/server/admin.html \
+            --output cmd/server/admin.min.html
+          mv cmd/server/admin.min.html cmd/server/admin.html
 
       - name: Install UPX (fast)
         run: |

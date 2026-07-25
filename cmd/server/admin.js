@@ -1,137 +1,969 @@
-(function installAccountUI(){
-  const connect=document.querySelector('.connect');
-  if(!connect)return;
-  const auth=document.createElement('div');
-  auth.className='accountAuth';
-  auth.innerHTML='<input id="accountUsername" autocomplete="username" placeholder="Account"><input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password"><input id="accountRegistrationInvite" autocomplete="off" placeholder="Registration invite"><button id="accountLogin">Log in</button><button id="accountRegister" class="ghost">Register</button><button id="accountLogout" class="ghost" hidden>Log out</button>';
-  connect.insertBefore(auth,connect.firstChild);
-  const access=document.querySelector('#access .columns');
-  if(access){
-    const tokenCard=document.createElement('article');
-    tokenCard.className='card';
-    tokenCard.innerHTML='<h2>Your network token</h2><p class="muted">Use this separate token with <code>mesh-node --network-token</code>. It is shown after registration or rotation.</p><button id="rotateAccountToken">Rotate token</button><div id="accountNetworkToken" class="inviteCode">—</div>';
+(function installAccountUI() {
+  const connect = document.querySelector('.connect');
+  if (!connect) return;
+  const auth = document.createElement('div');
+  auth.className = 'accountAuth';
+  auth.innerHTML = '<input id="accountUsername" autocomplete="username" placeholder="Account"><input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password"><input id="accountRegistrationInvite" autocomplete="off" placeholder="Registration invite"><button id="accountLogin">Log in</button><button id="accountRegister" class="ghost">Register</button><button id="accountLogout" class="ghost" hidden>Log out</button>';
+  connect.insertBefore(auth, connect.firstChild);
+  const access = document.querySelector('#access .columns');
+  if (access) {
+    const tokenCard = document.createElement('article');
+    tokenCard.className = 'card';
+    tokenCard.innerHTML = '<h2>Your network token</h2><p class="muted">Use this separate token with <code>mesh-node --network-token</code>. It is shown after registration or rotation.</p><button id="rotateAccountToken">Rotate token</button><div id="accountNetworkToken" class="inviteCode">—</div>';
     access.appendChild(tokenCard);
-    const card=document.createElement('article');
-    card.className='card';
-    card.innerHTML='<h2>Invite another account</h2><p class="muted">One-use invitation, valid for 24 hours. The raw token is shown once.</p><button id="createAccountInvite">Generate account invite</button><div id="newAccountInvite" class="inviteCode">—</div>';
+    const card = document.createElement('article');
+    card.className = 'card';
+    card.innerHTML = '<h2>Invite another account</h2><p class="muted">One-use invitation, valid for 24 hours. The raw token is shown once.</p><button id="createAccountInvite">Generate account invite</button><div id="newAccountInvite" class="inviteCode">—</div>';
     access.appendChild(card);
-    const list=document.createElement('article');
-    list.className='card';
-    list.innerHTML='<h2>Account invitations</h2><table><thead><tr><th>Created</th><th>Expires</th><th>Status</th></tr></thead><tbody id="accountInviteRows"></tbody></table>';
+    const list = document.createElement('article');
+    list.className = 'card';
+    list.innerHTML = '<h2>Account invitations</h2><table><thead><tr><th>Created</th><th>Expires</th><th>Status</th></tr></thead><tbody id="accountInviteRows"></tbody></table>';
     access.appendChild(list);
   }
 })();
-const $=id=>document.getElementById(id);
-let state={topology:{nodes:[],links:[]},topologies:{online:{nodes:[],links:[]},all:{nodes:[],links:[]}},scope:'online',audit:[],config:{},invites:[],manualLinks:[]},timer;
-let graphUI={positions:{},source:null,selectedNode:null,selectedEdge:null};
-const graphPositionsCookie='mesh_graph_positions',graphPositionsStorage='meshGraphPositions';
-function loadGraphPositions(){
-  let raw=cookieValue(graphPositionsCookie);
-  if(!raw){try{raw=localStorage.getItem(graphPositionsStorage)||''}catch(e){}}
-  if(!raw)return;
-  try{
-    let stored=JSON.parse(decodeURIComponent(raw));
-    Object.entries(stored).forEach(([id,p])=>{
-      let x=Number(p?.x),y=Number(p?.y);
-      if(Number.isFinite(x)&&Number.isFinite(y))graphUI.positions[id]={x:Math.max(30,Math.min(1070,x)),y:Math.max(30,Math.min(570,y))};
+const $ = id => document.getElementById(id);
+let state = {
+    topology: {
+      nodes: [],
+      links: []
+    },
+    topologies: {
+      online: {
+        nodes: [],
+        links: []
+      },
+      all: {
+        nodes: [],
+        links: []
+      }
+    },
+    scope: 'online',
+    audit: [],
+    config: {},
+    invites: [],
+    manualLinks: []
+  },
+  timer;
+let graphUI = {
+  positions: {},
+  source: null,
+  selectedNode: null,
+  selectedEdge: null
+};
+const graphPositionsCookie = 'mesh_graph_positions',
+  graphPositionsStorage = 'meshGraphPositions';
+
+function loadGraphPositions() {
+  let raw = cookieValue(graphPositionsCookie);
+  if (!raw) {
+    try {
+      raw = localStorage.getItem(graphPositionsStorage) || ''
+    } catch (e) {}
+  }
+  if (!raw) return;
+  try {
+    let stored = JSON.parse(decodeURIComponent(raw));
+    Object.entries(stored).forEach(([id, p]) => {
+      let x = Number(p?.x),
+        y = Number(p?.y);
+      if (Number.isFinite(x) && Number.isFinite(y)) graphUI.positions[id] = {
+        x: Math.max(30, Math.min(1070, x)),
+        y: Math.max(30, Math.min(570, y))
+      };
     });
-  }catch(e){}
+  } catch (e) {}
 }
-function saveGraphPositions(){
-  let stored={};
-  Object.entries(graphUI.positions).forEach(([id,p])=>{stored[id]={x:Math.round(p.x*10)/10,y:Math.round(p.y*10)/10}});
-  let encoded=encodeURIComponent(JSON.stringify(stored));
-  if(encoded.length<=3800)document.cookie=graphPositionsCookie+'='+encoded+'; Max-Age=31536000; Path=/; SameSite=Lax';
-  else document.cookie=graphPositionsCookie+'=; Max-Age=0; Path=/; SameSite=Lax';
-  try{localStorage.setItem(graphPositionsStorage,JSON.stringify(stored))}catch(e){}
+
+function saveGraphPositions() {
+  let stored = {};
+  Object.entries(graphUI.positions).forEach(([id, p]) => {
+    stored[id] = {
+      x: Math.round(p.x * 10) / 10,
+      y: Math.round(p.y * 10) / 10
+    }
+  });
+  let encoded = encodeURIComponent(JSON.stringify(stored));
+  if (encoded.length <= 3800) document.cookie = graphPositionsCookie + '=' + encoded + '; Max-Age=31536000; Path=/; SameSite=Lax';
+  else document.cookie = graphPositionsCookie + '=; Max-Age=0; Path=/; SameSite=Lax';
+  try {
+    localStorage.setItem(graphPositionsStorage, JSON.stringify(stored))
+  } catch (e) {}
 }
 loadGraphPositions();
-const titles={overview:['Network overview','Health and connectivity at a glance'],peers:['Peers','Inventory, roles and endpoints'],topology:['Topology','Edit routes and roles directly on the graph'],forwards:['Reverse ports','Forward a local source port to another peer’s LAN'],access:['Setup keys','Enroll new devices securely'],events:['Events','Administrative audit trail'],settings:['Settings','Topology policy and device administration']};
-const edgeKey=(a,b)=>a<b?a+'|'+b:b+'|'+a;
-const esc=value=>{let x=document.createElement('span');x.textContent=value??'';return x.innerHTML};
-const peerLabel=n=>n.name||n.node_id.slice(0,8);
-const peerSub=n=>n.name?n.node_id.slice(0,8):duration(n.uptime_seconds)+' up';
-function duration(seconds){seconds=Number(seconds)||0;if(seconds<60)return `${Math.round(seconds)}s`;if(seconds<3600)return `${Math.floor(seconds/60)}m`;if(seconds<86400)return `${Math.floor(seconds/3600)}h`;return `${Math.floor(seconds/86400)}d`}
-function toast(text){let x=$('toast');x.textContent=text;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),2500)}
-async function api(path,options={}){options.headers={...(options.headers||{}),'X-Mesh-Token':$('token').value};let r=await fetch(path,options),body=await r.json();if(!r.ok)throw Error(body.error||r.statusText);return body}
-function activeTopology(){return state.topology}
-function setScope(scope){if(!state.topologies[scope])return;state.scope=scope;state.topology=state.topologies[scope];$('topologyScope').value=scope;graphUI.source=null;graphUI.selectedNode=null;graphUI.selectedEdge=null;render()}
-function page(name){document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===name));document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x.dataset.page===name));$('pageTitle').textContent=titles[name][0];$('subtitle').textContent=titles[name][1]}
-document.querySelectorAll('nav button').forEach(x=>x.onclick=()=>page(x.dataset.page));
+const titles = {
+  overview: ['Network overview', 'Health and connectivity at a glance'],
+  peers: ['Peers', 'Inventory, roles and endpoints'],
+  topology: ['Topology', 'Edit routes and roles directly on the graph'],
+  forwards: ['Reverse ports', 'Forward a local source port to another peer’s LAN'],
+  access: ['Setup keys', 'Enroll new devices securely'],
+  events: ['Events', 'Administrative audit trail'],
+  settings: ['Settings', 'Topology policy and device administration']
+};
+const edgeKey = (a, b) => a < b ? a + '|' + b : b + '|' + a;
+const esc = value => {
+  let x = document.createElement('span');
+  x.textContent = value ?? '';
+  return x.innerHTML
+};
+const peerLabel = n => n.name || n.node_id.slice(0, 8);
+const peerSub = n => n.name ? n.node_id.slice(0, 8) : duration(n.uptime_seconds) + ' up';
 
-function layout(force=false){
-  let nodes=state.topology.nodes||[],cx=550,cy=300,R=Math.min(225,95+nodes.length*13);
-  nodes.forEach((n,i)=>{
-    if(force||!graphUI.positions[n.node_id]){
-      let a=i*Math.PI*2/Math.max(1,nodes.length)-Math.PI/2;
-      graphUI.positions[n.node_id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)};
+function duration(seconds) {
+  seconds = Number(seconds) || 0;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds/60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds/3600)}h`;
+  return `${Math.floor(seconds/86400)}d`
+}
+
+function toast(text) {
+  let x = $('toast');
+  x.textContent = text;
+  x.classList.add('show');
+  setTimeout(() => x.classList.remove('show'), 2500)
+}
+async function api(path, options = {}) {
+  options.headers = {
+    ...(options.headers || {}),
+    'X-Mesh-Token': $('token').value
+  };
+  let r = await fetch(path, options),
+    body = await r.json();
+  if (!r.ok) throw Error(body.error || r.statusText);
+  return body
+}
+
+function activeTopology() {
+  return state.topology
+}
+
+function setScope(scope) {
+  if (!state.topologies[scope]) return;
+  state.scope = scope;
+  state.topology = state.topologies[scope];
+  $('topologyScope').value = scope;
+  graphUI.source = null;
+  graphUI.selectedNode = null;
+  graphUI.selectedEdge = null;
+  render()
+}
+
+function page(name) {
+  document.querySelectorAll('.page').forEach(x => x.classList.toggle('active', x.id === name));
+  document.querySelectorAll('nav button').forEach(x => x.classList.toggle('active', x.dataset.page === name));
+  $('pageTitle').textContent = titles[name][0];
+  $('subtitle').textContent = titles[name][1]
+}
+document.querySelectorAll('nav button').forEach(x => x.onclick = () => page(x.dataset.page));
+
+function layout(force = false) {
+  let nodes = state.topology.nodes || [],
+    cx = 550,
+    cy = 300,
+    R = Math.min(225, 95 + nodes.length * 13);
+  nodes.forEach((n, i) => {
+    if (force || !graphUI.positions[n.node_id]) {
+      let a = i * Math.PI * 2 / Math.max(1, nodes.length) - Math.PI / 2;
+      graphUI.positions[n.node_id] = {
+        x: cx + R * Math.cos(a),
+        y: cy + R * Math.sin(a)
+      };
     }
   });
 }
-function overviewGraph(){let svg=$('overviewGraph'),nodes=state.topology.nodes||[],links=state.topology.links||[],p={},cx=500,cy=260,R=Math.min(205,80+nodes.length*12);nodes.forEach((n,i)=>{let a=i*Math.PI*2/Math.max(1,nodes.length)-Math.PI/2;p[n.node_id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)}});svg.innerHTML=links.map(e=>{let a=p[e.a],b=p[e.b];return a&&b?`<line class="edge ${e.status||'unknown'}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>`:''}).join('')+nodes.map(n=>{let q=p[n.node_id];return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text></g>`}).join('');svg.querySelectorAll('[data-peer]').forEach(g=>g.onclick=()=>{page('topology');selectNode(g.dataset.peer)})}
-function drawInteractive(){layout();let svg=$('topologyGraph'),nodes=state.topology.nodes||[],links=state.topology.links||[],manual=new Map((state.manualLinks||[]).map(e=>[edgeKey(e.a,e.b),e]));svg.innerHTML=links.map(e=>{let a=graphUI.positions[e.a],b=graphUI.positions[e.b],key=edgeKey(e.a,e.b);if(!a||!b)return'';let m=manual.get(key),cost=e.cost?`cost ${Number(e.cost).toFixed(2)}`:'cost —',rtt=e.rtt_ms?`ping ${Math.round(e.rtt_ms)} ms`:'ping —',label=`${rtt} · ${cost}`;return `<g class="edgeGroup ${graphUI.selectedEdge===key?'selected':''}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`}).join('')+nodes.map(n=>{let q=graphUI.positions[n.node_id],classes=['peerGroup'];if(graphUI.selectedNode===n.node_id)classes.push('selected');if(graphUI.source===n.node_id)classes.push('linkSource');let ring=n.nat_type==='symmetric'?'<circle class="sym" r="26"/>':'';return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="58">${esc(peerSub(n))}</text></g>`}).join('');svg.querySelectorAll('[data-edge]').forEach(g=>g.onclick=e=>{e.stopPropagation();selectEdge(g.dataset.edge)});svg.querySelectorAll('[data-peer]').forEach(bindPeerDrag);svg.onclick=()=>cancelSelection();updateMode()}
-function svgPoint(svg,e){let p=new DOMPoint(e.clientX,e.clientY);return p.matrixTransform(svg.getScreenCTM().inverse())}
-function bindPeerDrag(g){let start,last,moved=false,svg=$('topologyGraph');g.onclick=e=>e.stopPropagation();g.onpointerdown=e=>{e.stopPropagation();start=last=svgPoint(svg,e);moved=false;g.setPointerCapture(e.pointerId);g.classList.add('dragging')};g.onpointermove=e=>{if(!start)return;last=svgPoint(svg,e);let dx=last.x-start.x,dy=last.y-start.y;if(Math.hypot(dx,dy)>4)moved=true;let q=graphUI.positions[g.dataset.peer];g.setAttribute('transform',`translate(${q.x+dx} ${q.y+dy})`)};g.onpointerup=e=>{if(!start)return;g.classList.remove('dragging');if(moved){let q=graphUI.positions[g.dataset.peer];q.x=Math.max(30,Math.min(1070,q.x+last.x-start.x));q.y=Math.max(30,Math.min(570,q.y+last.y-start.y));saveGraphPositions();drawInteractive()}else selectNode(g.dataset.peer);start=null}}
-function updateMode(){let x=$('graphMode');if(graphUI.source){x.textContent=`Select a second peer to connect with ${graphUI.source.slice(0,8)}`;x.classList.add('active')}else{x.textContent=state.manualLinks.length?'Manual backbone + automatic client attachments · click a peer to start':'Automatic topology · click a peer to start';x.classList.remove('active')}}
-function cancelSelection(redraw=true){graphUI.source=null;graphUI.selectedNode=null;graphUI.selectedEdge=null;$('nodeDetail').textContent='Select a peer or link to edit it directly.';if(redraw)drawInteractive();else updateMode()}
-function selectNode(id){let node=(state.topology.nodes||[]).find(n=>n.node_id===id);if(!node)return;if(graphUI.source&&graphUI.source!==id){addDirectEdge(graphUI.source,id);return}graphUI.source=id;graphUI.selectedNode=id;graphUI.selectedEdge=null;drawInteractive();renderNodeInspector(node)}
-function renderNodeInspector(n){let box=$('nodeDetail'),routes=n.routes||[],records=n.dns_records||[];box.innerHTML=`<b>${esc(n.node_id.slice(0,12))}</b><span>${esc(n.mesh_ip)} · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><button id="directRemove" class="dangerButton">Remove peer</button>`;$('directRole').value=n.requested_role||'auto';$('directRoleSave').onclick=()=>setRole(n.node_id,$('directRole').value);$('directNetworkSave').onclick=()=>setNetwork(n.node_id);$('directRoutesClear').onclick=()=>clearNetwork(n.node_id);$('directRouteAddButton').onclick=()=>addRoute(n.node_id);$('directRouteList').querySelectorAll('[data-remove-route]').forEach(b=>b.onclick=()=>removeRoute(n.node_id,b.dataset.removeRoute));$('directRemove').onclick=()=>removePeer(n.node_id)}
-function selectEdge(key){graphUI.source=null;graphUI.selectedNode=null;graphUI.selectedEdge=key;drawInteractive();let live=(state.topology.links||[]).find(e=>edgeKey(e.a,e.b)===key),manual=(state.manualLinks||[]).find(e=>edgeKey(e.a,e.b)===key);if(!live)return;let box=$('nodeDetail');box.innerHTML=`<b>${esc(live.a.slice(0,8))} ↔ ${esc(live.b.slice(0,8))}</b><span>${live.rtt_ms?Math.round(live.rtt_ms)+' ms':'No RTT'} · ${esc(live.status||'unknown')}</span><span class="spacer"></span><label>Route cost <input id="directCost" type="number" min="0.1" max="1000" step="0.1" value="${manual?.cost||live.cost||1}"></label><button id="directCostSave">Save cost</button><button id="directEdgeRemove" class="dangerButton">Remove link</button>`;$('directCostSave').onclick=()=>saveDirectEdge(live.a,live.b,Number($('directCost').value));$('directEdgeRemove').onclick=()=>removeDirectEdge(key)}
-function seedManual(){if(state.manualLinks.length)return;state.manualLinks=(state.topology.links||[]).map(e=>({a:e.a,b:e.b,cost:Number(e.cost)>0?Number(e.cost):1}))}
-async function publishEdges(message){await api('/v1/admin/graph',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({links:state.manualLinks})});toast(message|| (state.manualLinks.length?'Manual topology published':'Automatic topology restored'));await load()}
-async function addDirectEdge(a,b){let cost=Number($('quickCost').value);if(!(cost>0&&cost<=1000))return toast('Cost must be between 0.1 and 1000');try{seedManual();let key=edgeKey(a,b),e=state.manualLinks.find(x=>edgeKey(x.a,x.b)===key);if(e)e.cost=cost;else state.manualLinks.push({a,b,cost});cancelSelection();await publishEdges('Link saved and pushed')}catch(e){toast(e.message)}}
-async function saveDirectEdge(a,b,cost){if(!(cost>0&&cost<=1000))return toast('Cost must be between 0.1 and 1000');try{seedManual();let key=edgeKey(a,b),e=state.manualLinks.find(x=>edgeKey(x.a,x.b)===key);if(e)e.cost=cost;else state.manualLinks.push({a,b,cost});await publishEdges('Link cost updated')}catch(e){toast(e.message)}}
-async function removeDirectEdge(key){try{seedManual();state.manualLinks=state.manualLinks.filter(e=>edgeKey(e.a,e.b)!==key);cancelSelection();await publishEdges('Link removed and topology pushed')}catch(e){toast(e.message)}}
-async function setRole(id,role){try{await api('/v1/admin/nodes/'+encodeURIComponent(id)+'/role',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({role})});toast('Role applied and topology pushed');await load()}catch(e){toast(e.message)}}
-async function setNetwork(id){try{let routes=$('directRoutes').value.split(',').map(x=>x.trim()).filter(Boolean),dns_records=$('directDNSRecords').value.split(/\n+/).map(x=>x.trim()).filter(Boolean).map(x=>{let at=x.indexOf('=');if(at<1)throw Error('Use name=IP for every LAN object');return{name:x.slice(0,at).trim(),ip:x.slice(at+1).trim()}});await api('/v1/admin/nodes/'+encodeURIComponent(id)+'/network',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('directName').value.trim(),routes,dns_records})});graphUI.source=null;toast('Virtual addresses and DNS names pushed');await load();drawInteractive()}catch(e){toast(e.message)}}
-async function clearNetwork(id){if(!confirm('Revoke all advertised subnets and LAN DNS records?'))return;try{await api('/v1/admin/nodes/'+encodeURIComponent(id)+'/network',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:$('directName').value.trim(),routes:[],dns_records:[]})});toast('All advertised subnets revoked');await load();drawInteractive()}catch(e){toast(e.message)}}
-async function addRoute(id){let route=$('directRouteAdd').value.trim();if(!route)return;try{await api('/v1/admin/nodes/'+encodeURIComponent(id)+'/network/routes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({route})});toast('Subnet added');await load();drawInteractive()}catch(e){toast(e.message)}}
-async function removeRoute(id,route){if(!confirm(`Revoke subnet ${route}?`))return;try{await api('/v1/admin/nodes/'+encodeURIComponent(id)+'/network/routes',{method:'DELETE',headers:{'Content-Type':'application/json'},body:JSON.stringify({route})});toast('Subnet revoked');await load();drawInteractive()}catch(e){toast(e.message)}}
-async function removePeer(id){if(!confirm(`Remove peer ${id.slice(0,12)}?`))return;try{await api('/v1/admin/nodes/'+encodeURIComponent(id),{method:'DELETE'});delete graphUI.positions[id];saveGraphPositions();cancelSelection();toast('Peer removed');await load()}catch(e){toast(e.message)}}
 
-function render(){let t=state.topology,n=t.nodes||[],links=t.links||[],rtts=links.filter(x=>x.rtt_ms).map(x=>x.rtt_ms),up=links.filter(x=>x.status==='up').length;$('nodesN').textContent=n.length;$('superN').textContent=n.filter(x=>x.role==='superpeer').length;$('upN').textContent=up;$('rttN').textContent=rtts.length?Math.round(rtts.reduce((a,b)=>a+b,0)/rtts.length)+' ms':'—';$('healthPct').textContent=(links.length?Math.round(up*100/links.length):0)+'% available';$('peerBadge').textContent=n.length;overviewGraph();drawInteractive();$('healthList').innerHTML=links.slice(0,8).map(x=>`<p><span class="statusDot" style="background:${x.status==='up'?'#22c55e':'#ef4444'}"></span> ${esc(x.a.slice(0,6))} → ${esc(x.b.slice(0,6))} <b>${x.rtt_ms?Math.round(x.rtt_ms)+'ms':esc(x.status)}</b></p>`).join('')||'<p class="muted">No links yet</p>';$('eventPreview').innerHTML=state.audit.slice(0,5).map(x=>`<p><b>${esc(x.event)}</b><br><span class="muted">${new Date(x.created_at*1000).toLocaleString()}</span></p>`).join('');renderPeers();renderEditor();$('auditRows').innerHTML=state.audit.map(x=>`<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('')||'<tr><td colspan="3" class="muted">No events recorded yet.</td></tr>';$('inviteRows').innerHTML=state.invites.map(x=>`<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('')||'<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';for(let k in state.config){let f=$('settingsForm').elements[k];if(f)f.value=state.config[k]}$('removePeer').innerHTML=n.map(x=>`<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join('')}
-function renderPeers(){let q=$('peerSearch').value.toLowerCase(),role=$('roleFilter').value,nat=$('natFilter').value,n=(state.topology.nodes||[]).filter(x=>(!role||x.role===role)&&(!nat||x.nat_type===nat)&&(!q||JSON.stringify(x).toLowerCase().includes(q)));$('peerRows').innerHTML=n.map(x=>`<tr><td><span class="statusDot"></span> online</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`).join('');$('peerRows').querySelectorAll('[data-inspect]').forEach(b=>b.onclick=()=>{page('topology');selectNode(b.dataset.inspect)})}
-function renderEditor(){let n=state.topology.nodes||[],options=n.map(x=>`<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,10))} · ${esc(x.mesh_ip)}</option>`).join('');for(let id of ['edgeA','edgeB','rolePeer'])$(id).innerHTML=options;let telemetry=new Map((state.topology.links||[]).map(x=>[edgeKey(x.a,x.b),x]));$('edgeRows').innerHTML=(state.manualLinks||[]).map((x,i)=>{let live=telemetry.get(edgeKey(x.a,x.b));return `<tr><td>${esc(x.a.slice(0,10))}</td><td>${esc(x.b.slice(0,10))}</td><td>${x.cost}</td><td>${live?.rtt_ms?Math.round(live.rtt_ms)+' ms':'—'}</td><td><button class="ghost" data-delete-edge="${i}">Remove</button></td></tr>`}).join('')||'<tr><td colspan="5" class="muted">Automatic topology is active.</td></tr>';$('edgeRows').querySelectorAll('[data-delete-edge]').forEach(b=>b.onclick=()=>deleteEdge(Number(b.dataset.deleteEdge)))}
-async function load(){try{let [config,topology,audit,invites,graphData]=await Promise.all([api('/v1/admin/config'),api('/v1/admin/topology'),api('/v1/admin/audit'),api('/v1/admin/invites'),api('/v1/admin/graph')]);state={config,topology,audit:audit||[],invites:invites||[],manualLinks:graphData.links||[]};$('liveDot').classList.add('live');$('liveText').textContent='Live · '+new Date().toLocaleTimeString();render()}catch(e){$('liveDot').classList.remove('live');$('liveText').textContent='Disconnected';toast(e.message)}}
-async function deleteEdge(i){try{state.manualLinks.splice(i,1);await publishEdges('Link removed')}catch(e){toast(e.message)}}
-$('connect').onclick=()=>{sessionStorage.setItem('meshToken',$('token').value);load();clearInterval(timer);timer=setInterval(load,10000)};$('refresh').onclick=load;$('peerSearch').oninput=renderPeers;$('roleFilter').onchange=renderPeers;$('natFilter').onchange=renderPeers;$('fitGraph').onclick=()=>{layout(true);saveGraphPositions();drawInteractive()};$('cancelGraph').onclick=()=>cancelSelection();
-$('settingsForm').onsubmit=async e=>{e.preventDefault();try{let body={};for(let x of new FormData(e.target))body[x[0]]=Number(x[1]);await api('/v1/admin/config',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Policy saved and pushed');load()}catch(x){toast(x.message)}};
-$('addEdge').onclick=()=>{$('quickCost').value=$('edgeCost').value;addDirectEdge($('edgeA').value,$('edgeB').value)};$('edgeCost').oninput=()=>$('quickCost').value=$('edgeCost').value;$('autoGraph').onclick=async()=>{if(confirm('Discard manual links and restore automatic topology?')){try{state.manualLinks=[];cancelSelection();await publishEdges('Automatic topology restored')}catch(e){toast(e.message)}}};
-$('createInvite').onclick=async()=>{try{let x=await api('/v1/admin/invites',{method:'POST'});$('newInvite').textContent=x.invite_token;toast('Setup key created');load()}catch(e){toast(e.message)}};$('loadGraph').onclick=async()=>{try{let x=await api('/v1/admin/graph');$('graphText').value=(x.links||[]).map(e=>`${e.a} ${e.b} ${e.cost}`).join('\n')}catch(e){toast(e.message)}};$('saveGraph').onclick=async()=>{try{let text=$('graphText').value.trim();state.manualLinks=text?text.split(/\n+/).map(x=>{let p=x.trim().split(/\s+/);return{a:p[0],b:p[1],cost:Number(p[2])}}):[];await publishEdges('Raw graph published')}catch(e){toast(e.message)}};$('removeButton').onclick=()=>removePeer($('removePeer').value);
-$('token').value=sessionStorage.getItem('meshToken')||'';
-function renderAllRemoveList(){let n=state.topologies.all?.nodes||state.topology.nodes||[];$('removePeer').innerHTML=n.map(x=>`<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)} · ${x.online===false?'offline':'online'}</option>`).join('')}
-async function loadScopes(){try{let [config,online,all,audit,invites,graphData]=await Promise.all([api('/v1/admin/config'),api('/v1/admin/topology?scope=online'),api('/v1/admin/topology?scope=all'),api('/v1/admin/audit'),api('/v1/admin/invites'),api('/v1/admin/graph')]);state={config,topology:(state.scope==='all'?all:online),topologies:{online,all},scope:state.scope,audit:audit||[],invites:invites||[],manualLinks:graphData.links||[]};$('liveDot').classList.add('live');$('liveText').textContent='Live · '+new Date().toLocaleTimeString();render();renderAllRemoveList()}catch(e){$('liveDot').classList.remove('live');$('liveText').textContent='Disconnected';toast(e.message)}}
-function load(){return loadScopes()}
-$('connect').onclick=()=>{sessionStorage.setItem('meshToken',$('token').value);loadScopes();clearInterval(timer);timer=setInterval(loadScopes,10000)};$('refresh').onclick=loadScopes;$('topologyScope').onchange=e=>{setScope(e.target.value)};
-function renderPeers(){let q=$('peerSearch').value.toLowerCase(),role=$('roleFilter').value,nat=$('natFilter').value,n=(state.topology.nodes||[]).filter(x=>(!role||x.role===role)&&(!nat||x.nat_type===nat)&&(!q||JSON.stringify(x).toLowerCase().includes(q)));$('peerRows').innerHTML=n.map(x=>{let online=x.online!==false;return `<tr><td><span class="statusDot ${online?'online':'offline'}"></span> ${online?'online':'offline'}</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`}).join('');$('peerRows').querySelectorAll('[data-inspect]').forEach(b=>b.onclick=()=>{page('topology');selectNode(b.dataset.inspect)})}
-if($('token').value)$('connect').click();
+function overviewGraph() {
+  let svg = $('overviewGraph'),
+    nodes = state.topology.nodes || [],
+    links = state.topology.links || [],
+    p = {},
+    cx = 500,
+    cy = 260,
+    R = Math.min(205, 80 + nodes.length * 12);
+  nodes.forEach((n, i) => {
+    let a = i * Math.PI * 2 / Math.max(1, nodes.length) - Math.PI / 2;
+    p[n.node_id] = {
+      x: cx + R * Math.cos(a),
+      y: cy + R * Math.sin(a)
+    }
+  });
+  svg.innerHTML = links.map(e => {
+    let a = p[e.a],
+      b = p[e.b];
+    return a && b ? `<line class="edge ${e.status||'unknown'}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>` : ''
+  }).join('') + nodes.map(n => {
+    let q = p[n.node_id];
+    return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text></g>`
+  }).join('');
+  svg.querySelectorAll('[data-peer]').forEach(g => g.onclick = () => {
+    page('topology');
+    selectNode(g.dataset.peer)
+  })
+}
 
-function cookieValue(name){let prefix=name+'=';return document.cookie.split(';').map(x=>x.trim()).find(x=>x.startsWith(prefix))?.slice(prefix.length)||''}
-function sessionCredential(){let token=cookieValue('mesh_csrf');if(token)$('token').value=token;return token}
-async function authJSON(path,options={}){options.credentials='same-origin';options.headers={...(options.headers||{}),'Content-Type':'application/json'};let r=await fetch(path,options),body=await r.json();if(!r.ok)throw Error(body.error||r.statusText);return body}
-function accountError(e){toast(e.message||String(e))}
-async function accountLogin(){try{let u=$('accountUsername').value.trim().toLowerCase(),p=$('accountPassword').value;if(!u||!p)throw Error('Enter account and password');await authJSON('/v1/auth/login',{method:'POST',body:JSON.stringify({username:u,password:p})});sessionCredential();$('accountLogin').hidden=true;$('accountRegister').hidden=true;$('accountLogout').hidden=false;$('accountPassword').value='';$('accountRegistrationInvite').value='';toast('Signed in');await loadScopes()}catch(e){accountError(e)}}
-async function accountRegister(){try{let u=$('accountUsername').value.trim().toLowerCase(),p=$('accountPassword').value,invite=$('accountRegistrationInvite').value.trim();if(!u||!p)throw Error('Enter account and password');let created=await authJSON('/v1/auth/register',{method:'POST',body:JSON.stringify({username:u,password:p,invite_token:invite})});if(created.network_token)$('accountNetworkToken').textContent=created.network_token;toast('Account created; copy the network token and sign in');}catch(e){accountError(e)}}
-async function accountLogout(){try{await authJSON('/v1/auth/logout',{method:'POST',headers:{'X-CSRF-Token':sessionCredential()}})}catch(e){}sessionStorage.removeItem('meshToken');location.reload()}
-function renderAccountInvites(items){let body=$('accountInviteRows');if(!body)return;body.innerHTML=(items||[]).map(x=>`<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${new Date(x.expires_at*1000).toLocaleString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('')||'<tr><td colspan="3" class="muted">No account invitations.</td></tr>'}
-async function loadAccountInvites(){let items=await api('/v1/admin/account-invites');renderAccountInvites(items)}
-const meshLoadScopes=loadScopes;
-loadScopes=async function(){await meshLoadScopes();try{await loadAccountInvites()}catch(e){}}
-$('accountLogin').onclick=accountLogin;
-$('accountRegister').onclick=accountRegister;
-$('accountLogout').onclick=accountLogout;
-$('rotateAccountToken').onclick=async()=>{if(!confirm('Rotate the network token? All devices using the current token will lose access and must be updated.'))return;let button=$('rotateAccountToken');button.disabled=true;try{let x=await authJSON('/v1/auth/token/rotate',{method:'POST',headers:{'X-CSRF-Token':sessionCredential()}});$('accountNetworkToken').textContent=x.network_token;toast('Network token rotated; reconnect your devices with the new token')}catch(e){accountError(e)}finally{button.disabled=false}};
-$('createAccountInvite').onclick=async()=>{try{let x=await api('/v1/admin/account-invites',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});$('newAccountInvite').textContent=x.invite_token;toast('Account invitation created; copy it now');await loadAccountInvites()}catch(e){accountError(e)}};
-(async()=>{try{let me=await authJSON('/v1/auth/me');if(me.authenticated&&me.auth_type!=='network_token'){sessionCredential();$('accountLogin').hidden=true;$('accountRegister').hidden=true;$('accountLogout').hidden=false;await loadScopes()}}catch(e){}})();
+function drawInteractive() {
+  layout();
+  let svg = $('topologyGraph'),
+    nodes = state.topology.nodes || [],
+    links = state.topology.links || [],
+    manual = new Map((state.manualLinks || []).map(e => [edgeKey(e.a, e.b), e]));
+  svg.innerHTML = links.map(e => {
+    let a = graphUI.positions[e.a],
+      b = graphUI.positions[e.b],
+      key = edgeKey(e.a, e.b);
+    if (!a || !b) return '';
+    let m = manual.get(key),
+      cost = e.cost ? `cost ${Number(e.cost).toFixed(2)}` : 'cost —',
+      rtt = e.rtt_ms ? `ping ${Math.round(e.rtt_ms)} ms` : 'ping —',
+      label = `${rtt} · ${cost}`;
+    return `<g class="edgeGroup ${graphUI.selectedEdge===key?'selected':''}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
+  }).join('') + nodes.map(n => {
+    let q = graphUI.positions[n.node_id],
+      classes = ['peerGroup'];
+    if (graphUI.selectedNode === n.node_id) classes.push('selected');
+    if (graphUI.source === n.node_id) classes.push('linkSource');
+    let ring = n.nat_type === 'symmetric' ? '<circle class="sym" r="26"/>' : '';
+    return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="58">${esc(peerSub(n))}</text></g>`
+  }).join('');
+  svg.querySelectorAll('[data-edge]').forEach(g => g.onclick = e => {
+    e.stopPropagation();
+    selectEdge(g.dataset.edge)
+  });
+  svg.querySelectorAll('[data-peer]').forEach(bindPeerDrag);
+  svg.onclick = () => cancelSelection();
+  updateMode()
+}
+
+function svgPoint(svg, e) {
+  let p = new DOMPoint(e.clientX, e.clientY);
+  return p.matrixTransform(svg.getScreenCTM().inverse())
+}
+
+function bindPeerDrag(g) {
+  let start, last, moved = false,
+    svg = $('topologyGraph');
+  g.onclick = e => e.stopPropagation();
+  g.onpointerdown = e => {
+    e.stopPropagation();
+    start = last = svgPoint(svg, e);
+    moved = false;
+    g.setPointerCapture(e.pointerId);
+    g.classList.add('dragging')
+  };
+  g.onpointermove = e => {
+    if (!start) return;
+    last = svgPoint(svg, e);
+    let dx = last.x - start.x,
+      dy = last.y - start.y;
+    if (Math.hypot(dx, dy) > 4) moved = true;
+    let q = graphUI.positions[g.dataset.peer];
+    g.setAttribute('transform', `translate(${q.x+dx} ${q.y+dy})`)
+  };
+  g.onpointerup = e => {
+    if (!start) return;
+    g.classList.remove('dragging');
+    if (moved) {
+      let q = graphUI.positions[g.dataset.peer];
+      q.x = Math.max(30, Math.min(1070, q.x + last.x - start.x));
+      q.y = Math.max(30, Math.min(570, q.y + last.y - start.y));
+      saveGraphPositions();
+      drawInteractive()
+    } else selectNode(g.dataset.peer);
+    start = null
+  }
+}
+
+function updateMode() {
+  let x = $('graphMode');
+  if (graphUI.source) {
+    x.textContent = `Select a second peer to connect with ${graphUI.source.slice(0,8)}`;
+    x.classList.add('active')
+  } else {
+    x.textContent = state.manualLinks.length ? 'Manual backbone + automatic client attachments · click a peer to start' : 'Automatic topology · click a peer to start';
+    x.classList.remove('active')
+  }
+}
+
+function cancelSelection(redraw = true) {
+  graphUI.source = null;
+  graphUI.selectedNode = null;
+  graphUI.selectedEdge = null;
+  $('nodeDetail').textContent = 'Select a peer or link to edit it directly.';
+  if (redraw) drawInteractive();
+  else updateMode()
+}
+
+function selectNode(id) {
+  let node = (state.topology.nodes || []).find(n => n.node_id === id);
+  if (!node) return;
+  if (graphUI.source && graphUI.source !== id) {
+    addDirectEdge(graphUI.source, id);
+    return
+  }
+  graphUI.source = id;
+  graphUI.selectedNode = id;
+  graphUI.selectedEdge = null;
+  drawInteractive();
+  renderNodeInspector(node)
+}
+
+function renderNodeInspector(n) {
+  let box = $('nodeDetail'),
+    routes = n.routes || [],
+    records = n.dns_records || [];
+  box.innerHTML = `<b>${esc(n.node_id.slice(0,12))}</b><span>${esc(n.mesh_ip)} · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><button id="directRemove" class="dangerButton">Remove peer</button>`;
+  $('directRole').value = n.requested_role || 'auto';
+  $('directRoleSave').onclick = () => setRole(n.node_id, $('directRole').value);
+  $('directNetworkSave').onclick = () => setNetwork(n.node_id);
+  $('directRoutesClear').onclick = () => clearNetwork(n.node_id);
+  $('directRouteAddButton').onclick = () => addRoute(n.node_id);
+  $('directRouteList').querySelectorAll('[data-remove-route]').forEach(b => b.onclick = () => removeRoute(n.node_id, b.dataset.removeRoute));
+  $('directRemove').onclick = () => removePeer(n.node_id)
+}
+
+function selectEdge(key) {
+  graphUI.source = null;
+  graphUI.selectedNode = null;
+  graphUI.selectedEdge = key;
+  drawInteractive();
+  let live = (state.topology.links || []).find(e => edgeKey(e.a, e.b) === key),
+    manual = (state.manualLinks || []).find(e => edgeKey(e.a, e.b) === key);
+  if (!live) return;
+  let box = $('nodeDetail');
+  box.innerHTML = `<b>${esc(live.a.slice(0,8))} ↔ ${esc(live.b.slice(0,8))}</b><span>${live.rtt_ms?Math.round(live.rtt_ms)+' ms':'No RTT'} · ${esc(live.status||'unknown')}</span><span class="spacer"></span><label>Route cost <input id="directCost" type="number" min="0.1" max="1000" step="0.1" value="${manual?.cost||live.cost||1}"></label><button id="directCostSave">Save cost</button><button id="directEdgeRemove" class="dangerButton">Remove link</button>`;
+  $('directCostSave').onclick = () => saveDirectEdge(live.a, live.b, Number($('directCost').value));
+  $('directEdgeRemove').onclick = () => removeDirectEdge(key)
+}
+
+function seedManual() {
+  if (state.manualLinks.length) return;
+  state.manualLinks = (state.topology.links || []).map(e => ({
+    a: e.a,
+    b: e.b,
+    cost: Number(e.cost) > 0 ? Number(e.cost) : 1
+  }))
+}
+async function publishEdges(message) {
+  await api('/v1/admin/graph', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      links: state.manualLinks
+    })
+  });
+  toast(message || (state.manualLinks.length ? 'Manual topology published' : 'Automatic topology restored'));
+  await load()
+}
+async function addDirectEdge(a, b) {
+  let cost = Number($('quickCost').value);
+  if (!(cost > 0 && cost <= 1000)) return toast('Cost must be between 0.1 and 1000');
+  try {
+    seedManual();
+    let key = edgeKey(a, b),
+      e = state.manualLinks.find(x => edgeKey(x.a, x.b) === key);
+    if (e) e.cost = cost;
+    else state.manualLinks.push({
+      a,
+      b,
+      cost
+    });
+    cancelSelection();
+    await publishEdges('Link saved and pushed')
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function saveDirectEdge(a, b, cost) {
+  if (!(cost > 0 && cost <= 1000)) return toast('Cost must be between 0.1 and 1000');
+  try {
+    seedManual();
+    let key = edgeKey(a, b),
+      e = state.manualLinks.find(x => edgeKey(x.a, x.b) === key);
+    if (e) e.cost = cost;
+    else state.manualLinks.push({
+      a,
+      b,
+      cost
+    });
+    await publishEdges('Link cost updated')
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function removeDirectEdge(key) {
+  try {
+    seedManual();
+    state.manualLinks = state.manualLinks.filter(e => edgeKey(e.a, e.b) !== key);
+    cancelSelection();
+    await publishEdges('Link removed and topology pushed')
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function setRole(id, role) {
+  try {
+    await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/role', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        role
+      })
+    });
+    toast('Role applied and topology pushed');
+    await load()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function setNetwork(id) {
+  try {
+    let routes = $('directRoutes').value.split(',').map(x => x.trim()).filter(Boolean),
+      dns_records = $('directDNSRecords').value.split(/\n+/).map(x => x.trim()).filter(Boolean).map(x => {
+        let at = x.indexOf('=');
+        if (at < 1) throw Error('Use name=IP for every LAN object');
+        return {
+          name: x.slice(0, at).trim(),
+          ip: x.slice(at + 1).trim()
+        }
+      });
+    await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: $('directName').value.trim(),
+        routes,
+        dns_records
+      })
+    });
+    graphUI.source = null;
+    toast('Virtual addresses and DNS names pushed');
+    await load();
+    drawInteractive()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function clearNetwork(id) {
+  if (!confirm('Revoke all advertised subnets and LAN DNS records?')) return;
+  try {
+    await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: $('directName').value.trim(),
+        routes: [],
+        dns_records: []
+      })
+    });
+    toast('All advertised subnets revoked');
+    await load();
+    drawInteractive()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function addRoute(id) {
+  let route = $('directRouteAdd').value.trim();
+  if (!route) return;
+  try {
+    await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network/routes', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        route
+      })
+    });
+    toast('Subnet added');
+    await load();
+    drawInteractive()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function removeRoute(id, route) {
+  if (!confirm(`Revoke subnet ${route}?`)) return;
+  try {
+    await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network/routes', {
+      method: 'DELETE',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        route
+      })
+    });
+    toast('Subnet revoked');
+    await load();
+    drawInteractive()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+async function removePeer(id) {
+  if (!confirm(`Remove peer ${id.slice(0,12)}?`)) return;
+  try {
+    await api('/v1/admin/nodes/' + encodeURIComponent(id), {
+      method: 'DELETE'
+    });
+    delete graphUI.positions[id];
+    saveGraphPositions();
+    cancelSelection();
+    toast('Peer removed');
+    await load()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+function render() {
+  let t = state.topology,
+    n = t.nodes || [],
+    links = t.links || [],
+    rtts = links.filter(x => x.rtt_ms).map(x => x.rtt_ms),
+    up = links.filter(x => x.status === 'up').length;
+  $('nodesN').textContent = n.length;
+  $('superN').textContent = n.filter(x => x.role === 'superpeer').length;
+  $('upN').textContent = up;
+  $('rttN').textContent = rtts.length ? Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length) + ' ms' : '—';
+  $('healthPct').textContent = (links.length ? Math.round(up * 100 / links.length) : 0) + '% available';
+  $('peerBadge').textContent = n.length;
+  overviewGraph();
+  drawInteractive();
+  $('healthList').innerHTML = links.slice(0, 8).map(x => `<p><span class="statusDot" style="background:${x.status==='up'?'#22c55e':'#ef4444'}"></span> ${esc(x.a.slice(0,6))} → ${esc(x.b.slice(0,6))} <b>${x.rtt_ms?Math.round(x.rtt_ms)+'ms':esc(x.status)}</b></p>`).join('') || '<p class="muted">No links yet</p>';
+  $('eventPreview').innerHTML = state.audit.slice(0, 5).map(x => `<p><b>${esc(x.event)}</b><br><span class="muted">${new Date(x.created_at*1000).toLocaleString()}</span></p>`).join('');
+  renderPeers();
+  renderEditor();
+  $('auditRows').innerHTML = state.audit.map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">No events recorded yet.</td></tr>';
+  $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
+  for (let k in state.config) {
+    let f = $('settingsForm').elements[k];
+    if (f) f.value = state.config[k]
+  }
+  $('removePeer').innerHTML = n.map(x => `<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join('')
+}
+
+function renderPeers() {
+  let q = $('peerSearch').value.toLowerCase(),
+    role = $('roleFilter').value,
+    nat = $('natFilter').value,
+    n = (state.topology.nodes || []).filter(x => (!role || x.role === role) && (!nat || x.nat_type === nat) && (!q || JSON.stringify(x).toLowerCase().includes(q)));
+  $('peerRows').innerHTML = n.map(x => `<tr><td><span class="statusDot"></span> online</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`).join('');
+  $('peerRows').querySelectorAll('[data-inspect]').forEach(b => b.onclick = () => {
+    page('topology');
+    selectNode(b.dataset.inspect)
+  })
+}
+
+function renderEditor() {
+  let n = state.topology.nodes || [],
+    options = n.map(x => `<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,10))} · ${esc(x.mesh_ip)}</option>`).join('');
+  for (let id of ['edgeA', 'edgeB', 'rolePeer']) $(id).innerHTML = options;
+  let telemetry = new Map((state.topology.links || []).map(x => [edgeKey(x.a, x.b), x]));
+  $('edgeRows').innerHTML = (state.manualLinks || []).map((x, i) => {
+    let live = telemetry.get(edgeKey(x.a, x.b));
+    return `<tr><td>${esc(x.a.slice(0,10))}</td><td>${esc(x.b.slice(0,10))}</td><td>${x.cost}</td><td>${live?.rtt_ms?Math.round(live.rtt_ms)+' ms':'—'}</td><td><button class="ghost" data-delete-edge="${i}">Remove</button></td></tr>`
+  }).join('') || '<tr><td colspan="5" class="muted">Automatic topology is active.</td></tr>';
+  $('edgeRows').querySelectorAll('[data-delete-edge]').forEach(b => b.onclick = () => deleteEdge(Number(b.dataset.deleteEdge)))
+}
+async function load() {
+  try {
+    let [config, topology, audit, invites, graphData] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph')]);
+    state = {
+      config,
+      topology,
+      audit: audit || [],
+      invites: invites || [],
+      manualLinks: graphData.links || []
+    };
+    $('liveDot').classList.add('live');
+    $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
+    render()
+  } catch (e) {
+    $('liveDot').classList.remove('live');
+    $('liveText').textContent = 'Disconnected';
+    toast(e.message)
+  }
+}
+async function deleteEdge(i) {
+  try {
+    state.manualLinks.splice(i, 1);
+    await publishEdges('Link removed')
+  } catch (e) {
+    toast(e.message)
+  }
+}
+$('connect').onclick = () => {
+  sessionStorage.setItem('meshToken', $('token').value);
+  load();
+  clearInterval(timer);
+  timer = setInterval(load, 10000)
+};
+$('refresh').onclick = load;
+$('peerSearch').oninput = renderPeers;
+$('roleFilter').onchange = renderPeers;
+$('natFilter').onchange = renderPeers;
+$('fitGraph').onclick = () => {
+  layout(true);
+  saveGraphPositions();
+  drawInteractive()
+};
+$('cancelGraph').onclick = () => cancelSelection();
+$('settingsForm').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    let body = {};
+    for (let x of new FormData(e.target)) body[x[0]] = Number(x[1]);
+    await api('/v1/admin/config', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    toast('Policy saved and pushed');
+    load()
+  } catch (x) {
+    toast(x.message)
+  }
+};
+$('addEdge').onclick = () => {
+  $('quickCost').value = $('edgeCost').value;
+  addDirectEdge($('edgeA').value, $('edgeB').value)
+};
+$('edgeCost').oninput = () => $('quickCost').value = $('edgeCost').value;
+$('autoGraph').onclick = async () => {
+  if (confirm('Discard manual links and restore automatic topology?')) {
+    try {
+      state.manualLinks = [];
+      cancelSelection();
+      await publishEdges('Automatic topology restored')
+    } catch (e) {
+      toast(e.message)
+    }
+  }
+};
+$('createInvite').onclick = async () => {
+  try {
+    let x = await api('/v1/admin/invites', {
+      method: 'POST'
+    });
+    $('newInvite').textContent = x.invite_token;
+    toast('Setup key created');
+    load()
+  } catch (e) {
+    toast(e.message)
+  }
+};
+$('loadGraph').onclick = async () => {
+  try {
+    let x = await api('/v1/admin/graph');
+    $('graphText').value = (x.links || []).map(e => `${e.a} ${e.b} ${e.cost}`).join('\n')
+  } catch (e) {
+    toast(e.message)
+  }
+};
+$('saveGraph').onclick = async () => {
+  try {
+    let text = $('graphText').value.trim();
+    state.manualLinks = text ? text.split(/\n+/).map(x => {
+      let p = x.trim().split(/\s+/);
+      return {
+        a: p[0],
+        b: p[1],
+        cost: Number(p[2])
+      }
+    }) : [];
+    await publishEdges('Raw graph published')
+  } catch (e) {
+    toast(e.message)
+  }
+};
+$('removeButton').onclick = () => removePeer($('removePeer').value);
+$('token').value = sessionStorage.getItem('meshToken') || '';
+
+function renderAllRemoveList() {
+  let n = state.topologies.all?.nodes || state.topology.nodes || [];
+  $('removePeer').innerHTML = n.map(x => `<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)} · ${x.online===false?'offline':'online'}</option>`).join('')
+}
+async function loadScopes() {
+  try {
+    let [config, online, all, audit, invites, graphData] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph')]);
+    state = {
+      config,
+      topology: (state.scope === 'all' ? all : online),
+      topologies: {
+        online,
+        all
+      },
+      scope: state.scope,
+      audit: audit || [],
+      invites: invites || [],
+      manualLinks: graphData.links || []
+    };
+    $('liveDot').classList.add('live');
+    $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
+    render();
+    renderAllRemoveList()
+  } catch (e) {
+    $('liveDot').classList.remove('live');
+    $('liveText').textContent = 'Disconnected';
+    toast(e.message)
+  }
+}
+
+function load() {
+  return loadScopes()
+}
+$('connect').onclick = () => {
+  sessionStorage.setItem('meshToken', $('token').value);
+  loadScopes();
+  clearInterval(timer);
+  timer = setInterval(loadScopes, 10000)
+};
+$('refresh').onclick = loadScopes;
+$('topologyScope').onchange = e => {
+  setScope(e.target.value)
+};
+
+function renderPeers() {
+  let q = $('peerSearch').value.toLowerCase(),
+    role = $('roleFilter').value,
+    nat = $('natFilter').value,
+    n = (state.topology.nodes || []).filter(x => (!role || x.role === role) && (!nat || x.nat_type === nat) && (!q || JSON.stringify(x).toLowerCase().includes(q)));
+  $('peerRows').innerHTML = n.map(x => {
+    let online = x.online !== false;
+    return `<tr><td><span class="statusDot ${online?'online':'offline'}"></span> ${online?'online':'offline'}</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`
+  }).join('');
+  $('peerRows').querySelectorAll('[data-inspect]').forEach(b => b.onclick = () => {
+    page('topology');
+    selectNode(b.dataset.inspect)
+  })
+}
+if ($('token').value) $('connect').click();
+
+function cookieValue(name) {
+  let prefix = name + '=';
+  return document.cookie.split(';').map(x => x.trim()).find(x => x.startsWith(prefix))?.slice(prefix.length) || ''
+}
+
+function sessionCredential() {
+  let token = cookieValue('mesh_csrf');
+  if (token) $('token').value = token;
+  return token
+}
+async function authJSON(path, options = {}) {
+  options.credentials = 'same-origin';
+  options.headers = {
+    ...(options.headers || {}),
+    'Content-Type': 'application/json'
+  };
+  let r = await fetch(path, options),
+    body = await r.json();
+  if (!r.ok) throw Error(body.error || r.statusText);
+  return body
+}
+
+function accountError(e) {
+  toast(e.message || String(e))
+}
+async function accountLogin() {
+  try {
+    let u = $('accountUsername').value.trim().toLowerCase(),
+      p = $('accountPassword').value;
+    if (!u || !p) throw Error('Enter account and password');
+    await authJSON('/v1/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: u,
+        password: p
+      })
+    });
+    sessionCredential();
+    $('accountLogin').hidden = true;
+    $('accountRegister').hidden = true;
+    $('accountLogout').hidden = false;
+    $('accountPassword').value = '';
+    $('accountRegistrationInvite').value = '';
+    toast('Signed in');
+    await loadScopes()
+  } catch (e) {
+    accountError(e)
+  }
+}
+async function accountRegister() {
+  try {
+    let u = $('accountUsername').value.trim().toLowerCase(),
+      p = $('accountPassword').value,
+      invite = $('accountRegistrationInvite').value.trim();
+    if (!u || !p) throw Error('Enter account and password');
+    let created = await authJSON('/v1/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({
+        username: u,
+        password: p,
+        invite_token: invite
+      })
+    });
+    if (created.network_token) $('accountNetworkToken').textContent = created.network_token;
+    toast('Account created; copy the network token and sign in');
+  } catch (e) {
+    accountError(e)
+  }
+}
+async function accountLogout() {
+  try {
+    await authJSON('/v1/auth/logout', {
+      method: 'POST',
+      headers: {
+        'X-CSRF-Token': sessionCredential()
+      }
+    })
+  } catch (e) {}
+  sessionStorage.removeItem('meshToken');
+  location.reload()
+}
+
+function renderAccountInvites(items) {
+  let body = $('accountInviteRows');
+  if (!body) return;
+  body.innerHTML = (items || []).map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${new Date(x.expires_at*1000).toLocaleString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No account invitations.</td></tr>'
+}
+async function loadAccountInvites() {
+  let items = await api('/v1/admin/account-invites');
+  renderAccountInvites(items)
+}
+const meshLoadScopes = loadScopes;
+loadScopes = async function() {
+  await meshLoadScopes();
+  try {
+    await loadAccountInvites()
+  } catch (e) {}
+}
+$('accountLogin').onclick = accountLogin;
+$('accountRegister').onclick = accountRegister;
+$('accountLogout').onclick = accountLogout;
+$('rotateAccountToken').onclick = async () => {
+  if (!confirm('Rotate the network token? All devices using the current token will lose access and must be updated.')) return;
+  let button = $('rotateAccountToken');
+  button.disabled = true;
+  try {
+    let x = await authJSON('/v1/auth/token/rotate', {
+      method: 'POST',
+      headers: {
+        'X-CSRF-Token': sessionCredential()
+      }
+    });
+    $('accountNetworkToken').textContent = x.network_token;
+    toast('Network token rotated; reconnect your devices with the new token')
+  } catch (e) {
+    accountError(e)
+  } finally {
+    button.disabled = false
+  }
+};
+$('createAccountInvite').onclick = async () => {
+  try {
+    let x = await api('/v1/admin/account-invites', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: '{}'
+    });
+    $('newAccountInvite').textContent = x.invite_token;
+    toast('Account invitation created; copy it now');
+    await loadAccountInvites()
+  } catch (e) {
+    accountError(e)
+  }
+};
+(async () => {
+  try {
+    let me = await authJSON('/v1/auth/me');
+    if (me.authenticated && me.auth_type !== 'network_token') {
+      sessionCredential();
+      $('accountLogin').hidden = true;
+      $('accountRegister').hidden = true;
+      $('accountLogout').hidden = false;
+      await loadScopes()
+    }
+  } catch (e) {}
+})();
 
 // Reverse port forwarding is deliberately exposed as a separate page because
 // the listener is created on a peer, not on the coordinator.
-(()=>{
-  let nav=document.querySelector('nav'),button=document.createElement('button');
-  button.dataset.page='forwards';button.textContent='Reverse ports';nav.insertBefore(button,nav.querySelector('[data-page="access"]'));
-  button.onclick=()=>page('forwards');
-  function options(){let nodes=(state.topologies?.all?.nodes||state.topology.nodes||[]);let text=nodes.map(n=>`<option value="${esc(n.node_id)}">${esc(n.name||n.node_id.slice(0,12))} · ${esc(n.mesh_ip)}</option>`).join('');$('forwardSource').innerHTML=text;$('forwardTarget').innerHTML=text}
-  async function forwards(){try{let rows=await api('/v1/admin/forwards');options();$('forwardRows').innerHTML=rows.map(f=>`<tr><td>${esc(f.source_node_id.slice(0,12))}</td><td><code>${esc(f.listen_host)}:${f.listen_port}</code></td><td>${esc(f.target_node_id.slice(0,12))} → <code>${esc(f.target_host)}:${f.target_port}</code></td><td><button class="ghost" data-forward-delete="${f.id}">Remove</button></td></tr>`).join('')||'<tr><td colspan="4" class="muted">No reverse ports configured.</td></tr>';$('forwardRows').querySelectorAll('[data-forward-delete]').forEach(b=>b.onclick=async()=>{if(!confirm('Remove this forwarding?'))return;try{await api('/v1/admin/forwards/'+b.dataset.forwardDelete,{method:'DELETE'});toast('Forwarding removed');forwards()}catch(e){toast(e.message)}})}catch(e){}};
-  $('forwardForm').onsubmit=async e=>{e.preventDefault();try{await api('/v1/admin/forwards',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_node_id:$('forwardSource').value,listen_host:$('forwardListenHost').value.trim(),listen_port:Number($('forwardListenPort').value),target_node_id:$('forwardTarget').value,target_host:$('forwardHost').value.trim(),target_port:Number($('forwardTargetPort').value)})});toast('Forwarding created and pushed');e.target.reset();$('forwardListenHost').value='127.0.0.1';await forwards()}catch(x){toast(x.message)}};
-  let original=loadScopes;loadScopes=async()=>{await original();await forwards()};forwards();
+(() => {
+  let nav = document.querySelector('nav'),
+    button = document.createElement('button');
+  button.dataset.page = 'forwards';
+  button.textContent = 'Reverse ports';
+  nav.insertBefore(button, nav.querySelector('[data-page="access"]'));
+  button.onclick = () => page('forwards');
+
+  function options() {
+    let nodes = (state.topologies?.all?.nodes || state.topology.nodes || []);
+    let text = nodes.map(n => `<option value="${esc(n.node_id)}">${esc(n.name||n.node_id.slice(0,12))} · ${esc(n.mesh_ip)}</option>`).join('');
+    $('forwardSource').innerHTML = text;
+    $('forwardTarget').innerHTML = text
+  }
+  async function forwards() {
+    try {
+      let rows = await api('/v1/admin/forwards');
+      options();
+      $('forwardRows').innerHTML = rows.map(f => `<tr><td>${esc(f.source_node_id.slice(0,12))}</td><td><code>${esc(f.listen_host)}:${f.listen_port}</code></td><td>${esc(f.target_node_id.slice(0,12))} → <code>${esc(f.target_host)}:${f.target_port}</code></td><td><button class="ghost" data-forward-delete="${f.id}">Remove</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">No reverse ports configured.</td></tr>';
+      $('forwardRows').querySelectorAll('[data-forward-delete]').forEach(b => b.onclick = async () => {
+        if (!confirm('Remove this forwarding?')) return;
+        try {
+          await api('/v1/admin/forwards/' + b.dataset.forwardDelete, {
+            method: 'DELETE'
+          });
+          toast('Forwarding removed');
+          forwards()
+        } catch (e) {
+          toast(e.message)
+        }
+      })
+    } catch (e) {}
+  };
+  $('forwardForm').onsubmit = async e => {
+    e.preventDefault();
+    try {
+      await api('/v1/admin/forwards', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          source_node_id: $('forwardSource').value,
+          listen_host: $('forwardListenHost').value.trim(),
+          listen_port: Number($('forwardListenPort').value),
+          target_node_id: $('forwardTarget').value,
+          target_host: $('forwardHost').value.trim(),
+          target_port: Number($('forwardTargetPort').value)
+        })
+      });
+      toast('Forwarding created and pushed');
+      e.target.reset();
+      $('forwardListenHost').value = '127.0.0.1';
+      await forwards()
+    } catch (x) {
+      toast(x.message)
+    }
+  };
+  let original = loadScopes;
+  loadScopes = async () => {
+    await original();
+    await forwards()
+  };
+  forwards();
 })();
