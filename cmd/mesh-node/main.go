@@ -1306,13 +1306,15 @@ func (n *node) replaceUDPConn(next *net.UDPConn) {
 	old := n.conn
 	n.conn = next
 	n.connMu.Unlock()
+	oldPort := 0
 	if old != nil {
+		oldPort = old.LocalAddr().(*net.UDPAddr).Port
 		_ = old.Close()
 	}
 	if n.stop != nil && runtime.GOOS == "windows" {
 		newPort := next.LocalAddr().(*net.UDPAddr).Port
-		if old != nil {
-			cleanupPlatformNetwork(old.LocalAddr().(*net.UDPAddr).Port)
+		if oldPort != 0 {
+			cleanupPlatformNetwork(oldPort)
 		}
 		if err := configurePlatformNetwork(newPort); err != nil {
 			n.logf("Windows firewall update for recovered UDP port %d failed: %v", newPort, err)
