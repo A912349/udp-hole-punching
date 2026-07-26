@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"testing"
 	"time"
 
@@ -57,6 +58,42 @@ func TestSymmetricRelaySelectionIsDeterministic(t *testing.T) {
 	id, _ := n.symmetricRelay()
 	if id != "relay-a" {
 		t.Fatalf("selected relay %q, want relay-a", id)
+	}
+}
+
+func TestSymmetricRelaysIncludesAllSuperpeers(t *testing.T) {
+	n := &node{neighbors: map[string]*peer{
+		"relay-z": {ID: "relay-z", Role: "superpeer"},
+		"relay-a": {ID: "relay-a", Role: "superpeer"},
+		"client":  {ID: "client", Role: "client"},
+	}}
+	relays := n.symmetricRelays()
+	if len(relays) != 2 || relays[0].id != "relay-a" || relays[1].id != "relay-z" {
+		t.Fatalf("relays = %#v, want relay-a and relay-z in deterministic order", relays)
+	}
+}
+
+func TestConnForPeerUsesDedicatedSymmetricSocket(t *testing.T) {
+	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer primary.Close()
+	dedicated, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dedicated.Close()
+	n := &node{
+		c:              config{nat: "symmetric"},
+		conn:           primary,
+		symmetricConns: map[string]*net.UDPConn{"relay": dedicated},
+	}
+	if got := n.connForPeer("relay"); got != dedicated {
+		t.Fatal("dedicated symmetric socket was not selected")
+	}
+	if got := n.connForPeer("other"); got != primary {
+		t.Fatal("primary socket was not used as fallback")
 	}
 }
 

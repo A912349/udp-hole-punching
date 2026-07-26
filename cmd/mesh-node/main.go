@@ -167,6 +167,10 @@ type symmetricReply struct {
 	conn *net.UDPConn
 	addr *net.UDPAddr
 }
+type symmetricRelayTarget struct {
+	id   string
+	peer peer
+}
 type fastFrame struct {
 	data []byte
 	addr *net.UDPAddr
@@ -190,6 +194,13 @@ type node struct {
 	key              []byte
 	conn             *net.UDPConn
 	connMu           sync.RWMutex
+	symmetricConnMu  sync.RWMutex
+	symmetricConns   map[string]*net.UDPConn
+	receiveMu        sync.Mutex
+	receiveCtx       context.Context
+	receiveStarted   bool
+	receiveSockets   map[*net.UDPConn]struct{}
+	receiveWG        sync.WaitGroup
 	lanConn          *net.UDPConn
 	udpReadMu        sync.Mutex
 	recoveryMu       sync.Mutex
@@ -245,6 +256,7 @@ type node struct {
 	symmetricAckWaiters map[string]chan struct{}
 	symmetricConnected  map[string]bool
 	symmetricBurstAt    map[string]time.Time
+	symmetricBurstSess  map[string]string
 	symmetricScanSlots  chan struct{}
 }
 
@@ -579,6 +591,8 @@ func newNode(c config) (*node, error) {
 		id:                  id,
 		key:                 k[:],
 		conn:                conn,
+		symmetricConns:      map[string]*net.UDPConn{},
+		receiveSockets:      map[*net.UDPConn]struct{}{},
 		dir:                 map[string]*peer{},
 		neighbors:           map[string]*peer{},
 		routes:              map[string]string{},
@@ -599,6 +613,7 @@ func newNode(c config) (*node, error) {
 		symmetricAckWaiters: map[string]chan struct{}{},
 		symmetricConnected:  map[string]bool{},
 		symmetricBurstAt:    map[string]time.Time{},
+		symmetricBurstSess:  map[string]string{},
 		symmetricScanSlots:  make(chan struct{}, 2),
 		pings:               map[string]time.Time{},
 	}
@@ -1217,6 +1232,7 @@ func (n *node) cancelObsoleteSymmetricScans() {
 		delete(n.symmetricSessions, id)
 		delete(n.symmetricConnected, id)
 		delete(n.symmetricBurstAt, id)
+		delete(n.symmetricBurstSess, id)
 	}
 }
 
@@ -1383,9 +1399,9 @@ func (n *node) start() error {
 	return nil
 }
 
-// establishSymmetricTransport mirrors the legacy 500-port burst.  A symmetric
-// NAT allocates a mapping per destination, therefore one of these sockets must
-// receive the cone superpeer's HELLO before it becomes the node's transport.
+// establishSymmetricTransport establishes one UDP mapping per superpeer. A
+// symmetric NAT allocates a mapping per destination, so a single selected
+// socket cannot serve all superpeers.
 func (n *node) establishSymmetricTransport() bool {
 	// A long symmetric-NAT scan can outlive the coordinator's node TTL.
 	// Keep the registration lease alive before the normal periodic loops are
@@ -1409,35 +1425,37 @@ func (n *node) establishSymmetricTransport() bool {
 	}()
 	defer func() { close(leaseStop); <-leaseDone }()
 	for attempt := 1; attempt <= symmetricBurstRetries; attempt++ {
-		if n.establishSymmetricTransportOnce(attempt) {
+		relays := n.symmetricRelays()
+		allReady := len(relays) > 0
+		for _, relay := range relays {
+			if n.symmetricTransportReady(relay.id) {
+				continue
+			}
+			allReady = false
+			if n.establishSymmetricTransportOnce(relay.id, &relay.peer, attempt) {
+				n.logf("symmetric NAT connected to superpeer %s", relay.id[:8])
+			}
+		}
+		if allReady || (len(relays) > 0 && n.symmetricTransportCount() == len(relays)) {
 			return true
 		}
 		if attempt < symmetricBurstRetries {
-			n.logf("symmetric burst retry %d/%d", attempt, symmetricBurstRetries-1)
+			n.logf("symmetric burst retry round %d/%d", attempt, symmetricBurstRetries-1)
 			if err := n.bootstrap(); err != nil {
 				n.logf("topology refresh before symmetric retry failed: %v", err)
 			}
 			time.Sleep(symmetricRetryDelay)
 		}
 	}
-	return false
+	return n.symmetricTransportCount() > 0
 }
 
-func (n *node) establishSymmetricTransportOnce(attempt int) bool {
+func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, attempt int) bool {
 	if n.c.nat != "symmetric" {
 		return true
 	}
-	n.symmetricMu.Lock()
-	if n.symmetricReady {
-		n.symmetricMu.Unlock()
+	if n.symmetricTransportReady(relayID) {
 		return true
-	}
-	n.symmetricMu.Unlock()
-
-	relayID, relay := n.symmetricRelay()
-	if relay == nil {
-		n.logf("symmetric burst deferred: no superpeer in topology")
-		return false
 	}
 	endpoint, err := net.ResolveUDPAddr("udp", relay.Endpoint)
 	if err != nil {
@@ -1505,18 +1523,17 @@ func (n *node) establishSymmetricTransportOnce(attempt int) bool {
 			_ = probe.Close()
 		}
 	}
-	n.replaceUDPConn(selected)
-	if endpoint, _, err := n.detectEndpoint(); err == nil {
-		n.c.endpoint = endpoint
-		if err := n.register(); err != nil {
-			n.logf("symmetric NAT endpoint update failed: %v", err)
-		} else if err := n.bootstrap(); err != nil {
-			n.logf("topology refresh after symmetric NAT update failed: %v", err)
+	primary := n.installSymmetricConn(relayID, selected)
+	if primary {
+		if endpoint, _, err := n.detectEndpoint(); err == nil {
+			n.c.endpoint = endpoint
+			if err := n.register(); err != nil {
+				n.logf("symmetric NAT endpoint update failed: %v", err)
+			} else if err := n.bootstrap(); err != nil {
+				n.logf("topology refresh after symmetric NAT update failed: %v", err)
+			}
 		}
 	}
-	n.symmetricMu.Lock()
-	n.symmetricReady = true
-	n.symmetricMu.Unlock()
 	n.logf("symmetric NAT synchronized through %s on %s", relayID[:8], selected.LocalAddr())
 	return true
 }
@@ -1565,23 +1582,58 @@ func (n *node) requestSymmetricScan(relayID, sessionID string) (proceed, coordin
 	}
 }
 
-func (n *node) symmetricRelay() (string, *peer) {
+func (n *node) symmetricRelays() []symmetricRelayTarget {
 	n.mu.RLock()
-	ids := make([]string, 0, len(n.neighbors))
+	relays := make([]symmetricRelayTarget, 0, len(n.neighbors))
 	for id, candidate := range n.neighbors {
 		if candidate.Role == "superpeer" {
-			ids = append(ids, id)
+			relays = append(relays, symmetricRelayTarget{id: id, peer: *candidate})
 		}
 	}
-	sort.Strings(ids)
-	if len(ids) == 0 {
-		n.mu.RUnlock()
+	n.mu.RUnlock()
+	sort.Slice(relays, func(i, j int) bool { return relays[i].id < relays[j].id })
+	return relays
+}
+
+// symmetricRelay is kept as a deterministic compatibility helper for callers
+// that only need the preferred relay. Establishment itself uses all relays.
+func (n *node) symmetricRelay() (string, *peer) {
+	relays := n.symmetricRelays()
+	if len(relays) == 0 {
 		return "", nil
 	}
-	id := ids[0]
-	copy := *n.neighbors[id]
-	n.mu.RUnlock()
-	return id, &copy
+	return relays[0].id, &relays[0].peer
+}
+
+func (n *node) symmetricTransportReady(relayID string) bool {
+	n.symmetricConnMu.RLock()
+	_, ready := n.symmetricConns[relayID]
+	n.symmetricConnMu.RUnlock()
+	return ready
+}
+
+func (n *node) symmetricTransportCount() int {
+	n.symmetricConnMu.RLock()
+	count := len(n.symmetricConns)
+	n.symmetricConnMu.RUnlock()
+	return count
+}
+
+// installSymmetricConn keeps the first successful socket as the node's
+// primary socket and retains every later socket for its own superpeer.
+func (n *node) installSymmetricConn(relayID string, next *net.UDPConn) bool {
+	n.symmetricConnMu.Lock()
+	primary := len(n.symmetricConns) == 0
+	n.symmetricConns[relayID] = next
+	n.symmetricConnMu.Unlock()
+	n.symmetricMu.Lock()
+	n.symmetricReady = true
+	n.symmetricMu.Unlock()
+	if primary {
+		n.replaceUDPConn(next)
+	}
+	n.addReceiveSocket(next)
+	return primary
 }
 
 func (n *node) currentUDPConn() *net.UDPConn {
@@ -1590,12 +1642,25 @@ func (n *node) currentUDPConn() *net.UDPConn {
 	return n.conn
 }
 
+func (n *node) connForPeer(peerID string) *net.UDPConn {
+	if n.c.nat == "symmetric" {
+		n.symmetricConnMu.RLock()
+		conn := n.symmetricConns[peerID]
+		n.symmetricConnMu.RUnlock()
+		if conn != nil {
+			return conn
+		}
+	}
+	return n.currentUDPConn()
+}
+
 func (n *node) replaceUDPConn(next *net.UDPConn) {
 	n.connMu.Lock()
 	old := n.conn
 	n.conn = next
 	n.connMu.Unlock()
 	n.finishUDPConnReplacement(old, next)
+	n.addReceiveSocket(next)
 }
 
 // rebindUDPConn drops the socket created on the previous network and creates
@@ -1642,6 +1707,7 @@ func (n *node) rebindUDPConn() error {
 	n.conn = next
 	n.connMu.Unlock()
 	n.finishUDPConnReplacement(old, next)
+	n.addReceiveSocket(next)
 	return nil
 }
 
@@ -1802,24 +1868,28 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	}
 	sessionID := payloadString(packet, "session_id")
 	n.symmetricMu.Lock()
-	activeSession := n.symmetricSessions[packet.Source]
-	n.symmetricMu.Unlock()
-	if activeSession != "" && sessionID != activeSession {
-		return
-	}
-	n.symmetricMu.Lock()
+	armedSession := n.symmetricSessions[packet.Source]
 	previous := n.symmetricBurstAt[packet.Source]
-	n.symmetricBurstAt[packet.Source] = time.Now()
-	n.symmetricMu.Unlock()
-	if time.Since(previous) < 5*time.Second {
+	previousSession := n.symmetricBurstSess[packet.Source]
+	if armedSession != "" && sessionID != armedSession {
+		n.symmetricMu.Unlock()
 		return
 	}
-	// The control event already started the scan for this session. The burst
-	// only confirms that the 500-port round has begun; do not restart the scan
-	// around the observed mapping, otherwise the event and the burst briefly
-	// run two workers for the same session.
-	_ = observed
-	n.startSymmetricScan(packet.Source, peer.Endpoint, sessionID, false)
+	if previousSession == sessionID && time.Since(previous) < 5*time.Second {
+		n.symmetricMu.Unlock()
+		return
+	}
+	n.symmetricBurstAt[packet.Source] = time.Now()
+	n.symmetricBurstSess[packet.Source] = sessionID
+	n.symmetricMu.Unlock()
+	// The coordinator event arms the session. The first authenticated burst
+	// starts exactly one scan round and supplies the current per-destination
+	// mapping; this keeps the scan and the 500-port burst synchronized.
+	endpoint := peer.Endpoint
+	if observed != nil {
+		endpoint = observed.String()
+	}
+	n.startSymmetricScan(packet.Source, endpoint, sessionID, false)
 }
 
 func payloadString(packet protocol.Packet, key string) string {
@@ -1837,10 +1907,19 @@ func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
 	if peer == nil || peer.NAT != "symmetric" {
 		return
 	}
+	// Arm the session, but wait for the authenticated SYMMETRIC_BURST before
+	// starting the scan. The ACK below only releases the 500-port burst.
 	n.symmetricMu.Lock()
+	if existing := n.symmetricScans[peerID]; existing != nil {
+		delete(n.symmetricScans, peerID)
+		delete(n.symmetricSessions, peerID)
+		close(existing)
+	}
+	delete(n.symmetricConnected, peerID)
+	n.symmetricSessions[peerID] = sessionID
 	delete(n.symmetricBurstAt, peerID)
+	delete(n.symmetricBurstSess, peerID)
 	n.symmetricMu.Unlock()
-	n.startSymmetricScan(peerID, endpoint, sessionID, true)
 	err := n.request("POST", "/v1/symmetric-scan/ack", map[string]any{
 		"source_node_id": peerID,
 		"session_id":     sessionID,
@@ -1855,7 +1934,11 @@ func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
 	if err != nil {
 		return
 	}
-	_, _ = n.currentUDPConn().WriteToUDP(encoded, address)
+	conn := n.connForPeer(packet.Destination)
+	if conn == nil {
+		return
+	}
+	_, _ = conn.WriteToUDP(encoded, address)
 }
 func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 	t := time.NewTicker(d)
@@ -1953,6 +2036,16 @@ func (n *node) resetTransportState() {
 		peer.up = false
 	}
 	n.mu.Unlock()
+	current := n.currentUDPConn()
+	n.symmetricConnMu.Lock()
+	for id, conn := range n.symmetricConns {
+		if conn != nil && conn != current {
+			_ = conn.Close()
+		}
+		delete(n.symmetricConns, id)
+	}
+	n.symmetricConns = map[string]*net.UDPConn{}
+	n.symmetricConnMu.Unlock()
 	n.symmetricMu.Lock()
 	n.symmetricReady = false
 	for id, cancel := range n.symmetricScans {
@@ -1963,6 +2056,7 @@ func (n *node) resetTransportState() {
 	n.symmetricAckWaiters = map[string]chan struct{}{}
 	n.symmetricConnected = map[string]bool{}
 	n.symmetricBurstAt = map[string]time.Time{}
+	n.symmetricBurstSess = map[string]string{}
 	n.symmetricMu.Unlock()
 }
 
@@ -2118,7 +2212,7 @@ func (n *node) usable(p *peer) bool {
 	return p != nil && !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout
 }
 func (n *node) send(p protocol.Packet) bool {
-	_, q := n.nextHop(p.Destination)
+	hop, q := n.nextHop(p.Destination)
 	if !n.usable(q) {
 		return false
 	}
@@ -2134,7 +2228,7 @@ func (n *node) send(p protocol.Packet) bool {
 	if e != nil {
 		return false
 	}
-	_, e = n.currentUDPConn().WriteToUDP(b, a.(*net.UDPAddr))
+	_, e = n.connForPeer(hop).WriteToUDP(b, a.(*net.UDPAddr))
 	return e == nil
 }
 
@@ -2340,10 +2434,73 @@ func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 }
 
 func (n *node) receive(ctx context.Context) {
+	n.receiveMu.Lock()
+	n.receiveCtx = ctx
+	n.receiveStarted = true
+	conns := n.transportConns()
+	for _, conn := range conns {
+		if _, exists := n.receiveSockets[conn]; exists {
+			continue
+		}
+		n.receiveSockets[conn] = struct{}{}
+		n.receiveWG.Add(1)
+		go n.receiveSocket(ctx, conn)
+	}
+	n.receiveMu.Unlock()
+	<-ctx.Done()
+	n.receiveWG.Wait()
+	close(n.fastQueue)
+}
+
+func (n *node) transportConns() []*net.UDPConn {
+	seen := map[*net.UDPConn]struct{}{}
+	conns := make([]*net.UDPConn, 0, 1+n.symmetricTransportCount())
+	if conn := n.currentUDPConn(); conn != nil {
+		seen[conn] = struct{}{}
+		conns = append(conns, conn)
+	}
+	n.symmetricConnMu.RLock()
+	for _, conn := range n.symmetricConns {
+		if conn != nil {
+			if _, exists := seen[conn]; !exists {
+				seen[conn] = struct{}{}
+				conns = append(conns, conn)
+			}
+		}
+	}
+	n.symmetricConnMu.RUnlock()
+	return conns
+}
+
+func (n *node) addReceiveSocket(conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+	n.receiveMu.Lock()
+	defer n.receiveMu.Unlock()
+	if !n.receiveStarted || n.receiveCtx == nil {
+		return
+	}
+	if _, exists := n.receiveSockets[conn]; exists {
+		return
+	}
+	if n.receiveCtx.Err() != nil {
+		return
+	}
+	n.receiveSockets[conn] = struct{}{}
+	n.receiveWG.Add(1)
+	go n.receiveSocket(n.receiveCtx, conn)
+}
+
+func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
+	defer n.receiveWG.Done()
+	defer func() {
+		n.receiveMu.Lock()
+		delete(n.receiveSockets, conn)
+		n.receiveMu.Unlock()
+	}()
 	buffer := make([]byte, protocol.MaxDatagramSize)
-	defer close(n.fastQueue)
 	for {
-		conn := n.currentUDPConn()
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n.udpReadMu.Lock()
 		length, address, e := conn.ReadFromUDP(buffer)
@@ -2358,56 +2515,59 @@ func (n *node) receive(ctx context.Context) {
 			n.debugf("UDP receive failed: %v", e)
 			continue
 		}
-		datagram := buffer[:length]
-		if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
-			n.enqueueFast(datagram, address)
-			continue
-		}
-		p, e := protocol.DecodePacket(datagram, n.key)
-		if e != nil || !n.remember(p.ID) {
-			continue
-		}
-		if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
-			n.touch(p.Source, address)
-		}
-		if p.Destination != n.id.ID {
-			if n.c.role == "superpeer" {
-				if q, e := p.DecTTL(); e == nil {
-					n.send(q)
-				}
+		n.handleDatagram(buffer[:length], address)
+	}
+}
+
+func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
+	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
+		n.enqueueFast(datagram, address)
+		return
+	}
+	p, e := protocol.DecodePacket(datagram, n.key)
+	if e != nil || !n.remember(p.ID) {
+		return
+	}
+	if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
+		n.touch(p.Source, address)
+	}
+	if p.Destination != n.id.ID {
+		if n.c.role == "superpeer" {
+			if q, e := p.DecTTL(); e == nil {
+				n.send(q)
 			}
-			continue
 		}
-		switch p.Type {
-		case "HELLO":
-			n.ensureNeighbor(p.Source)
-			n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{"session_id": payloadString(p, "session_id")}))
-		case "HELLO_ACK":
-			n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
-			n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
-		case "PING":
-			n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
-		case "PONG":
-			if id, ok := p.Payload["ping_id"].(string); ok {
-				n.pingMu.Lock()
-				sent := n.pings[id]
-				delete(n.pings, id)
-				n.pingMu.Unlock()
-				if !sent.IsZero() {
-					n.mu.Lock()
-					if q := n.neighbors[p.Source]; q != nil {
-						q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
-					}
-					n.mu.Unlock()
+		return
+	}
+	switch p.Type {
+	case "HELLO":
+		n.ensureNeighbor(p.Source)
+		n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{"session_id": payloadString(p, "session_id")}))
+	case "HELLO_ACK":
+		n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
+		n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
+	case "PING":
+		n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
+	case "PONG":
+		if id, ok := p.Payload["ping_id"].(string); ok {
+			n.pingMu.Lock()
+			sent := n.pings[id]
+			delete(n.pings, id)
+			n.pingMu.Unlock()
+			if !sent.IsZero() {
+				n.mu.Lock()
+				if q := n.neighbors[p.Source]; q != nil {
+					q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
 				}
+				n.mu.Unlock()
 			}
-		case "SYMMETRIC_BURST":
-			n.ensureNeighbor(p.Source)
-			n.handleSymmetricBurst(p, address)
-		case "DATA":
-			n.ensureNeighbor(p.Source)
-			n.data(p)
 		}
+	case "SYMMETRIC_BURST":
+		n.ensureNeighbor(p.Source)
+		n.handleSymmetricBurst(p, address)
+	case "DATA":
+		n.ensureNeighbor(p.Source)
+		n.data(p)
 	}
 }
 
@@ -2803,6 +2963,14 @@ func (n *node) close() {
 	conn := n.currentUDPConn()
 	port := conn.LocalAddr().(*net.UDPAddr).Port
 	conn.Close()
+	n.symmetricConnMu.Lock()
+	for _, extra := range n.symmetricConns {
+		if extra != nil && extra != conn {
+			_ = extra.Close()
+		}
+	}
+	n.symmetricConns = map[string]*net.UDPConn{}
+	n.symmetricConnMu.Unlock()
 	if n.tun != nil {
 		cleanupTUN(n.c.tun, n.installedRoutes, n.tunLUID)
 	}
@@ -2891,7 +3059,7 @@ func (n *node) sendFast(dst string, data []byte) bool {
 			return false
 		}
 	}
-	_, e := n.currentUDPConn().WriteToUDP(data, a.(*net.UDPAddr))
+	_, e := n.connForPeer(p.ID).WriteToUDP(data, a.(*net.UDPAddr))
 	if e != nil {
 		n.debugf("fast send to %s via %s failed: %v", dst[:8], a, e)
 		return false
