@@ -281,6 +281,8 @@ type node struct {
 	symmetricBurstAt    map[string]time.Time
 	symmetricBurstSess  map[string]string
 	symmetricScanSlots  chan struct{}
+	edgeRetryMu         sync.Mutex
+	edgeRetries         map[string]bool
 }
 
 func main() {
@@ -647,6 +649,7 @@ func newNode(c config) (*node, error) {
 		symmetricBurstAt:    map[string]time.Time{},
 		symmetricBurstSess:  map[string]string{},
 		symmetricScanSlots:  make(chan struct{}, 2),
+		edgeRetries:         map[string]bool{},
 		pings:               map[string]pingProbe{},
 	}
 	if _, e = rand.Read(n.packetPrefix[:]); e != nil {
@@ -958,10 +961,12 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 		n.logf("control reconnect: STUN check failed: %v", err)
 		return
 	}
-	if endpoint == n.c.endpoint {
+	previousEndpoint := n.c.endpoint
+	if endpoint == previousEndpoint {
 		return
 	}
-	n.logf("control reconnect: UDP endpoint changed %s -> %s; re-registering", n.c.endpoint, endpoint)
+	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
+	n.logf("control reconnect: UDP endpoint changed %s -> %s", previousEndpoint, endpoint)
 	// The old UDP mapping is tied to the previous network. Clear all cached
 	// peer observations and per-superpeer sockets before rebuilding transport;
 	// otherwise a Wi-Fi -> LTE transition can keep stale symmetric state and
@@ -971,17 +976,38 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
 	}
-	if err := n.register(); err != nil {
-		n.logf("control reconnect: re-register failed: %v", err)
-		return
-	}
-	if err := n.bootstrap(); err != nil {
-		n.logf("control reconnect: topology refresh failed: %v", err)
-		return
+	if ipChanged {
+		if err := n.register(); err != nil {
+			n.logf("control reconnect: re-register failed: %v", err)
+			return
+		}
+		if err := n.bootstrap(); err != nil {
+			n.logf("control reconnect: topology refresh failed: %v", err)
+			return
+		}
 	}
 	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
 		n.logf("control reconnect: symmetric handshake did not complete")
+	} else if !ipChanged {
+		// The heartbeat will publish the new port. Rebuild direct paths locally
+		// without causing a registration/topology churn for a port-only change.
+		n.helloAll()
 	}
+}
+
+func endpointIP(endpoint string) string {
+	host, _, err := net.SplitHostPort(endpoint)
+	if err != nil {
+		return strings.ToLower(strings.TrimSpace(endpoint))
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String()
+	}
+	return strings.ToLower(strings.TrimSpace(host))
+}
+
+func endpointIPChanged(previous, next string) bool {
+	return previous == "" || endpointIP(previous) != endpointIP(next)
 }
 
 func (n *node) register() error {
@@ -1583,12 +1609,15 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 	}
 	primary := n.installSymmetricConn(relayID, selected)
 	if primary {
+		previousEndpoint := n.c.endpoint
 		if endpoint, _, err := n.detectEndpoint(); err == nil {
 			n.c.endpoint = endpoint
-			if err := n.register(); err != nil {
-				n.logf("symmetric NAT endpoint update failed: %v", err)
-			} else if err := n.bootstrap(); err != nil {
-				n.logf("topology refresh after symmetric NAT update failed: %v", err)
+			if endpointIPChanged(previousEndpoint, endpoint) {
+				if err := n.register(); err != nil {
+					n.logf("symmetric NAT endpoint update failed: %v", err)
+				} else if err := n.bootstrap(); err != nil {
+					n.logf("topology refresh after symmetric NAT update failed: %v", err)
+				}
 			}
 		}
 	}
@@ -2142,6 +2171,80 @@ func (n *node) resetSymmetricRelay(relayID string) {
 	n.symmetricMu.Unlock()
 }
 
+const (
+	edgeRetryAttempts = 3
+	edgeRetryDelay    = 2 * time.Second
+)
+
+// retryDeadEdge keeps retrying an individual failed edge. Global network
+// recovery is intentionally conservative and only runs when every neighbor is
+// stale, so it cannot be the mechanism that revives one dead edge in an
+// otherwise healthy mesh.
+func (n *node) retryDeadEdge(id string, snapshot peer) {
+	n.edgeRetryMu.Lock()
+	if n.edgeRetries == nil {
+		n.edgeRetries = map[string]bool{}
+	}
+	if n.edgeRetries[id] {
+		n.edgeRetryMu.Unlock()
+		return
+	}
+	n.edgeRetries[id] = true
+	n.edgeRetryMu.Unlock()
+
+	go func() {
+		defer func() {
+			n.edgeRetryMu.Lock()
+			delete(n.edgeRetries, id)
+			n.edgeRetryMu.Unlock()
+		}()
+
+		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
+			n.resetSymmetricRelay(id)
+			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
+				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
+					return
+				}
+				if attempt < edgeRetryAttempts {
+					time.Sleep(edgeRetryDelay)
+				}
+			}
+			return
+		}
+
+		for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
+			n.mu.RLock()
+			current := n.neighbors[id]
+			if current != nil {
+				copy := *current
+				if n.usable(current) {
+					n.mu.RUnlock()
+					return
+				}
+				snapshot = copy
+			}
+			n.mu.RUnlock()
+			if current == nil {
+				return
+			}
+			n.sendHello(snapshot)
+			if attempt < edgeRetryAttempts {
+				time.Sleep(edgeRetryDelay)
+			}
+		}
+	}()
+}
+
+func (n *node) sendHello(p peer) {
+	packet := protocol.NewPacket("HELLO", n.id.ID, p.ID, map[string]any{"public_key": n.id.Public})
+	if observed, ok := p.last.(*net.UDPAddr); ok {
+		n.sendToAddress(packet, observed)
+	}
+	if address, err := net.ResolveUDPAddr("udp", p.Endpoint); err == nil {
+		n.sendToAddress(packet, address)
+	}
+}
+
 func (n *node) deferRecovery(err error, action string) {
 	n.recoveryFails++
 	backoff := recoveryMinBackoff
@@ -2188,17 +2291,21 @@ func (n *node) recoverNetwork() {
 		n.deferRecovery(err, "STUN recovery failed")
 		return
 	}
+	previousEndpoint := n.c.endpoint
+	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
 	n.c.endpoint = endpoint
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
 	}
-	if err := n.register(); err != nil {
-		n.deferRecovery(err, "re-register after network loss failed")
-		return
-	}
-	if err := n.bootstrap(); err != nil {
-		n.deferRecovery(err, "topology refresh after network loss failed")
-		return
+	if ipChanged {
+		if err := n.register(); err != nil {
+			n.deferRecovery(err, "re-register after network loss failed")
+			return
+		}
+		if err := n.bootstrap(); err != nil {
+			n.deferRecovery(err, "topology refresh after network loss failed")
+			return
+		}
 	}
 	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
 		n.deferRecovery(errors.New("symmetric handshake did not complete"), "symmetric transport recovery failed")
@@ -2832,7 +2939,7 @@ func (n *node) linkHealth(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			lostRelays := make([]symmetricRelayTarget, 0)
+			deadEdges := make([]peer, 0)
 			n.mu.Lock()
 			for id, peer := range n.neighbors {
 				live := n.usable(peer)
@@ -2843,21 +2950,19 @@ func (n *node) linkHealth(ctx context.Context) {
 						state = "up"
 					}
 					n.logf("link %s %s", id[:8], state)
-					if !live && n.c.nat == "symmetric" && peer.Role == "superpeer" {
-						lostRelays = append(lostRelays, symmetricRelayTarget{id: id, peer: *peer})
-					}
+				}
+				if !live {
+					deadEdges = append(deadEdges, *peer)
 				}
 			}
 			n.mu.Unlock()
-			for _, relay := range lostRelays {
-				relay := relay
-				go func() {
-					n.resetSymmetricRelay(relay.id)
-					n.logf("symmetric edge %s is down; restarting scan", relay.id[:8])
-					if !n.establishSymmetricTransportOnce(relay.id, &relay.peer, 1) {
-						n.logf("symmetric scan for %s after edge loss did not complete", relay.id[:8])
-					}
-				}()
+			for _, peer := range deadEdges {
+				if n.c.nat == "symmetric" && peer.Role == "superpeer" {
+					n.logf("symmetric edge %s is down; retrying scan", peer.ID[:8])
+				} else {
+					n.logf("edge %s is down; retrying HELLO", peer.ID[:8])
+				}
+				n.retryDeadEdge(peer.ID, peer)
 			}
 		}
 	}

@@ -15,6 +15,18 @@ func TestEstablishSymmetricTransportSkipsNonSymmetricNAT(t *testing.T) {
 	}
 }
 
+func TestEndpointIPChangedIgnoresPortChanges(t *testing.T) {
+	if endpointIPChanged("198.51.100.7:4000", "198.51.100.7:5000") {
+		t.Fatal("port-only endpoint change must not require re-registration")
+	}
+	if !endpointIPChanged("198.51.100.7:4000", "198.51.100.8:4000") {
+		t.Fatal("IP endpoint change must require re-registration")
+	}
+	if !endpointIPChanged("[2001:db8::7]:4000", "[2001:db8::8]:5000") {
+		t.Fatal("IPv6 endpoint IP change must require re-registration")
+	}
+}
+
 func TestCancelObsoleteSymmetricScans(t *testing.T) {
 	kept := make(chan struct{})
 	removed := make(chan struct{})
