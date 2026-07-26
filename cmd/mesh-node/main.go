@@ -1403,6 +1403,12 @@ func (n *node) start() error {
 // symmetric NAT allocates a mapping per destination, so a single selected
 // socket cannot serve all superpeers.
 func (n *node) establishSymmetricTransport() bool {
+	// Cone (and open) NATs use the normal UDP socket.  They must not enter the
+	// symmetric scan below: it intentionally creates per-superpeer sockets.
+	if n.c.nat != "symmetric" {
+		return true
+	}
+
 	// A long symmetric-NAT scan can outlive the coordinator's node TTL.
 	// Keep the registration lease alive before the normal periodic loops are
 	// started (start() blocks here until transport selection completes).

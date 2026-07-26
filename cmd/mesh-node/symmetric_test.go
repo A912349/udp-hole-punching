@@ -8,6 +8,13 @@ import (
 	"home-udp-mesh/internal/protocol"
 )
 
+func TestEstablishSymmetricTransportSkipsNonSymmetricNAT(t *testing.T) {
+	n := &node{c: config{nat: "cone"}}
+	if !n.establishSymmetricTransport() {
+		t.Fatal("non-symmetric NAT should not require symmetric transport")
+	}
+}
+
 func TestCancelObsoleteSymmetricScans(t *testing.T) {
 	kept := make(chan struct{})
 	removed := make(chan struct{})
