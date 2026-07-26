@@ -602,7 +602,11 @@ async function load() {
 }
 async function deleteEdge(i) {
   try {
+    let edge = state.manualLinks[i];
     state.manualLinks.splice(i, 1);
+    if (edge && !state.blockedLinks.some(x => edgeKey(x.a, x.b) === edgeKey(edge.a, edge.b))) {
+      state.blockedLinks.push({a: edge.a, b: edge.b, cost: 1});
+    }
     await publishEdges('Link removed')
   } catch (e) {
     toast(e.message)
