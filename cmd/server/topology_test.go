@@ -3,6 +3,7 @@ package main
 import "testing"
 import "net/netip"
 import "time"
+import "fmt"
 
 func TestVirtualSubnetAllocationAvoidsDuplicatePhysicalLANs(t *testing.T) {
 	mesh := netip.MustParsePrefix("10.77.0.0/24")
@@ -113,6 +114,28 @@ func TestManualBackboneStillAttachesNewClients(t *testing.T) {
 	links := s.addAutomaticClientLinks([]link{{A: "sp-a", B: "sp-b"}}, nodes)
 	if got := len(neighborsFor(links, "new-client")); got != 2 {
 		t.Fatalf("new client has %d automatic superpeer links, want 2", got)
+	}
+}
+
+func TestBlockedAutomaticClientLinkStaysRemoved(t *testing.T) {
+	s := testAuthServer(t)
+	defer s.db.Close()
+	now := time.Now().Unix()
+	for i, n := range []struct{ id, role string }{{"sp-a", "superpeer"}, {"sp-b", "superpeer"}, {"client", "client"}} {
+		if _, err := s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			n.id, "key-"+n.id, "cone", n.role, "127.0.0.1:10000", "auto", 1, 1, now, now, fmt.Sprintf("10.77.0.%d", i+10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec("INSERT INTO graph_blocks(a,b) VALUES(?,?)", "client", "sp-a"); err != nil {
+		t.Fatal(err)
+	}
+	nodes := []node{testNode("sp-a", "cone", "superpeer", 1), testNode("sp-b", "cone", "superpeer", 1), testNode("client", "cone", "client", 1)}
+	if neighborsFor(s.links(nodes), "client")["sp-a"] {
+		t.Fatal("blocked automatic client-superpeer link was restored")
+	}
+	if !neighborsFor(s.links(nodes), "client")["sp-b"] {
+		t.Fatal("unblocked automatic client-superpeer link was not retained")
 	}
 }
 

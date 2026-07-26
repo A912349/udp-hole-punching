@@ -41,7 +41,8 @@ let state = {
     audit: [],
     config: {},
     invites: [],
-    manualLinks: []
+    manualLinks: [],
+    blockedLinks: []
   },
   timer;
 let graphUI = {
@@ -336,12 +337,8 @@ function selectEdge(key) {
 }
 
 function seedManual() {
-  if (state.manualLinks.length) return;
-  state.manualLinks = (state.topology.links || []).map(e => ({
-    a: e.a,
-    b: e.b,
-    cost: Number(e.cost) > 0 ? Number(e.cost) : 1
-  }))
+  // Automatic links must not be copied into the manual graph. Otherwise
+  // deleting one causes the automatic client attachment logic to recreate it.
 }
 async function publishEdges(message) {
   await api('/v1/admin/graph', {
@@ -350,7 +347,8 @@ async function publishEdges(message) {
       'Content-Type': 'application/json'
     },
     body: JSON.stringify({
-      links: state.manualLinks
+      links: state.manualLinks,
+      blocked_links: state.blockedLinks
     })
   });
   toast(message || (state.manualLinks.length ? 'Manual topology published' : 'Automatic topology restored'));
@@ -369,6 +367,7 @@ async function addDirectEdge(a, b) {
       b,
       cost
     });
+    state.blockedLinks = state.blockedLinks.filter(e => edgeKey(e.a, e.b) !== key);
     cancelSelection();
     await publishEdges('Link saved and pushed')
   } catch (e) {
@@ -387,6 +386,7 @@ async function saveDirectEdge(a, b, cost) {
       b,
       cost
     });
+    state.blockedLinks = state.blockedLinks.filter(e => edgeKey(e.a, e.b) !== key);
     await publishEdges('Link cost updated')
   } catch (e) {
     toast(e.message)
@@ -395,7 +395,12 @@ async function saveDirectEdge(a, b, cost) {
 async function removeDirectEdge(key) {
   try {
     seedManual();
+    let manual = state.manualLinks.some(e => edgeKey(e.a, e.b) === key);
     state.manualLinks = state.manualLinks.filter(e => edgeKey(e.a, e.b) !== key);
+    if (!manual && !state.blockedLinks.some(e => edgeKey(e.a, e.b) === key)) {
+      let [a, b] = key.split('|');
+      state.blockedLinks.push({a, b, cost: 1});
+    }
     cancelSelection();
     await publishEdges('Link removed and topology pushed')
   } catch (e) {
@@ -583,7 +588,8 @@ async function load() {
       topology,
       audit: audit || [],
       invites: invites || [],
-      manualLinks: graphData.links || []
+      manualLinks: graphData.links || [],
+      blockedLinks: graphData.blocked_links || []
     };
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
@@ -645,6 +651,7 @@ $('autoGraph').onclick = async () => {
   if (confirm('Discard manual links and restore automatic topology?')) {
     try {
       state.manualLinks = [];
+      state.blockedLinks = [];
       cancelSelection();
       await publishEdges('Automatic topology restored')
     } catch (e) {
@@ -708,7 +715,8 @@ async function loadScopes() {
       scope: state.scope,
       audit: audit || [],
       invites: invites || [],
-      manualLinks: graphData.links || []
+      manualLinks: graphData.links || [],
+      blockedLinks: graphData.blocked_links || []
     };
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();

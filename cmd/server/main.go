@@ -669,6 +669,9 @@ func (s *server) init() error {
 	if err != nil {
 		return err
 	}
+	if _, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS graph_blocks (a TEXT NOT NULL,b TEXT NOT NULL,PRIMARY KEY(a,b))`); err != nil {
+		return err
+	}
 	if _, err = s.db.Exec(`CREATE TABLE IF NOT EXISTS port_forwards (id INTEGER PRIMARY KEY AUTOINCREMENT,source_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,listen_host TEXT NOT NULL,listen_port INTEGER NOT NULL,target_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,UNIQUE(source_node_id,listen_host,listen_port))`); err != nil {
 		return err
 	}
@@ -2393,11 +2396,12 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	accountID, scoped := s.accountIDForRequest(r)
 	if r.Method == http.MethodGet {
-		reply(w, 200, map[string]any{"links": s.manualLinksForAccount(accountID, scoped)})
+		reply(w, 200, map[string]any{"links": s.manualLinksForAccount(accountID, scoped), "blocked_links": s.blockedLinksForAccount(accountID, scoped)})
 		return
 	}
 	var input struct {
-		Links []link `json:"links"`
+		Links        []link `json:"links"`
+		BlockedLinks []link `json:"blocked_links"`
 	}
 	if err := decodeJSON(w, r, &input); err != nil {
 		reply(w, 400, map[string]string{"error": err.Error()})
@@ -2413,6 +2417,12 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	for _, e := range input.BlockedLinks {
+		if e.A == "" || e.B == "" || e.A == e.B || (scoped && (!s.nodeOwnedByAccount(e.A, accountID) || !s.nodeOwnedByAccount(e.B, accountID))) {
+			reply(w, 400, map[string]string{"error": "invalid blocked graph link"})
+			return
+		}
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
@@ -2421,8 +2431,14 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	if scoped {
 		_, err = tx.Exec("DELETE FROM graph_links WHERE a IN (SELECT node_id FROM nodes WHERE owner_id=?) AND b IN (SELECT node_id FROM nodes WHERE owner_id=?)", accountID, accountID)
+		if err == nil {
+			_, err = tx.Exec("DELETE FROM graph_blocks WHERE a IN (SELECT node_id FROM nodes WHERE owner_id=?) AND b IN (SELECT node_id FROM nodes WHERE owner_id=?)", accountID, accountID)
+		}
 	} else {
 		_, err = tx.Exec("DELETE FROM graph_links")
+		if err == nil {
+			_, err = tx.Exec("DELETE FROM graph_blocks")
+		}
 	}
 	if err == nil {
 		for _, e := range input.Links {
@@ -2431,6 +2447,17 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 				a, b = b, a
 			}
 			if _, err = tx.Exec("INSERT OR REPLACE INTO graph_links(a,b,cost) VALUES(?,?,?)", a, b, e.Cost); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil {
+		for _, e := range input.BlockedLinks {
+			a, b := e.A, e.B
+			if a > b {
+				a, b = b, a
+			}
+			if _, err = tx.Exec("INSERT OR IGNORE INTO graph_blocks(a,b) VALUES(?,?)", a, b); err != nil {
 				break
 			}
 		}
@@ -2445,7 +2472,7 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	s.invalidateLinkCache()
 	s.pushTopologies()
-	reply(w, 200, map[string]any{"links": input.Links})
+	reply(w, 200, map[string]any{"links": input.Links, "blocked_links": input.BlockedLinks})
 }
 
 func (s *server) manualLinks() []link {
@@ -2462,6 +2489,31 @@ func (s *server) manualLinksForAccount(accountID int64, scoped bool) []link {
 		query = `SELECT g.a,g.b,g.cost FROM graph_links g
 			JOIN nodes na ON na.node_id=g.a JOIN nodes nb ON nb.node_id=g.b
 			WHERE na.owner_id=? AND nb.owner_id=? ORDER BY g.a,g.b`
+		args = []any{accountID, accountID}
+	}
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return []link{}
+	}
+	defer rows.Close()
+	out := []link{}
+	for rows.Next() {
+		var e link
+		if rows.Scan(&e.A, &e.B, &e.Cost) == nil {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (s *server) blockedLinksForAccount(accountID int64, scoped bool) []link {
+	if s.db == nil {
+		return []link{}
+	}
+	query := "SELECT a,b,1.0 FROM graph_blocks ORDER BY a,b"
+	args := []any{}
+	if scoped {
+		query = `SELECT g.a,g.b,1.0 FROM graph_blocks g JOIN nodes na ON na.node_id=g.a JOIN nodes nb ON nb.node_id=g.b WHERE na.owner_id=? AND nb.owner_id=? ORDER BY g.a,g.b`
 		args = []any{accountID, accountID}
 	}
 	rows, err := s.db.Query(query, args...)
@@ -2987,7 +3039,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 }
 func (s *server) links(nodes []node) []link {
 	if manual := s.manualLinksForNodes(nodes); len(manual) > 0 {
-		return s.decorateLinks(s.addAutomaticClientLinks(manual, nodes), nodes)
+		return s.decorateLinks(s.filterBlockedLinks(s.addAutomaticClientLinks(manual, nodes), nodes), nodes)
 	}
 	s.configMu.RLock()
 	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
@@ -3038,7 +3090,35 @@ func (s *server) links(nodes []node) []link {
 			out = append(out, link{A: n.ID, B: p.ID, Cost: 1 + float64(i)/10})
 		}
 	}
-	return s.decorateLinks(out, nodes)
+	return s.decorateLinks(s.filterBlockedLinks(out, nodes), nodes)
+}
+
+func (s *server) filterBlockedLinks(links []link, nodes []node) []link {
+	blocked := map[string]bool{}
+	for _, e := range s.blockedLinksForNodes(nodes) {
+		blocked[edgeKey(e.A, e.B)] = true
+	}
+	out := links[:0]
+	for _, e := range links {
+		if !blocked[edgeKey(e.A, e.B)] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func (s *server) blockedLinksForNodes(nodes []node) []link {
+	allowed := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		allowed[n.ID] = true
+	}
+	out := []link{}
+	for _, e := range s.blockedLinksForAccount(0, false) {
+		if allowed[e.A] && allowed[e.B] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // cachedTopologyLinks shares the graph calculation across all bootstrap
