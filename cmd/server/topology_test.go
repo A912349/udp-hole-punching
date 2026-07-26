@@ -70,6 +70,39 @@ func TestWeightedPeerOrderIsStable(t *testing.T) {
 	}
 }
 
+func TestRebalanceRolesDoesNotRewriteStableRoles(t *testing.T) {
+	s := testAuthServer(t)
+	now := time.Now().Unix()
+	for _, n := range []struct {
+		id, role, requested string
+	}{
+		{"superpeer", "superpeer", "superpeer"},
+		{"client", "client", "client"},
+	} {
+		meshIP := "10.77.0.10"
+		if n.id == "client" {
+			meshIP = "10.77.0.11"
+		}
+		if _, err := s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			n.id, "public-"+n.id, "cone", n.role, "127.0.0.1:10000", n.requested, 1, 1, now, now, meshIP); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var before, after int64
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.rebalanceRoles(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT total_changes()").Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("stable role rebalance made %d unnecessary database writes", after-before)
+	}
+}
+
 func TestManualBackboneStillAttachesNewClients(t *testing.T) {
 	s := &server{clientLinks: 2, symmetricLinks: 3}
 	nodes := []node{

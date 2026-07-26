@@ -1433,6 +1433,9 @@ func (s *server) rebalanceRolesFor(ownerID *int64) error {
 		if super[n.ID] {
 			role = "superpeer"
 		}
+		if n.Role == role {
+			continue
+		}
 		if _, err := s.db.Exec("UPDATE nodes SET role=? WHERE node_id=?", role, n.ID); err != nil {
 			return err
 		}
@@ -2630,10 +2633,18 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	role, e := s.assign(d.ID, d.Role, d.NAT, relay, d.Capacity, now)
-	if e != nil {
-		reply(w, 500, map[string]any{"error": e.Error()})
-		return
+	// Existing nodes retain their role until the authoritative rebalance below.
+	// Re-running assign on every 15-second heartbeat duplicated the full online
+	// node scan and sort performed by rebalanceRolesFor.
+	role := "client"
+	if previous != nil {
+		role = previous.Role
+	} else {
+		role, e = s.assign(d.ID, d.Role, d.NAT, relay, d.Capacity, now)
+		if e != nil {
+			reply(w, 500, map[string]any{"error": e.Error()})
+			return
+		}
 	}
 	var ownerValue any
 	if accountScoped {
@@ -2662,11 +2673,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
-	log.Printf("[SERVER] register node=%s role=%s mesh_ip=%s", d.ID[:8], role, ip)
 	topologyChanged := registrationChangesTopology(previous, now-int64(s.settings().TTL), node{
 		PublicKey: d.Public, NAT: d.NAT, Role: role, Endpoint: d.Endpoint,
 		RequestedRole: d.Role, Relay: relay, Capacity: d.Capacity, MeshIP: ip,
 	})
+	if topologyChanged {
+		log.Printf("[SERVER] register node=%s role=%s mesh_ip=%s", d.ID[:8], role, ip)
+	}
 	response := map[string]any{"status": "ok", "mesh_ip": ip, "mesh_network": s.network.String(), "assigned_role": role, "topology_changed": topologyChanged}
 	if enrollmentToken != "" {
 		response["network_token"] = enrollmentToken

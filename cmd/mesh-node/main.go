@@ -2552,13 +2552,24 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 		length, address, e := conn.ReadFromUDP(buffer)
 		n.udpReadMu.RUnlock()
 		if e != nil {
-			if ctx.Err() != nil {
+			// A socket replacement deliberately closes the old connection while
+			// the node context stays alive. ReadFromUDP then returns net.ErrClosed
+			// immediately forever; retrying it here used to leave one hot goroutine
+			// behind after every network recovery.
+			if ctx.Err() != nil || errors.Is(e, net.ErrClosed) {
 				return
 			}
 			if ne, ok := e.(net.Error); ok && ne.Timeout() {
 				continue
 			}
 			n.debugf("UDP receive failed: %v", e)
+			// Protect against platform-specific persistent socket errors as well.
+			// UDP has no useful work to do until the socket recovers or is replaced.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 		n.handleDatagram(buffer[:length], address)
