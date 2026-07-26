@@ -401,9 +401,10 @@ async function removeDirectEdge(key, button) {
   try {
     if (button) button.disabled = true;
     seedManual();
-    let manual = state.manualLinks.some(e => edgeKey(e.a, e.b) === key);
     state.manualLinks = state.manualLinks.filter(e => edgeKey(e.a, e.b) !== key);
-    if (!manual && !state.blockedLinks.some(e => edgeKey(e.a, e.b) === key)) {
+    // A deleted manual edge must also stay deleted when automatic topology
+    // would otherwise select the same client-superpeer pair again.
+    if (!state.blockedLinks.some(e => edgeKey(e.a, e.b) === key)) {
       let [a, b] = key.split('|');
       state.blockedLinks.push({a, b, cost: 1});
     }
@@ -755,13 +756,16 @@ async function refreshGraph() {
     // The normal refresh reports authentication/network errors to the user.
   }
 }
-$('connect').onclick = () => {
-  sessionStorage.setItem('meshToken', $('token').value);
-  loadScopes();
+function startLiveRefresh() {
   clearInterval(timer);
   clearInterval(graphTimer);
   timer = setInterval(loadScopes, 10000);
-  graphTimer = setInterval(refreshGraph, 3000)
+  graphTimer = setInterval(refreshGraph, 3000);
+}
+$('connect').onclick = () => {
+  sessionStorage.setItem('meshToken', $('token').value);
+  loadScopes();
+  startLiveRefresh()
 };
 $('refresh').onclick = loadScopes;
 $('topologyScope').onchange = e => {
@@ -828,7 +832,8 @@ async function accountLogin() {
     $('accountPassword').value = '';
     $('accountRegistrationInvite').value = '';
     toast('Signed in');
-    await loadScopes()
+    await loadScopes();
+    startLiveRefresh()
   } catch (e) {
     accountError(e)
   }
@@ -928,7 +933,8 @@ $('createAccountInvite').onclick = async () => {
       $('accountLogin').hidden = true;
       $('accountRegister').hidden = true;
       $('accountLogout').hidden = false;
-      await loadScopes()
+      await loadScopes();
+      startLiveRefresh()
     }
   } catch (e) {}
 })();
