@@ -171,6 +171,10 @@ type symmetricRelayTarget struct {
 	id   string
 	peer peer
 }
+type pingProbe struct {
+	sent   time.Time
+	peerID string
+}
 type fastFrame struct {
 	data []byte
 	addr *net.UDPAddr
@@ -202,7 +206,7 @@ type node struct {
 	receiveSockets   map[*net.UDPConn]struct{}
 	receiveWG        sync.WaitGroup
 	lanConn          *net.UDPConn
-	udpReadMu        sync.Mutex
+	udpReadMu        sync.RWMutex
 	recoveryMu       sync.Mutex
 	recoveryNext     time.Time
 	recoveryFails    int
@@ -212,7 +216,7 @@ type node struct {
 	controlCall      sync.Mutex
 	controlReply     chan controlFrame
 	pingMu           sync.Mutex
-	pings            map[string]time.Time
+	pings            map[string]pingProbe
 	mu               sync.RWMutex
 	routeMu          sync.Mutex
 	dir              map[string]*peer
@@ -615,7 +619,7 @@ func newNode(c config) (*node, error) {
 		symmetricBurstAt:    map[string]time.Time{},
 		symmetricBurstSess:  map[string]string{},
 		symmetricScanSlots:  make(chan struct{}, 2),
-		pings:               map[string]time.Time{},
+		pings:               map[string]pingProbe{},
 	}
 	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
 	for _, v := range c.allows {
@@ -1674,9 +1678,9 @@ func (n *node) replaceUDPConn(next *net.UDPConn) {
 // the Wi-Fi Network after the default network changes to LTE; refreshing STUN
 // on that socket then keeps returning the dead mapping.
 func (n *node) rebindUDPConn() error {
-	// Do not close a socket while receive or STUN is using it. Read operations
-	// have a one-second deadline, so this lock also gives those loops a chance
-	// to leave the old socket cleanly.
+	// Do not close a socket while receive or STUN is using it. Receive loops
+	// hold a shared lock, so all per-superpeer sockets can read concurrently
+	// while rebind still waits for them to leave their one-second read window.
 	n.udpReadMu.Lock()
 	defer n.udpReadMu.Unlock()
 
@@ -2169,30 +2173,65 @@ func (n *node) helloAll() {
 }
 func (n *node) pingAll() {
 	n.mu.RLock()
-	ids := make([]string, 0, len(n.neighbors))
-	for id := range n.neighbors {
-		ids = append(ids, id)
+	targets := make([]pingTarget, 0, len(n.neighbors))
+	for id, peer := range n.neighbors {
+		target := pingTarget{id: id, endpoint: peer.Endpoint}
+		if observed, ok := peer.last.(*net.UDPAddr); ok {
+			target.observed = &net.UDPAddr{IP: append(net.IP(nil), observed.IP...), Port: observed.Port, Zone: observed.Zone}
+		}
+		targets = append(targets, target)
 	}
 	n.mu.RUnlock()
 	now := time.Now()
 	n.pingMu.Lock()
 	prunePings(n.pings, now.Add(-linkTimeout))
 	n.pingMu.Unlock()
-	for _, id := range ids {
-		p := protocol.NewPacket("PING", n.id.ID, id, map[string]any{})
+	for _, target := range targets {
+		p := protocol.NewPacket("PING", n.id.ID, target.id, map[string]any{})
+		if !n.sendDirect(p, target.endpoint, target.observed) {
+			continue
+		}
 		n.pingMu.Lock()
-		n.pings[p.ID] = now
+		n.pings[p.ID] = pingProbe{sent: now, peerID: target.id}
 		n.pingMu.Unlock()
-		n.send(p)
 	}
+}
+
+type pingTarget struct {
+	id       string
+	endpoint string
+	observed *net.UDPAddr
+}
+
+// sendDirect bypasses mesh routing. Keepalive RTT is a measurement of a
+// physical neighbor link, not of a potentially changing multi-hop route.
+func (n *node) sendDirect(packet protocol.Packet, endpoint string, observed *net.UDPAddr) bool {
+	address := observed
+	if address == nil {
+		var err error
+		address, err = net.ResolveUDPAddr("udp", endpoint)
+		if err != nil {
+			return false
+		}
+	}
+	encoded, err := protocol.EncodePacket(packet, n.key)
+	if err != nil {
+		return false
+	}
+	conn := n.connForPeer(packet.Destination)
+	if conn == nil {
+		return false
+	}
+	_, err = conn.WriteToUDP(encoded, address)
+	return err == nil
 }
 
 // PONG removes its matching entry, but offline peers never answer. Bound the
 // bookkeeping for those peers so a long-running node does not accumulate one
 // ping timestamp per keepalive interval forever.
-func prunePings(pings map[string]time.Time, before time.Time) {
-	for id, sent := range pings {
-		if sent.Before(before) {
+func prunePings(pings map[string]pingProbe, before time.Time) {
+	for id, probe := range pings {
+		if probe.sent.Before(before) {
 			delete(pings, id)
 		}
 	}
@@ -2509,9 +2548,9 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 	buffer := make([]byte, protocol.MaxDatagramSize)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
-		n.udpReadMu.Lock()
+		n.udpReadMu.RLock()
 		length, address, e := conn.ReadFromUDP(buffer)
-		n.udpReadMu.Unlock()
+		n.udpReadMu.RUnlock()
 		if e != nil {
 			if ctx.Err() != nil {
 				return
@@ -2554,21 +2593,9 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
 		n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
 	case "PING":
-		n.send(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}))
+		n.sendToAddress(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}), address)
 	case "PONG":
-		if id, ok := p.Payload["ping_id"].(string); ok {
-			n.pingMu.Lock()
-			sent := n.pings[id]
-			delete(n.pings, id)
-			n.pingMu.Unlock()
-			if !sent.IsZero() {
-				n.mu.Lock()
-				if q := n.neighbors[p.Source]; q != nil {
-					q.rttMS = float64(time.Since(sent).Microseconds()) / 1000
-				}
-				n.mu.Unlock()
-			}
-		}
+		n.handlePong(p)
 	case "SYMMETRIC_BURST":
 		n.ensureNeighbor(p.Source)
 		n.handleSymmetricBurst(p, address)
@@ -2576,6 +2603,27 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		n.ensureNeighbor(p.Source)
 		n.data(p)
 	}
+}
+
+func (n *node) handlePong(packet protocol.Packet) {
+	id, ok := packet.Payload["ping_id"].(string)
+	if !ok || packet.TTL != protocol.DefaultTTL {
+		return
+	}
+	n.pingMu.Lock()
+	probe, exists := n.pings[id]
+	if exists && probe.peerID == packet.Source {
+		delete(n.pings, id)
+	}
+	n.pingMu.Unlock()
+	if !exists || probe.peerID != packet.Source || probe.sent.IsZero() {
+		return
+	}
+	n.mu.Lock()
+	if peer := n.neighbors[packet.Source]; peer != nil {
+		peer.rttMS = float64(time.Since(probe.sent).Microseconds()) / 1000
+	}
+	n.mu.Unlock()
 }
 
 // A relay preserves the original source but decrements TTL. Such a packet

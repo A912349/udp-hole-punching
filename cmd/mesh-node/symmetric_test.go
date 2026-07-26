@@ -172,3 +172,37 @@ func TestCompleteSymmetricScanRequiresMatchingSession(t *testing.T) {
 		t.Fatal("peer was not marked connected")
 	}
 }
+
+func TestHandlePongTracksOnlyDirectExpectedProbe(t *testing.T) {
+	const probeID = "probe-id"
+	n := &node{
+		neighbors: map[string]*peer{"peer": {}},
+		pings: map[string]pingProbe{
+			probeID: {sent: time.Now().Add(-5 * time.Millisecond), peerID: "peer"},
+		},
+	}
+
+	relayed := protocol.Packet{Source: "peer", TTL: protocol.DefaultTTL - 1, Payload: map[string]any{"ping_id": probeID}}
+	n.handlePong(relayed)
+	if n.neighbors["peer"].rttMS != 0 {
+		t.Fatal("relayed PONG changed direct-link RTT")
+	}
+	if _, exists := n.pings[probeID]; !exists {
+		t.Fatal("relayed PONG consumed the direct probe")
+	}
+
+	wrongPeer := protocol.Packet{Source: "other", TTL: protocol.DefaultTTL, Payload: map[string]any{"ping_id": probeID}}
+	n.handlePong(wrongPeer)
+	if _, exists := n.pings[probeID]; !exists {
+		t.Fatal("PONG from another peer consumed the probe")
+	}
+
+	direct := protocol.Packet{Source: "peer", TTL: protocol.DefaultTTL, Payload: map[string]any{"ping_id": probeID}}
+	n.handlePong(direct)
+	if n.neighbors["peer"].rttMS <= 0 {
+		t.Fatal("direct PONG did not update RTT")
+	}
+	if _, exists := n.pings[probeID]; exists {
+		t.Fatal("direct PONG did not consume its probe")
+	}
+}
