@@ -2569,11 +2569,11 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 		delete(n.receiveSockets, conn)
 		n.receiveMu.Unlock()
 	}()
-	buffer := make([]byte, protocol.MaxDatagramSize)
+	reader := newUDPBatchReader(conn)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n.udpReadMu.RLock()
-		length, address, e := conn.ReadFromUDP(buffer)
+		datagrams, e := reader.read()
 		n.udpReadMu.RUnlock()
 		if e != nil {
 			// A socket replacement deliberately closes the old connection while
@@ -2596,7 +2596,9 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 			}
 			continue
 		}
-		n.handleDatagram(buffer[:length], address)
+		for _, datagram := range datagrams {
+			n.handleDatagram(datagram.data, datagram.address)
+		}
 	}
 }
 
