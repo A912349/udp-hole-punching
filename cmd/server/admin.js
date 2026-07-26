@@ -908,18 +908,30 @@ $('createAccountInvite').onclick = async () => {
   button.dataset.page = 'forwards';
   button.textContent = 'Reverse ports';
   nav.insertBefore(button, nav.querySelector('[data-page="access"]'));
-  button.onclick = () => page('forwards');
+  button.onclick = () => {
+    page('forwards');
+    options();
+    forwards();
+  };
 
   function options() {
-    let nodes = (state.topologies?.all?.nodes || state.topology.nodes || []);
+    // Keep this working with both the scoped and legacy topology loaders.
+    let nodes = [
+      ...(state.topologies?.all?.nodes || []),
+      ...(state.topologies?.online?.nodes || []),
+      ...(state.topology?.nodes || [])
+    ],
+      seen = new Set();
+    nodes = nodes.filter(n => n?.node_id && !seen.has(n.node_id) && seen.add(n.node_id));
     let text = nodes.map(n => `<option value="${esc(n.node_id)}">${esc(n.name||n.node_id.slice(0,12))} · ${esc(n.mesh_ip)}</option>`).join('');
     $('forwardSource').innerHTML = text;
     $('forwardTarget').innerHTML = text
   }
   async function forwards() {
     try {
-      let rows = await api('/v1/admin/forwards');
+      // Loading existing rules must not be a prerequisite for peer options.
       options();
+      let rows = await api('/v1/admin/forwards');
       $('forwardRows').innerHTML = rows.map(f => `<tr><td>${esc(f.source_node_id.slice(0,12))}</td><td><code>${esc(f.listen_host)}:${f.listen_port}</code></td><td>${esc(f.target_node_id.slice(0,12))} → <code>${esc(f.target_host)}:${f.target_port}</code></td><td><button class="ghost" data-forward-delete="${f.id}">Remove</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">No reverse ports configured.</td></tr>';
       $('forwardRows').querySelectorAll('[data-forward-delete]').forEach(b => b.onclick = async () => {
         if (!confirm('Remove this forwarding?')) return;

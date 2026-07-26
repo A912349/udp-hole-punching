@@ -997,6 +997,11 @@ func (n *node) register() error {
 		n.key = k[:]
 		persisted := n.c
 		persisted.role = n.requestedRole
+		// n.c.nat contains the result of the latest automatic detection.
+		// Persist the user's mode instead, otherwise an auto-detected
+		// "symmetric" value becomes a permanent setting after enrollment and
+		// future reconnects cannot update it to "cone".
+		persisted.nat = n.requestedNAT
 		if err := saveInteractiveConfig(persisted); err != nil {
 			return fmt.Errorf("persist enrolled network token: %w", err)
 		}
