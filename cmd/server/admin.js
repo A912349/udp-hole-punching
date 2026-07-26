@@ -44,7 +44,8 @@ let state = {
     manualLinks: [],
     blockedLinks: []
   },
-  timer;
+  timer,
+  graphTimer;
 let graphUI = {
   positions: {},
   source: null,
@@ -736,11 +737,30 @@ async function loadScopes() {
 function load() {
   return loadScopes()
 }
+
+// Keep the visualization responsive to registrations, disconnects and
+// telemetry changes without waiting for the slower full admin refresh.
+async function refreshGraph() {
+  try {
+    let [online, all] = await Promise.all([
+      api('/v1/admin/topology?scope=online'),
+      api('/v1/admin/topology?scope=all')
+    ]);
+    state.topologies = {online, all};
+    state.topology = state.scope === 'all' ? all : online;
+    render();
+    renderAllRemoveList();
+  } catch (e) {
+    // The normal refresh reports authentication/network errors to the user.
+  }
+}
 $('connect').onclick = () => {
   sessionStorage.setItem('meshToken', $('token').value);
   loadScopes();
   clearInterval(timer);
-  timer = setInterval(loadScopes, 10000)
+  clearInterval(graphTimer);
+  timer = setInterval(loadScopes, 10000);
+  graphTimer = setInterval(refreshGraph, 3000)
 };
 $('refresh').onclick = loadScopes;
 $('topologyScope').onchange = e => {

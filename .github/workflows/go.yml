@@ -98,10 +98,10 @@ jobs:
 
       - name: Compress binaries
         run: |
-          upx --best --lzma bin/server
-          upx --best --lzma bin/server-linux-arm64
-          upx --best --lzma bin/mesh-node
-          upx --best --lzma bin/mesh-node-linux-arm64
+          for binary in bin/*; do
+            upx --best --lzma "$binary" &
+          done
+          wait
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
