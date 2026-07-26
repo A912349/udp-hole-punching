@@ -1814,20 +1814,12 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	if time.Since(previous) < 5*time.Second {
 		return
 	}
-	// A burst is a trigger to ensure that scanning is running. It must not
-	// cancel and restart an already active scan: doing so can invalidate a
-	// nearly completed HELLO/HELLO_ACK exchange on the other node.
-	// The coordinator endpoint can already be stale: every probe socket of a
-	// symmetric NAT gets a distinct public mapping. Anchor the scan to the
-	// mapping from which this burst packet actually arrived.
-	endpoint := peer.Endpoint
-	if observed != nil {
-		endpoint = observed.String()
-	}
-	// The control event starts the worker around the registered endpoint. The
-	// first authenticated burst reveals the current per-destination mapping;
-	// restart this same session around that exact port.
-	n.startSymmetricScan(packet.Source, endpoint, sessionID, activeSession != "")
+	// The control event already started the scan for this session. The burst
+	// only confirms that the 500-port round has begun; do not restart the scan
+	// around the observed mapping, otherwise the event and the burst briefly
+	// run two workers for the same session.
+	_ = observed
+	n.startSymmetricScan(packet.Source, peer.Endpoint, sessionID, false)
 }
 
 func payloadString(packet protocol.Packet, key string) string {
