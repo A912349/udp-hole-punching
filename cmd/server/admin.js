@@ -334,7 +334,11 @@ function selectEdge(key) {
   let box = $('nodeDetail');
   box.innerHTML = `<b>${esc(live.a.slice(0,8))} ↔ ${esc(live.b.slice(0,8))}</b><span>${live.rtt_ms?Math.round(live.rtt_ms)+' ms':'No RTT'} · ${esc(live.status||'unknown')}</span><span class="spacer"></span><label>Route cost <input id="directCost" type="number" min="0.1" max="1000" step="0.1" value="${manual?.cost||live.cost||1}"></label><button id="directCostSave">Save cost</button><button id="directEdgeRemove" class="dangerButton">Remove link</button>`;
   $('directCostSave').onclick = () => saveDirectEdge(live.a, live.b, Number($('directCost').value));
-  $('directEdgeRemove').onclick = () => removeDirectEdge(key)
+  $('directEdgeRemove').onclick = e => {
+    e.preventDefault();
+    e.stopPropagation();
+    removeDirectEdge(key, e.currentTarget)
+  }
 }
 
 function seedManual() {
@@ -393,8 +397,9 @@ async function saveDirectEdge(a, b, cost) {
     toast(e.message)
   }
 }
-async function removeDirectEdge(key) {
+async function removeDirectEdge(key, button) {
   try {
+    if (button) button.disabled = true;
     seedManual();
     let manual = state.manualLinks.some(e => edgeKey(e.a, e.b) === key);
     state.manualLinks = state.manualLinks.filter(e => edgeKey(e.a, e.b) !== key);
@@ -613,13 +618,6 @@ async function deleteEdge(i) {
     toast(e.message)
   }
 }
-$('connect').onclick = () => {
-  sessionStorage.setItem('meshToken', $('token').value);
-  load();
-  clearInterval(timer);
-  timer = setInterval(load, 10000)
-};
-$('refresh').onclick = load;
 $('peerSearch').oninput = renderPeers;
 $('roleFilter').onchange = renderPeers;
 $('natFilter').onchange = renderPeers;
@@ -725,7 +723,9 @@ async function loadScopes() {
     };
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
-    render();
+    // Keep the inspector stable while refreshing the live graph.
+    overviewGraph();
+    drawInteractive();
     renderAllRemoveList()
   } catch (e) {
     $('liveDot').classList.remove('live');
@@ -748,7 +748,8 @@ async function refreshGraph() {
     ]);
     state.topologies = {online, all};
     state.topology = state.scope === 'all' ? all : online;
-    render();
+    overviewGraph();
+    drawInteractive();
     renderAllRemoveList();
   } catch (e) {
     // The normal refresh reports authentication/network errors to the user.
