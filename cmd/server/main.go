@@ -82,6 +82,9 @@ type link struct {
 }
 type server struct {
 	db                                          *sql.DB
+	registerLookupStmt                          *sql.Stmt
+	registerInsertStmt                          *sql.Stmt
+	registerUpdateStmt                          *sql.Stmt
 	token                                       string
 	bootstrapToken                              string
 	tokenKey                                    []byte
@@ -730,7 +733,35 @@ func (s *server) init() error {
 			return err
 		}
 	}
-	return s.loadSettings()
+	if err = s.loadSettings(); err != nil {
+		return err
+	}
+	return s.prepareRegisterStatements()
+}
+
+// Registration is the heartbeat hot path. Keeping these statements prepared
+// avoids reparsing the same SQLite SQL for every connected node every 15s.
+func (s *server) prepareRegisterStatements() error {
+	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.mesh_ip,n.owner_id,o.role
+		FROM nodes n LEFT JOIN role_overrides o ON o.node_id=n.node_id WHERE n.node_id=?`)
+	if err != nil {
+		return err
+	}
+	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+	if err != nil {
+		lookup.Close()
+		return err
+	}
+	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,mesh_ip=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
+	if err != nil {
+		lookup.Close()
+		insert.Close()
+		return err
+	}
+	s.registerLookupStmt = lookup
+	s.registerInsertStmt = insert
+	s.registerUpdateStmt = update
+	return nil
 }
 
 const (
@@ -2553,6 +2584,28 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+// registeredNode combines the three per-heartbeat lookups (node, owner and
+// role override) into one indexed query.
+func (s *server) registeredNode(id string) (*node, sql.NullInt64, sql.NullString, error) {
+	var n node
+	var relay int
+	var owner sql.NullInt64
+	var override sql.NullString
+	err := s.registerLookupStmt.QueryRow(id).Scan(
+		&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole,
+		&relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.MeshIP, &owner, &override,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, owner, override, nil
+	}
+	if err != nil {
+		return nil, owner, override, err
+	}
+	n.Relay = relay != 0
+	return &n, owner, override, nil
+}
+
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
@@ -2589,14 +2642,17 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]any{"error": "node_id does not match public_key"})
 		return
 	}
-	var existingOwner sql.NullInt64
-	if s.db.QueryRow("SELECT owner_id FROM nodes WHERE node_id=?", d.ID).Scan(&existingOwner) == nil && accountScoped && existingOwner.Valid && existingOwner.Int64 != accountID {
+	previous, existingOwner, roleOverride, e := s.registeredNode(d.ID)
+	if e != nil {
+		reply(w, 500, map[string]any{"error": e.Error()})
+		return
+	}
+	if accountScoped && existingOwner.Valid && existingOwner.Int64 != accountID {
 		reply(w, http.StatusForbidden, map[string]any{"error": "node belongs to another account"})
 		return
 	}
-	var roleOverride string
-	if s.db.QueryRow("SELECT role FROM role_overrides WHERE node_id=?", d.ID).Scan(&roleOverride) == nil {
-		d.Role = roleOverride
+	if roleOverride.Valid {
+		d.Role = roleOverride.String
 	}
 	if d.Role == "superpeer" && d.NAT != "cone" {
 		reply(w, 400, map[string]any{"error": "only cone nodes may be superpeers"})
@@ -2617,15 +2673,6 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		d.Capacity = 1000
 	}
 	now := time.Now().Unix()
-	previousRows, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE node_id=?", d.ID)
-	if e != nil {
-		reply(w, 500, map[string]any{"error": e.Error()})
-		return
-	}
-	var previous *node
-	if len(previousRows) > 0 {
-		previous = &previousRows[0]
-	}
 	ip := d.MeshIP
 	if ip == "" && previous != nil {
 		ip = previous.MeshIP
@@ -2637,20 +2684,23 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	var owner string
-	var ownerLastSeen int64
-	s.db.QueryRow("SELECT node_id,last_seen FROM nodes WHERE mesh_ip=? AND node_id!=?", ip, d.ID).Scan(&owner, &ownerLastSeen)
-	if owner != "" {
-		if ownerLastSeen >= now-int64(s.settings().TTL) {
-			reply(w, 409, map[string]any{"error": "mesh_ip is already assigned"})
-			return
-		}
-		// A crashed or replaced client may leave its last mesh address in the
-		// registry. It is safe to reclaim it once the previous registration is
-		// outside the online TTL; keep the old device row for offline inventory.
-		if _, e = s.db.Exec("UPDATE nodes SET mesh_ip='' WHERE node_id=?", owner); e != nil {
-			reply(w, 500, map[string]any{"error": e.Error()})
-			return
+	ttl := s.settings().TTL
+	if previous == nil || ip != previous.MeshIP {
+		var owner string
+		var ownerLastSeen int64
+		s.db.QueryRow("SELECT node_id,last_seen FROM nodes WHERE mesh_ip=? AND node_id!=?", ip, d.ID).Scan(&owner, &ownerLastSeen)
+		if owner != "" {
+			if ownerLastSeen >= now-int64(ttl) {
+				reply(w, 409, map[string]any{"error": "mesh_ip is already assigned"})
+				return
+			}
+			// A crashed or replaced client may leave its last mesh address in the
+			// registry. It is safe to reclaim it once the previous registration is
+			// outside the online TTL; keep the old device row for offline inventory.
+			if _, e = s.db.Exec("UPDATE nodes SET mesh_ip='' WHERE node_id=?", owner); e != nil {
+				reply(w, 500, map[string]any{"error": e.Error()})
+				return
+			}
 		}
 	}
 	// Existing nodes retain their role until the authoritative rebalance below.
@@ -2659,18 +2709,20 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	role := "client"
 	if previous != nil {
 		role = previous.Role
-	} else {
-		role, e = s.assign(d.ID, d.Role, d.NAT, relay, d.Capacity, now)
-		if e != nil {
-			reply(w, 500, map[string]any{"error": e.Error()})
-			return
-		}
+	} else if d.Role == "superpeer" {
+		// The authoritative rebalance immediately below picks auto candidates.
+		// Preserve a manually requested superpeer until that pass runs.
+		role = "superpeer"
 	}
 	var ownerValue any
 	if accountScoped {
 		ownerValue = accountID
 	}
-	_, e = s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET public_key=excluded.public_key,nat_type=excluded.nat_type,role=excluded.role,endpoint=excluded.endpoint,requested_role=excluded.requested_role,relay_capable=excluded.relay_capable,capacity=excluded.capacity,last_seen=excluded.last_seen,mesh_ip=excluded.mesh_ip,owner_id=COALESCE(nodes.owner_id,excluded.owner_id)`, d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, ip, ownerValue)
+	if previous == nil {
+		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, ip, ownerValue)
+	} else {
+		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, ip, ownerValue, d.ID)
+	}
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
@@ -2683,17 +2735,24 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if accountScoped {
-		e = s.rebalanceRolesFor(&accountID)
-	} else {
-		e = s.rebalanceRoles()
+	// A normal heartbeat changes only last_seen. Do not scan and sort every
+	// online node in rebalanceRolesFor unless eligibility or ownership changed.
+	needsRebalance := previous == nil || previous.LastSeen < now-int64(ttl) ||
+		(previous != nil && (previous.NAT != d.NAT || previous.RequestedRole != d.Role || previous.Relay != relay || previous.Capacity != d.Capacity)) ||
+		(accountScoped && !existingOwner.Valid)
+	if needsRebalance {
+		if accountScoped {
+			e = s.rebalanceRolesFor(&accountID)
+		} else {
+			e = s.rebalanceRoles()
+		}
+		if e != nil {
+			reply(w, 500, map[string]any{"error": e.Error()})
+			return
+		}
+		_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
 	}
-	if e != nil {
-		reply(w, 500, map[string]any{"error": e.Error()})
-		return
-	}
-	_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
-	topologyChanged := registrationChangesTopology(previous, now-int64(s.settings().TTL), node{
+	topologyChanged := registrationChangesTopology(previous, now-int64(ttl), node{
 		PublicKey: d.Public, NAT: d.NAT, Role: role, Endpoint: d.Endpoint,
 		RequestedRole: d.Role, Relay: relay, Capacity: d.Capacity, MeshIP: ip,
 	})
