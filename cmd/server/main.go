@@ -14,12 +14,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"sort"
@@ -163,6 +165,7 @@ func envInt(name string, fallback int) int {
 	return fallback
 }
 func main() {
+	pprofListen := flag.String("pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6061")
 	if len(os.Args) > 1 && (os.Args[1] == "--add-autostart" || os.Args[1] == "--del-autostart") {
 		var err error
 		if os.Args[1] == "--add-autostart" {
@@ -175,6 +178,23 @@ func main() {
 		}
 		log.Println("autostart updated")
 		return
+	}
+	flag.Parse()
+	if *pprofListen != "" {
+		host, _, err := net.SplitHostPort(*pprofListen)
+		if err != nil {
+			log.Fatalf("invalid --pprof-listen: %v", err)
+		}
+		ip := net.ParseIP(host)
+		if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+			log.Fatal("--pprof-listen must use localhost or a loopback IP")
+		}
+		go func() {
+			log.Printf("[SERVER] pprof available at http://%s/debug/pprof/", *pprofListen)
+			if err := http.ListenAndServe(*pprofListen, nil); err != nil {
+				log.Printf("[SERVER] pprof listener stopped: %v", err)
+			}
+		}()
 	}
 	dsn := os.Getenv("MESH_DATABASE")
 	if dsn == "" {
