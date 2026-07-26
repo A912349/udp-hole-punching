@@ -172,29 +172,45 @@ func NewNonceSequence() (*NonceSequence, error) {
 }
 
 func (s *NonceSequence) Next() ([]byte, error) {
-	count := s.counter.Add(1)
-	if count == 0 {
-		return nil, fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
-	}
 	nonce := make([]byte, chacha20poly1305.NonceSize)
+	if err := s.NextInto(nonce); err != nil {
+		return nil, err
+	}
+	return nonce, nil
+}
+
+// NextInto writes the next nonce into caller-owned storage. Data-plane callers
+// use it to build and encrypt a complete frame in one backing array.
+func (s *NonceSequence) NextInto(nonce []byte) error {
+	if len(nonce) != chacha20poly1305.NonceSize {
+		return fmt.Errorf("%w: invalid nonce buffer size", ErrProtocol)
+	}
+	var count uint32
+	for {
+		previous := s.counter.Load()
+		if previous == ^uint32(0) {
+			return fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
+		}
+		count = previous + 1
+		if s.counter.CompareAndSwap(previous, count) {
+			break
+		}
+	}
 	copy(nonce, s.prefix[:])
 	binary.BigEndian.PutUint32(nonce[8:], count)
-	return nonce, nil
+	return nil
 }
 
 func SealBytesWithSequence(a cipher.AEAD, sequence *NonceSequence, plaintext, aad []byte) ([]byte, error) {
 	if a.NonceSize() != chacha20poly1305.NonceSize {
 		return nil, fmt.Errorf("%w: unsupported nonce size", ErrProtocol)
 	}
-	count := sequence.counter.Add(1)
-	if count == 0 {
-		return nil, fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
-	}
 	// Keep the nonce on the stack.  The frame itself owns the wire nonce, so
 	// allocating a separate []byte for it on every TUN packet is unnecessary.
 	var nonce [chacha20poly1305.NonceSize]byte
-	copy(nonce[:], sequence.prefix[:])
-	binary.BigEndian.PutUint32(nonce[8:], count)
+	if err := sequence.NextInto(nonce[:]); err != nil {
+		return nil, err
+	}
 	frame := make([]byte, len(nonce), len(nonce)+len(plaintext)+a.Overhead())
 	copy(frame, nonce[:])
 	return a.Seal(frame, nonce[:], plaintext, aad), nil

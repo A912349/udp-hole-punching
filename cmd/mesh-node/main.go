@@ -68,6 +68,7 @@ const (
 	maxTUN                = 1279
 	fastBatchSize         = 32
 	fastQueueSize         = 1024
+	fastSeenCapacity      = 10000
 	lanDiscoveryPort      = 37777
 	lanDiscoveryInterval  = 10 * time.Second
 	maxFastFrame          = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
@@ -155,6 +156,7 @@ type cachedKey struct {
 	key     []byte
 	aead    cipher.AEAD
 	nonces  *protocol.NonceSequence
+	peerID  [16]byte
 	openAAD []byte
 	sealAAD []byte
 }
@@ -195,6 +197,9 @@ type node struct {
 	requestedRole    string
 	requestedNAT     string
 	id               *protocol.Identity
+	idBinary         [16]byte
+	packetPrefix     [4]byte
+	packetCounter    atomic.Uint64
 	key              []byte
 	conn             *net.UDPConn
 	connMu           sync.RWMutex
@@ -230,6 +235,10 @@ type node struct {
 	subnetRoutes     []subnetRoute
 	installedRoutes  map[string]bool
 	seen             map[string]struct{}
+	fastSeenMu       sync.Mutex
+	fastSeen         map[[12]byte]struct{}
+	fastSeenRing     [][12]byte
+	fastSeenNext     int
 	pending          map[string]chan serviceResult
 	services         map[string]string
 	allow            map[string]bool
@@ -243,6 +252,7 @@ type node struct {
 	startedAt        time.Time
 	fastQueue        chan fastFrame
 	fastPool         sync.Pool
+	sendPool         sync.Pool
 	macPool          sync.Pool
 	deliverQueue     chan deliverFrame
 	stats            fastStats
@@ -579,6 +589,12 @@ func newNode(c config) (*node, error) {
 	if e != nil {
 		return nil, e
 	}
+	decodedID, e := hex.DecodeString(id.ID)
+	if e != nil || len(decodedID) != 16 {
+		return nil, errors.New("identity has an invalid node ID")
+	}
+	var idBinary [16]byte
+	copy(idBinary[:], decodedID)
 	a, e := net.ResolveUDPAddr("udp4", fmt.Sprintf("%s:%d", c.bind, c.port))
 	if e != nil {
 		return nil, e
@@ -593,6 +609,7 @@ func newNode(c config) (*node, error) {
 		requestedRole:       c.role,
 		requestedNAT:        c.nat,
 		id:                  id,
+		idBinary:            idBinary,
 		key:                 k[:],
 		conn:                conn,
 		symmetricConns:      map[string]*net.UDPConn{},
@@ -603,6 +620,8 @@ func newNode(c config) (*node, error) {
 		meshNodes:           map[netip.Addr]string{},
 		installedRoutes:     map[string]bool{},
 		seen:                map[string]struct{}{},
+		fastSeen:            make(map[[12]byte]struct{}, fastSeenCapacity),
+		fastSeenRing:        make([][12]byte, 0, fastSeenCapacity),
 		pending:             map[string]chan serviceResult{},
 		services:            map[string]string{},
 		allow:               map[string]bool{"*": true},
@@ -621,7 +640,12 @@ func newNode(c config) (*node, error) {
 		symmetricScanSlots:  make(chan struct{}, 2),
 		pings:               map[string]pingProbe{},
 	}
+	if _, e = rand.Read(n.packetPrefix[:]); e != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("initialize packet ID sequence: %w", e)
+	}
 	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
+	n.sendPool.New = func() any { return make([]byte, maxFastFrame) }
 	for _, v := range c.allows {
 		if v != "" {
 			if len(n.allow) == 1 {
@@ -2668,6 +2692,47 @@ func (n *node) remember(id string) bool {
 	}
 	return true
 }
+
+// rememberFast keeps data-plane replay detection independent from the broad
+// topology mutex. A fixed-size FIFO gives predictable O(1) work per packet and
+// retains exactly the most recent fast packet IDs.
+func (n *node) rememberFast(id [12]byte) bool {
+	n.fastSeenMu.Lock()
+	defer n.fastSeenMu.Unlock()
+	if _, ok := n.fastSeen[id]; ok {
+		return false
+	}
+	if len(n.fastSeenRing) < fastSeenCapacity {
+		n.fastSeenRing = append(n.fastSeenRing, id)
+	} else {
+		delete(n.fastSeen, n.fastSeenRing[n.fastSeenNext])
+		n.fastSeenRing[n.fastSeenNext] = id
+		n.fastSeenNext++
+		if n.fastSeenNext == fastSeenCapacity {
+			n.fastSeenNext = 0
+		}
+	}
+	n.fastSeen[id] = struct{}{}
+	return true
+}
+
+func (n *node) nextPacketID(dst []byte) bool {
+	if len(dst) != 12 {
+		return false
+	}
+	for {
+		previous := n.packetCounter.Load()
+		if previous == ^uint64(0) {
+			return false
+		}
+		count := previous + 1
+		if n.packetCounter.CompareAndSwap(previous, count) {
+			copy(dst, n.packetPrefix[:])
+			binary.BigEndian.PutUint64(dst[len(n.packetPrefix):], count)
+			return true
+		}
+	}
+}
 func (n *node) touch(id string, a net.Addr) {
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
@@ -2749,6 +2814,12 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 	}
 	k, e := protocol.SharedKey(n.id.Private, p.Public)
 	if e == nil {
+		decodedID, decodeErr := hex.DecodeString(id)
+		if decodeErr != nil || len(decodedID) != 16 {
+			return nil, nil, errors.New("peer has an invalid node ID")
+		}
+		var peerID [16]byte
+		copy(peerID[:], decodedID)
 		aead, cipherErr := protocol.NewAEAD(k)
 		if cipherErr != nil {
 			return nil, nil, cipherErr
@@ -2758,7 +2829,7 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 			return nil, nil, nonceErr
 		}
 		n.mu.Lock()
-		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
+		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
 		n.mu.Unlock()
 	}
 	return k, p, e
@@ -2777,17 +2848,17 @@ func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
 	return cached.aead, cached.openAAD, nil
 }
 
-func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, error) {
+func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, [16]byte, error) {
 	if _, _, err := n.peerKey(id); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, [16]byte{}, err
 	}
 	n.mu.RLock()
 	cached, ok := n.sharedKeys[id]
 	n.mu.RUnlock()
 	if !ok || cached.aead == nil || cached.nonces == nil {
-		return nil, nil, nil, errors.New("missing peer cipher")
+		return nil, nil, nil, [16]byte{}, errors.New("missing peer cipher")
 	}
-	return cached.aead, cached.nonces, cached.sealAAD, nil
+	return cached.aead, cached.nonces, cached.sealAAD, cached.peerID, nil
 }
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	k, _, e := n.peerKey(dst)
@@ -3078,16 +3149,17 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	}
 	ttl := int(auth[4])
 	src := hex.EncodeToString(auth[5:21])
-	dst := hex.EncodeToString(auth[21:37])
-	pid := hex.EncodeToString(auth[37:49])
-	if ttl < 1 || ttl > protocol.DefaultTTL || !n.remember(pid) {
-		n.debugf("drop fast frame %s->%s: invalid TTL or duplicate", src[:8], dst[:8])
+	var packetID [12]byte
+	copy(packetID[:], auth[37:49])
+	if ttl < 1 || ttl > protocol.DefaultTTL || !n.rememberFast(packetID) {
+		n.debugf("drop fast frame from %s: invalid TTL or duplicate", src[:8])
 		return
 	}
 	// HELLO frames refresh the endpoint and liveness every keepAlive period.
 	// Updating it on every data packet only adds a contended lock and a clock
 	// read to the fast path.
-	if dst != n.id.ID {
+	if !bytes.Equal(auth[21:37], n.idBinary[:]) {
+		dst := hex.EncodeToString(auth[21:37])
 		if n.c.role == "superpeer" && ttl > 1 {
 			// Reserve space for the new MAC while copying: the old frame's
 			// backing array belongs to the UDP read buffer and cannot be reused.
@@ -3104,10 +3176,10 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	}
 	plain, e := protocol.OpenBytesWithAEAD(aead, auth[fastHeader:], aad)
 	if e != nil {
-		n.debugf("drop fast frame %s->%s: decrypt failed: %v", src[:8], dst[:8], e)
+		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
 		return
 	}
-	n.debugf("fast frame %s->%s received (%d bytes encrypted)", src[:8], dst[:8], len(data))
+	n.debugf("fast frame from %s received (%d bytes encrypted)", src[:8], len(data))
 	n.acceptIPFragment(src, plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
@@ -3215,37 +3287,43 @@ func (n *node) isTUNBroadcast(addr netip.Addr) bool {
 	return true
 }
 func (n *node) sendIP(dst string, p []byte) bool {
-	aead, nonces, aad, e := n.peerCipher(dst)
+	if len(p) > maxTUN {
+		return false
+	}
+	aead, nonces, aad, target, e := n.peerCipher(dst)
 	if e != nil {
 		n.debugf("IP send to %s: %v", dst[:8], e)
 		return false
 	}
-	fragmentID := make([]byte, 8)
-	packetID := make([]byte, 12)
-	if _, e = rand.Read(fragmentID); e != nil {
+	var packetID [12]byte
+	if !n.nextPacketID(packetID[:]) {
+		n.debugf("IP send to %s: packet ID sequence exhausted", dst[:8])
 		return false
 	}
-	if _, e = rand.Read(packetID); e != nil {
-		return false
-	}
-	plain := make([]byte, 12+len(p))
-	copy(plain, fragmentID)
-	binary.BigEndian.PutUint16(plain[8:], 0)
-	binary.BigEndian.PutUint16(plain[10:], 1)
-	copy(plain[12:], p)
-	sealed, e := protocol.SealBytesWithSequence(aead, nonces, plain, aad)
-	if e != nil {
-		return false
-	}
-	src, _ := hex.DecodeString(n.id.ID)
-	target, _ := hex.DecodeString(dst)
-	pkt := make([]byte, fastHeader, fastHeader+len(sealed)+fastMAC)
+
+	// Build header, nonce and plaintext in one backing array. Seal appends its
+	// output exactly over the plaintext region, which is an overlap supported by
+	// cipher.AEAD, and leaves room for the final network HMAC.
+	nonceSize := aead.NonceSize()
+	plainAt := fastHeader + nonceSize
+	plainSize := 12 + len(p)
+	buffer := n.sendPool.Get().([]byte)
+	defer n.sendPool.Put(buffer[:maxFastFrame])
+	pkt := buffer[:plainAt+plainSize]
 	copy(pkt, fastMagic)
 	pkt[4] = protocol.DefaultTTL
-	copy(pkt[5:], src)
-	copy(pkt[21:], target)
-	copy(pkt[37:], packetID)
-	pkt = append(pkt, sealed...)
+	copy(pkt[5:21], n.idBinary[:])
+	copy(pkt[21:37], target[:])
+	copy(pkt[37:49], packetID[:])
+	if e = nonces.NextInto(pkt[fastHeader:plainAt]); e != nil {
+		return false
+	}
+	// Fragment ID and index remain zero. Count=1 takes the receiver's optimized
+	// no-reassembly path, so a random fragment ID has no observable purpose.
+	clear(pkt[plainAt : plainAt+12])
+	binary.BigEndian.PutUint16(pkt[plainAt+10:plainAt+12], 1)
+	copy(pkt[plainAt+12:], p)
+	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], aad)
 	return n.sendFast(dst, n.networkMAC(pkt, pkt))
 }
 func (n *node) deliver(src string, p []byte) {

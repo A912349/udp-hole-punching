@@ -86,6 +86,17 @@ func TestSealedPayloadRoundTrip(t *testing.T) {
 	if bytes.Equal(first[:12], second[:12]) {
 		t.Fatal("nonce sequence reused a nonce")
 	}
+	var callerOwned [12]byte
+	if err := sequence.NextInto(callerOwned[:]); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(second[:12], callerOwned[:]) {
+		t.Fatal("NextInto reused a nonce")
+	}
+	sequence.counter.Store(^uint32(0))
+	if err := sequence.NextInto(callerOwned[:]); err == nil {
+		t.Fatal("exhausted nonce sequence was accepted")
+	}
 }
 
 func mustAEAD(t *testing.T, key []byte) cipher.AEAD {
