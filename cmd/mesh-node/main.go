@@ -1888,14 +1888,13 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	n.symmetricBurstAt[packet.Source] = time.Now()
 	n.symmetricBurstSess[packet.Source] = sessionID
 	n.symmetricMu.Unlock()
-	// The coordinator event arms the session. The first authenticated burst
-	// starts exactly one scan round and supplies the current per-destination
-	// mapping; this keeps the scan and the 500-port burst synchronized.
+	// A burst is optional: the control-plane event already started the scan.
+	// When one arrives, use its observed mapping to refine the scan window.
 	endpoint := peer.Endpoint
 	if observed != nil {
 		endpoint = observed.String()
 	}
-	n.startSymmetricScan(packet.Source, endpoint, sessionID, false)
+	n.startSymmetricScan(packet.Source, endpoint, sessionID, true)
 }
 
 func payloadString(packet protocol.Packet, key string) string {
@@ -1913,8 +1912,9 @@ func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
 	if peer == nil || peer.NAT != "symmetric" {
 		return
 	}
-	// Arm the session, but wait for the authenticated SYMMETRIC_BURST before
-	// starting the scan. The ACK below only releases the 500-port burst.
+	// The control-plane event is the rendezvous barrier: begin scanning before
+	// acknowledging it, so both peers scan concurrently. A later UDP burst can
+	// refine the window but must never be required to start the scan.
 	n.symmetricMu.Lock()
 	if existing := n.symmetricScans[peerID]; existing != nil {
 		delete(n.symmetricScans, peerID)
@@ -1926,6 +1926,7 @@ func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
 	delete(n.symmetricBurstAt, peerID)
 	delete(n.symmetricBurstSess, peerID)
 	n.symmetricMu.Unlock()
+	n.startSymmetricScan(peerID, endpoint, sessionID, true)
 	err := n.request("POST", "/v1/symmetric-scan/ack", map[string]any{
 		"source_node_id": peerID,
 		"session_id":     sessionID,
