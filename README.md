@@ -78,6 +78,11 @@ For restricted or offline environments, provide both `--nat-type` and
 `--public-endpoint HOST:PORT` explicitly. Each node needs its own state
 directory because it holds its persistent X25519 identity.
 
+For symmetric NAT traversal, `--symmetric-scan-step` controls the interval
+between ports in each scan pass (default: `200`). For example, a target port
+of `54532` is probed as `54332`, `54732`, and so on through the port range;
+the following pass is centered on `54531`.
+
 Publish a one-shot TCP service:
 
 ```bash

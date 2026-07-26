@@ -2,11 +2,41 @@ package main
 
 import (
 	"net"
+	"reflect"
 	"testing"
 	"time"
 
 	"home-udp-mesh/internal/protocol"
 )
+
+func TestSymmetricScanPortsUsesSparseDescendingPasses(t *testing.T) {
+	const center, step = 54532, 200
+	ports := make([]int, 0, 329)
+	symmetricScanPorts(center, step, func(port int) bool {
+		ports = append(ports, port)
+		return len(ports) < cap(ports)
+	})
+
+	if got, want := ports[:3], []int{54332, 54732, 54932}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("scan begins with %v, want %v", got, want)
+	}
+	wrapAt := -1
+	for i, port := range ports {
+		if port == 65532 {
+			wrapAt = i
+			break
+		}
+	}
+	if wrapAt == -1 || wrapAt+1 >= len(ports) || ports[wrapAt+1] != 132 {
+		t.Fatalf("scan did not wrap from 65532 to 132: %v", ports)
+	}
+	if got := ports[len(ports)-2]; got != center {
+		t.Fatalf("first pass ends at %d, want target port %d", got, center)
+	}
+	if got := ports[len(ports)-1]; got != 54331 {
+		t.Fatalf("second pass begins at %d, want 54331", got)
+	}
+}
 
 func TestEstablishSymmetricTransportSkipsNonSymmetricNAT(t *testing.T) {
 	n := &node{c: config{nat: "cone"}}

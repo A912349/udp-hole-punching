@@ -53,27 +53,26 @@ const (
 	recoveryMaxBackoff = 5 * time.Minute
 	maxRequest         = 32000
 	maxResponse        = 48000
+	maxUDPPort         = 65535
 
-	symmetricBurstSize    = 500
-	symmetricBurstTimeout = 45 * time.Second
-	scanInitialStart      = -1000
-	scanInitialEnd        = 2000
-	scanExpand            = 2000
-	scanDelay             = 500 * time.Microsecond
-	symmetricRetryDelay   = 2 * time.Second
-	symmetricBurstRetries = 4
-	fastMagic             = "MIP1"
-	fastMAC               = 32
-	fastHeader            = 49
-	maxTUN                = 1279
-	fastBatchSize         = 32
-	fastQueueSize         = 1024
-	udpSendBatchSize      = 16
-	udpSendQueueSize      = 256
-	fastSeenCapacity      = 10000
-	lanDiscoveryPort      = 37777
-	lanDiscoveryInterval  = 10 * time.Second
-	maxFastFrame          = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
+	symmetricBurstSize       = 500
+	symmetricBurstTimeout    = 45 * time.Second
+	symmetricScanDefaultStep = 200
+	scanDelay                = 500 * time.Microsecond
+	symmetricRetryDelay      = 2 * time.Second
+	symmetricBurstRetries    = 4
+	fastMagic                = "MIP1"
+	fastMAC                  = 32
+	fastHeader               = 49
+	maxTUN                   = 1279
+	fastBatchSize            = 32
+	fastQueueSize            = 1024
+	udpSendBatchSize         = 16
+	udpSendQueueSize         = 256
+	fastSeenCapacity         = 10000
+	lanDiscoveryPort         = 37777
+	lanDiscoveryInterval     = 10 * time.Second
+	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
 )
 
 var fastMagicBytes = []byte(fastMagic)
@@ -81,7 +80,7 @@ var ipv4LimitedBroadcast = netip.MustParseAddr("255.255.255.255")
 
 type config struct {
 	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
-	port, capacity, prefix                                                                                               int
+	port, capacity, prefix, symmetricScanStep                                                                            int
 	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                bool
 	fastWorkers                                                                                                          int
 	statsInterval                                                                                                        time.Duration
@@ -409,6 +408,7 @@ func parse() config {
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
+	f.IntVar(&c.symmetricScanStep, "symmetric-scan-step", symmetricScanDefaultStep, "port interval for symmetric NAT scan")
 	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = up to 2, max 16)")
 	f.DurationVar(&c.statsInterval, "stats-interval", 0, "log fast-path throughput and queue statistics (0 = off)")
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
@@ -428,6 +428,9 @@ func parse() config {
 	if saved, err := loadInteractiveConfig(); err == nil {
 		if len(os.Args) == 1 {
 			c = saved
+			// Scan tuning is deliberately a command-line setting and is not
+			// stored with interactive connection settings.
+			c.symmetricScanStep = symmetricScanDefaultStep
 			// Interactive nodes are TUN endpoints by default. Migrate earlier
 			// saved configurations that predate this default.
 			if c.tun == "" {
@@ -497,6 +500,9 @@ func parse() config {
 	}
 	if c.statsInterval < 0 {
 		log.Fatal("--stats-interval must not be negative")
+	}
+	if c.symmetricScanStep < 1 || c.symmetricScanStep > maxUDPPort {
+		log.Fatalf("--symmetric-scan-step must be between 1 and %d", maxUDPPort)
 	}
 	return c
 }
@@ -1900,31 +1906,77 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint, sessionID string, cancel 
 		n.logf("symmetric scan endpoint for %s: %v", peerID[:8], err)
 		return
 	}
-	n.logf("symmetric scan for %s around %s (one round per 500-port burst)", peerID[:8], endpoint)
-	scanned := make(map[int]bool)
-	for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
-		start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
-		for port := start; port <= end; port++ {
-			if n.symmetricScanCancelled(cancel) {
-				return
-			}
-			if time.Now().After(deadline) {
-				n.logf("symmetric scan window expired for %s", peerID[:8])
-				return
-			}
-			if scanned[port] {
-				continue
-			}
-			scanned[port] = true
-			target := *address
-			target.Port = port
-			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public, "session_id": sessionID}), &target)
-			time.Sleep(scanDelay)
+	step := n.c.symmetricScanStep
+	if step == 0 {
+		step = symmetricScanDefaultStep
+	}
+	n.logf("symmetric scan for %s around %s (port interval %d)", peerID[:8], endpoint, step)
+	symmetricScanPorts(address.Port, step, func(port int) bool {
+		if n.symmetricScanCancelled(cancel) {
+			return false
 		}
-		if start == 1 && end == 65535 {
-			break
+		if time.Now().After(deadline) {
+			n.logf("symmetric scan window expired for %s", peerID[:8])
+			return false
+		}
+		target := *address
+		target.Port = port
+		n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public, "session_id": sessionID}), &target)
+		time.Sleep(scanDelay)
+		return true
+	})
+}
+
+// symmetricScanPorts scans ports in sparse, offset passes.  A 200-port step
+// for a peer advertised on 54532 starts at 54332, continues with 54732 through
+// 65532, wraps to 132, and only then begins the next pass around 54531.
+//
+// The advertised port is included at the end of its own pass, before the scan
+// shifts the pass center down by one.
+func symmetricScanPorts(center, step int, visit func(port int) bool) {
+	if center < 1 || center > maxUDPPort || step < 1 || step > maxUDPPort {
+		return
+	}
+	for offset := 0; offset < step; offset++ {
+		passCenter := center - offset
+		if !symmetricScanPortPass(passCenter, step, visit) {
+			return
 		}
 	}
+}
+
+func symmetricScanPortPass(center, step int, visit func(port int) bool) bool {
+	first := center % step
+	if first < 0 {
+		first += step
+	}
+	if first == 0 {
+		first = step
+	}
+	last := first + (maxUDPPort-first)/step*step
+	if center < 1 {
+		for port := first; port <= last; port += step {
+			if !visit(port) {
+				return false
+			}
+		}
+		return true
+	}
+	beforeCenter := center - step
+	if beforeCenter >= first && !visit(beforeCenter) {
+		return false
+	}
+	for port := center + step; port <= last; port += step {
+		if !visit(port) {
+			return false
+		}
+	}
+	for port := first; port < beforeCenter; port += step {
+		if !visit(port) {
+			return false
+		}
+	}
+	return visit(center)
 }
 
 func (n *node) symmetricScanCancelled(cancel chan struct{}) bool {
