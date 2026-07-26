@@ -60,10 +60,6 @@ const (
 	scanInitialEnd        = 2000
 	scanExpand            = 2000
 	scanDelay             = 500 * time.Microsecond
-	// One scan is paired with one 45-second burst window. Retrying the same
-	// stale mapping for minutes makes the cone side drift into later bursts;
-	// a new burst starts a fresh scan around its newly observed endpoint.
-	symmetricScanRetries  = 1
 	symmetricRetryDelay   = 2 * time.Second
 	symmetricBurstRetries = 4
 	fastMagic             = "MIP1"
@@ -1716,7 +1712,6 @@ func (n *node) startSymmetricScan(peerID, endpoint, sessionID string, force bool
 }
 
 func (n *node) scanSymmetricNeighbor(peerID, endpoint, sessionID string, cancel chan struct{}) {
-	deadline := time.Now().Add(symmetricBurstTimeout - symmetricRetryDelay)
 	// A full symmetric-NAT port scan is intentionally broad. Bound concurrent
 	// scans so several newly discovered peers cannot monopolize CPU and UDP
 	// bandwidth at once; queued scans remain cancellable by a newer topology.
@@ -1736,51 +1731,37 @@ func (n *node) scanSymmetricNeighbor(peerID, endpoint, sessionID string, cancel 
 		}
 		n.symmetricMu.Unlock()
 	}()
-	for attempt := 1; attempt <= symmetricScanRetries; attempt++ {
-		if n.symmetricScanCancelled(cancel) {
-			return
-		}
-		address, err := net.ResolveUDPAddr("udp", endpoint)
-		if err != nil {
-			n.logf("symmetric scan endpoint for %s (attempt %d/%d): %v", peerID[:8], attempt, symmetricScanRetries, err)
-		} else {
-			n.logf("symmetric scan for %s around %s (attempt %d/%d)", peerID[:8], endpoint, attempt, symmetricScanRetries)
-			scanned := make(map[int]bool)
-			for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
-				start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
-				for port := start; port <= end; port++ {
-					if n.symmetricScanCancelled(cancel) {
-						return
-					}
-					if time.Now().After(deadline) {
-						n.logf("symmetric scan window expired for %s", peerID[:8])
-						return
-					}
-					if scanned[port] {
-						continue
-					}
-					scanned[port] = true
-					target := *address
-					target.Port = port
-					n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public, "session_id": sessionID}), &target)
-					time.Sleep(scanDelay)
-				}
-				if start == 1 && end == 65535 {
-					break
-				}
-			}
-		}
-		if attempt < symmetricScanRetries && !n.symmetricScanCancelled(cancel) {
-			timer := time.NewTimer(symmetricRetryDelay)
-			select {
-			case <-cancel:
-				timer.Stop()
+	deadline := time.Now().Add(symmetricBurstTimeout - symmetricRetryDelay)
+	address, err := net.ResolveUDPAddr("udp", endpoint)
+	if err != nil {
+		n.logf("symmetric scan endpoint for %s: %v", peerID[:8], err)
+		return
+	}
+	n.logf("symmetric scan for %s around %s (one round per 500-port burst)", peerID[:8], endpoint)
+	scanned := make(map[int]bool)
+	for startOffset, endOffset := scanInitialStart, scanInitialEnd; ; startOffset, endOffset = startOffset-scanExpand, endOffset+scanExpand {
+		start, end := max(1, address.Port+startOffset), min(65535, address.Port+endOffset)
+		for port := start; port <= end; port++ {
+			if n.symmetricScanCancelled(cancel) {
 				return
-			case <-timer.C:
 			}
+			if time.Now().After(deadline) {
+				n.logf("symmetric scan window expired for %s", peerID[:8])
+				return
+			}
+			if scanned[port] {
+				continue
+			}
+			scanned[port] = true
+			target := *address
+			target.Port = port
+			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, peerID, map[string]any{"public_key": n.id.Public, "session_id": sessionID}), &target)
+			time.Sleep(scanDelay)
+		}
+		if start == 1 && end == 65535 {
+			break
 		}
 	}
-	n.logf("symmetric scan exhausted retries for %s", peerID[:8])
 }
 
 func (n *node) symmetricScanCancelled(cancel chan struct{}) bool {
