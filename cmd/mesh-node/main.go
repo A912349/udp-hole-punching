@@ -68,6 +68,8 @@ const (
 	maxTUN                = 1279
 	fastBatchSize         = 32
 	fastQueueSize         = 1024
+	udpSendBatchSize      = 16
+	udpSendQueueSize      = 256
 	fastSeenCapacity      = 10000
 	lanDiscoveryPort      = 37777
 	lanDiscoveryInterval  = 10 * time.Second
@@ -185,6 +187,11 @@ type deliverFrame struct {
 	source string
 	data   []byte
 }
+type outboundDatagram struct {
+	conn    *net.UDPConn
+	data    []byte
+	address *net.UDPAddr
+}
 type fastStats struct {
 	receivedPackets, receivedBytes   atomic.Uint64
 	queueDrops                       atomic.Uint64
@@ -251,6 +258,8 @@ type node struct {
 	tunLUID          uint64
 	startedAt        time.Time
 	fastQueue        chan fastFrame
+	udpSendQueue     chan outboundDatagram
+	udpSendPool      sync.Pool
 	fastPool         sync.Pool
 	sendPool         sync.Pool
 	macPool          sync.Pool
@@ -1384,6 +1393,7 @@ func (n *node) start() error {
 	if e := n.startPprof(); e != nil {
 		return e
 	}
+	n.startUDPSender(ctx)
 	n.startFastWorkers(ctx)
 	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
@@ -3199,15 +3209,23 @@ func (n *node) sendFast(dst string, data []byte) bool {
 			return false
 		}
 	}
-	_, e := n.connForPeer(p.ID).WriteToUDP(data, a.(*net.UDPAddr))
-	if e != nil {
-		n.debugf("fast send to %s via %s failed: %v", dst[:8], a, e)
+	conn := n.connForPeer(p.ID)
+	address := a.(*net.UDPAddr)
+	if n.udpSendQueue == nil {
+		_, e := conn.WriteToUDP(data, address)
+		return e == nil
+	}
+	owned := n.udpSendPool.Get().([]byte)[:len(data)]
+	copy(owned, data)
+	select {
+	case n.udpSendQueue <- outboundDatagram{conn: conn, data: owned, address: address}:
+		return true
+	default:
+		n.udpSendPool.Put(owned[:maxFastFrame])
+		n.stats.queueDrops.Add(1)
+		n.debugf("drop fast frame to %s: UDP send queue full", dst[:8])
 		return false
 	}
-	n.stats.sentPackets.Add(1)
-	n.stats.sentBytes.Add(uint64(len(data)))
-	n.debugf("fast frame sent to %s via %s (%d bytes)", dst[:8], a, len(data))
-	return true
 }
 func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
