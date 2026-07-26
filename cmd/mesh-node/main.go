@@ -962,6 +962,11 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 		return
 	}
 	n.logf("control reconnect: UDP endpoint changed %s -> %s; re-registering", n.c.endpoint, endpoint)
+	// The old UDP mapping is tied to the previous network. Clear all cached
+	// peer observations and per-superpeer sockets before rebuilding transport;
+	// otherwise a Wi-Fi -> LTE transition can keep stale symmetric state and
+	// never start a scan for the new endpoint.
+	n.resetTransportState()
 	n.c.endpoint = endpoint
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
@@ -972,6 +977,10 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 	}
 	if err := n.bootstrap(); err != nil {
 		n.logf("control reconnect: topology refresh failed: %v", err)
+		return
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.logf("control reconnect: symmetric handshake did not complete")
 	}
 }
 
@@ -2110,6 +2119,29 @@ func (n *node) resetTransportState() {
 	n.symmetricMu.Unlock()
 }
 
+// resetSymmetricRelay drops only one superpeer mapping. It is used when a
+// single edge dies, so the remaining symmetric links stay usable while this
+// relay gets a fresh rendezvous and port scan.
+func (n *node) resetSymmetricRelay(relayID string) {
+	n.symmetricConnMu.Lock()
+	if conn := n.symmetricConns[relayID]; conn != nil {
+		_ = conn.Close()
+	}
+	delete(n.symmetricConns, relayID)
+	n.symmetricConnMu.Unlock()
+
+	n.symmetricMu.Lock()
+	if cancel := n.symmetricScans[relayID]; cancel != nil {
+		delete(n.symmetricScans, relayID)
+		close(cancel)
+	}
+	delete(n.symmetricSessions, relayID)
+	delete(n.symmetricConnected, relayID)
+	delete(n.symmetricBurstAt, relayID)
+	delete(n.symmetricBurstSess, relayID)
+	n.symmetricMu.Unlock()
+}
+
 func (n *node) deferRecovery(err error, action string) {
 	n.recoveryFails++
 	backoff := recoveryMinBackoff
@@ -2800,6 +2832,7 @@ func (n *node) linkHealth(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			lostRelays := make([]symmetricRelayTarget, 0)
 			n.mu.Lock()
 			for id, peer := range n.neighbors {
 				live := n.usable(peer)
@@ -2810,9 +2843,22 @@ func (n *node) linkHealth(ctx context.Context) {
 						state = "up"
 					}
 					n.logf("link %s %s", id[:8], state)
+					if !live && n.c.nat == "symmetric" && peer.Role == "superpeer" {
+						lostRelays = append(lostRelays, symmetricRelayTarget{id: id, peer: *peer})
+					}
 				}
 			}
 			n.mu.Unlock()
+			for _, relay := range lostRelays {
+				relay := relay
+				go func() {
+					n.resetSymmetricRelay(relay.id)
+					n.logf("symmetric edge %s is down; restarting scan", relay.id[:8])
+					if !n.establishSymmetricTransportOnce(relay.id, &relay.peer, 1) {
+						n.logf("symmetric scan for %s after edge loss did not complete", relay.id[:8])
+					}
+				}()
+			}
 		}
 	}
 }
