@@ -20,9 +20,9 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -85,6 +85,7 @@ type server struct {
 	registerLookupStmt                          *sql.Stmt
 	registerInsertStmt                          *sql.Stmt
 	registerUpdateStmt                          *sql.Stmt
+	accountTokenUserStmt                        *sql.Stmt
 	token                                       string
 	bootstrapToken                              string
 	tokenKey                                    []byte
@@ -347,6 +348,31 @@ type controlFrame struct {
 	Event  string          `json:"event,omitempty"`
 }
 
+// controlResponseWriter is the small ResponseWriter implementation used by
+// the in-process WebSocket control path. Going through httptest.NewRecorder
+// here needlessly allocates an HTTP response and parses transfer metadata for
+// every heartbeat/control frame.
+type controlResponseWriter struct {
+	header http.Header
+	body   bytes.Buffer
+	status int
+}
+
+func (w *controlResponseWriter) Header() http.Header { return w.header }
+
+func (w *controlResponseWriter) WriteHeader(status int) {
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *controlResponseWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
 func (s *server) controlWS(ws *websocket.Conn) {
 	credential := ws.Request().Header.Get("X-Mesh-Token")
 	if credential == "" {
@@ -585,14 +611,22 @@ func (s *server) controlRequestWithAuth(in controlFrame, credential, invite stri
 	if in.Method == "" || in.Path == "" {
 		return controlFrame{Status: http.StatusBadRequest, Error: "missing method or path"}
 	}
-	r := httptest.NewRequest(in.Method, "http://control"+in.Path, bytes.NewReader(in.Body))
+	r := &http.Request{
+		Method:        in.Method,
+		URL:           &url.URL{Scheme: "http", Host: "control", Path: in.Path},
+		RequestURI:    in.Path,
+		Header:        make(http.Header),
+		Body:          io.NopCloser(bytes.NewReader(in.Body)),
+		ContentLength: int64(len(in.Body)),
+		RemoteAddr:    "control",
+	}
 	if credential != "" {
 		r.Header.Set("X-Mesh-Token", credential)
 	}
 	if invite != "" {
 		r.Header.Set("X-Mesh-Invite", invite)
 	}
-	w := httptest.NewRecorder()
+	w := &controlResponseWriter{header: make(http.Header)}
 	switch {
 	case in.Method == http.MethodPost && in.Path == "/v1/register":
 		s.register(w, r)
@@ -614,13 +648,15 @@ func (s *server) controlRequestWithAuth(in controlFrame, credential, invite stri
 	default:
 		return controlFrame{Status: http.StatusNotFound, Error: "unknown control operation"}
 	}
-	result := w.Result()
-	defer result.Body.Close()
-	body := json.RawMessage(append([]byte(nil), w.Body.Bytes()...))
-	if result.StatusCode < 200 || result.StatusCode > 299 {
-		return controlFrame{Status: result.StatusCode, Error: strings.TrimSpace(string(body))}
+	status := w.status
+	if status == 0 {
+		status = http.StatusOK
 	}
-	return controlFrame{Status: result.StatusCode, Body: body}
+	body := json.RawMessage(append([]byte(nil), w.body.Bytes()...))
+	if status < 200 || status > 299 {
+		return controlFrame{Status: status, Error: strings.TrimSpace(string(body))}
+	}
+	return controlFrame{Status: status, Body: body}
 }
 func value(k, d string) string {
 	if v := os.Getenv(k); v != "" {
@@ -742,22 +778,31 @@ func (s *server) init() error {
 // Registration is the heartbeat hot path. Keeping these statements prepared
 // avoids reparsing the same SQLite SQL for every connected node every 15s.
 func (s *server) prepareRegisterStatements() error {
+	accountTokenUser, err := s.db.Prepare(`SELECT t.user_id FROM account_tokens t JOIN users u ON u.id=t.user_id
+		WHERE t.token_hash=? AND t.revoked_at IS NULL AND u.disabled=0`)
+	if err != nil {
+		return err
+	}
 	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.mesh_ip,n.owner_id,o.role
 		FROM nodes n LEFT JOIN role_overrides o ON o.node_id=n.node_id WHERE n.node_id=?`)
 	if err != nil {
+		accountTokenUser.Close()
 		return err
 	}
 	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
+		accountTokenUser.Close()
 		lookup.Close()
 		return err
 	}
 	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,mesh_ip=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
 	if err != nil {
+		accountTokenUser.Close()
 		lookup.Close()
 		insert.Close()
 		return err
 	}
+	s.accountTokenUserStmt = accountTokenUser
 	s.registerLookupStmt = lookup
 	s.registerInsertStmt = insert
 	s.registerUpdateStmt = update
@@ -1231,12 +1276,11 @@ func (s *server) accountMe(w http.ResponseWriter, r *http.Request) {
 // exactly like the unchanged mesh-node client already does.
 func (s *server) accountTokenUser(r *http.Request) (int64, bool) {
 	provided := r.Header.Get("X-Mesh-Token")
-	if provided == "" || s.db == nil {
+	if provided == "" || s.db == nil || s.accountTokenUserStmt == nil {
 		return 0, false
 	}
 	var userID int64
-	err := s.db.QueryRow(`SELECT t.user_id FROM account_tokens t JOIN users u ON u.id=t.user_id
-		WHERE t.token_hash=? AND t.revoked_at IS NULL AND u.disabled=0`, tokenDigest(provided)).Scan(&userID)
+	err := s.accountTokenUserStmt.QueryRow(tokenDigest(provided)).Scan(&userID)
 	if err != nil {
 		return 0, false
 	}
