@@ -972,6 +972,9 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 	// otherwise a Wi-Fi -> LTE transition can keep stale symmetric state and
 	// never start a scan for the new endpoint.
 	n.resetTransportState()
+	if err := n.restoreTUNNetwork(); err != nil {
+		n.logf("control reconnect: TUN network restore failed: %v", err)
+	}
 	n.c.endpoint = endpoint
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
@@ -1083,6 +1086,13 @@ func (n *node) applyTopology(t topology) {
 	unchanged := t.Version != "" && n.topologyVersion == t.Version
 	n.mu.RUnlock()
 	if unchanged {
+		// A network switch can remove OS routes without changing the
+		// coordinator topology version.
+		if n.tun != nil && n.c.autoTUN {
+			if err := n.forceTUNRouteSync(); err != nil {
+				n.logf("TUN route resync failed: %v", err)
+			}
+		}
 		return
 	}
 	n.mu.Lock()
@@ -2148,6 +2158,26 @@ func (n *node) resetTransportState() {
 	n.symmetricMu.Unlock()
 }
 
+// restoreTUNNetwork repairs host-side state that a mobile network switch can
+// discard. The installed-route cache is cleared because routes may be gone in
+// the kernel even though they are still present in the cache.
+func (n *node) restoreTUNNetwork() error {
+	if n.tun == nil || !n.c.autoTUN {
+		return nil
+	}
+	if err := configureTUN(n.c.tun, n.c.meshIP, n.c.prefix, n.tunLUID); err != nil {
+		return err
+	}
+	return n.forceTUNRouteSync()
+}
+
+func (n *node) forceTUNRouteSync() error {
+	n.routeMu.Lock()
+	n.installedRoutes = map[string]bool{}
+	n.routeMu.Unlock()
+	return n.syncTUNRoutes()
+}
+
 // resetSymmetricRelay drops only one superpeer mapping. It is used when a
 // single edge dies, so the remaining symmetric links stay usable while this
 // relay gets a fresh rendezvous and port scan.
@@ -2286,6 +2316,10 @@ func (n *node) recoverNetwork() {
 		return
 	}
 	n.resetTransportState()
+	if err := n.restoreTUNNetwork(); err != nil {
+		n.deferRecovery(err, "TUN network restore failed")
+		return
+	}
 	endpoint, nat, err := n.detectEndpoint()
 	if err != nil {
 		n.deferRecovery(err, "STUN recovery failed")
