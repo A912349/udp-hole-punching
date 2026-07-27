@@ -19,12 +19,18 @@ func (n *node) startUDPSender(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case first := <-n.udpSendQueue:
+			case first, ok := <-n.udpSendQueue:
+				if !ok {
+					return
+				}
 				batch = append(batch[:0], first)
 			}
 			for len(batch) < cap(batch) {
 				select {
-				case frame := <-n.udpSendQueue:
+				case frame, ok := <-n.udpSendQueue:
+					if !ok {
+						return
+					}
 					batch = append(batch, frame)
 				default:
 					goto send

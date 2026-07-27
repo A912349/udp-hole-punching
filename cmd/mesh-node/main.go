@@ -43,14 +43,22 @@ import (
 )
 
 const (
-	keepAlive          = 10 * time.Second
+	// PING/PONG maintains liveness and learns a peer's current UDP endpoint.
+	// HELLO carries a public key and therefore only needs a slow background
+	// refresh after the immediate startup and topology-change handshakes.
+	pingInterval       = 15 * time.Second
+	helloInterval      = 90 * time.Second
+	linkHealthInterval = 5 * time.Second
 	refresh            = 5 * time.Second
-	heartbeat          = 15 * time.Second
-	topologyPoll       = 37 * time.Second
-	linkTimeout        = 45 * time.Second
-	linkGrace          = 35 * time.Second
-	recoveryMinBackoff = 30 * time.Second
+	heartbeat          = 20 * time.Second
+	telemetryInterval  = 15 * time.Second
+	recoveryCheck      = 5 * time.Second
+	topologyPoll       = 90 * time.Second
+	linkTimeout        = 30 * time.Second
+	linkGrace          = 20 * time.Second
+	recoveryMinBackoff = 10 * time.Second
 	recoveryMaxBackoff = 5 * time.Minute
+	stunProbeTimeout   = 2 * time.Second
 	maxRequest         = 32000
 	maxResponse        = 48000
 	maxUDPPort         = 65535
@@ -71,7 +79,8 @@ const (
 	udpSendQueueSize         = 256
 	fastSeenCapacity         = 10000
 	lanDiscoveryPort         = 37777
-	lanDiscoveryInterval     = 10 * time.Second
+	lanDiscoveryInterval     = time.Minute
+	initialTelemetryDelay    = 3 * time.Second
 	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
 )
 
@@ -923,8 +932,12 @@ func (n *node) request(method, path string, in, out any) error {
 		} else {
 			_ = ws.SetWriteDeadline(time.Time{})
 			n.controlMu.Unlock()
+			responseTimer := time.NewTimer(10 * time.Second)
 			select {
 			case reply := <-replies:
+				if !responseTimer.Stop() {
+					<-responseTimer.C
+				}
 				if reconnected {
 					go n.refreshEndpointAfterControlReconnect()
 				}
@@ -935,7 +948,7 @@ func (n *node) request(method, path string, in, out any) error {
 					return nil
 				}
 				return json.Unmarshal(reply.Body, out)
-			case <-time.After(10 * time.Second):
+			case <-responseTimer.C:
 				last = errors.New("control websocket response timed out")
 			}
 		}
@@ -1453,19 +1466,19 @@ func (n *node) start() error {
 	n.startFastWorkers(ctx)
 	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
-	go n.periodic(ctx, keepAlive, n.helloAll)
-	go n.periodic(ctx, keepAlive, n.pingAll)
+	go n.periodic(ctx, helloInterval, n.helloAll)
+	go n.periodic(ctx, pingInterval, n.pingAll)
 	go n.periodic(ctx, heartbeat, func() {
 		if e := n.register(); e != nil {
 			n.logf("heartbeat failed: %v", e)
 		}
 	})
-	go n.periodic(ctx, heartbeat, func() {
+	go n.periodic(ctx, telemetryInterval, func() {
 		if e := n.reportTelemetry(); e != nil {
 			n.logf("telemetry failed: %v", e)
 		}
 	})
-	go n.periodic(ctx, heartbeat, n.recoverNetwork)
+	go n.periodic(ctx, recoveryCheck, n.recoverNetwork)
 	go n.periodic(ctx, topologyPoll, func() {
 		if err := n.bootstrap(); err != nil {
 			n.logf("periodic topology refresh failed: %v", err)
@@ -1489,6 +1502,21 @@ func (n *node) start() error {
 		n.logf("Windows firewall rule enabled for inbound UDP %d", port)
 	}
 	n.helloAll()
+	// Establish direct paths immediately; waiting for the first keepalive
+	// interval makes a freshly started node look offline unnecessarily long.
+	n.pingAll()
+	go func() {
+		timer := time.NewTimer(initialTelemetryDelay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			if err := n.reportTelemetry(); err != nil {
+				n.logf("initial telemetry failed: %v", err)
+			}
+		}
+	}()
 	n.logf("listening on %s", n.currentUDPConn().LocalAddr())
 	return nil
 }
@@ -2091,6 +2119,30 @@ func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
 	_, _ = conn.WriteToUDP(encoded, address)
 }
 func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
+	// Nodes commonly start at the same time (service restart, container
+	// rollout, or a laptop waking up). A small per-loop phase prevents all
+	// registrations, telemetry and topology refreshes from becoming one
+	// control-plane burst. Keep short health loops immediate; they are useful
+	// for fast recovery and do not generate meaningful traffic by themselves.
+	if d >= 10*time.Second {
+		phase := d / 5
+		if phase > 5*time.Second {
+			phase = 5 * time.Second
+		}
+		var seed [2]byte
+		if _, err := rand.Read(seed[:]); err == nil {
+			phase = time.Duration(binary.BigEndian.Uint16(seed[:])) % (phase + 1)
+		}
+		if phase > 0 {
+			timer := time.NewTimer(phase)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+	}
 	t := time.NewTicker(d)
 	defer t.Stop()
 	for {
@@ -3018,7 +3070,7 @@ func (n *node) ensureNeighbor(id string) {
 }
 
 func (n *node) linkHealth(ctx context.Context) {
-	ticker := time.NewTicker(keepAlive)
+	ticker := time.NewTicker(linkHealthInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -3337,13 +3389,15 @@ func (n *node) call(dst, name string, data []byte) ([]byte, error) {
 	if !n.encrypted(dst, "SERVICE_REQUEST", map[string]any{"service": name, "data": protocol.B64Encode(data)}, id) {
 		return nil, errors.New("could not send service request")
 	}
+	serviceTimer := time.NewTimer(30 * time.Second)
+	defer serviceTimer.Stop()
 	select {
 	case x := <-ch:
 		if x.Error != "" {
 			return nil, errors.New(x.Error)
 		}
 		return protocol.B64Decode(x.Data)
-	case <-time.After(30 * time.Second):
+	case <-serviceTimer.C:
 		return nil, errors.New("service response timed out")
 	}
 }
@@ -3409,9 +3463,8 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		n.debugf("drop fast frame from %s: invalid TTL or duplicate", src[:8])
 		return
 	}
-	// HELLO frames refresh the endpoint and liveness every keepAlive period.
-	// Updating it on every data packet only adds a contended lock and a clock
-	// read to the fast path.
+	// Control packets refresh the endpoint and liveness. Updating it on every
+	// data packet only adds a contended lock and a clock read to the fast path.
 	if !bytes.Equal(auth[21:37], n.idBinary[:]) {
 		dst := hex.EncodeToString(auth[21:37])
 		if n.c.role == "superpeer" && ttl > 1 {
@@ -3769,50 +3822,97 @@ func min(a, b int) int {
 	return b
 }
 func stunEndpoint(c *net.UDPConn) (string, string, error) {
+	// STUN shares the node's UDP socket with the receive loop. Always restore
+	// the socket deadline so a probe cannot leave the data plane with a stale
+	// two-second read timeout.
+	defer c.SetReadDeadline(time.Time{})
 	servers := []string{"stun.nextcloud.com:3478", "stun.miwifi.com:3478", "stun.sipgate.net:3478"}
-	var mapped []string
+	type resolvedServer struct {
+		address *net.UDPAddr
+		err     error
+	}
+	resolved := make(chan resolvedServer, len(servers))
 	for _, server := range servers {
-		a, e := resolveMeshUDPAddr(server)
-		if e != nil {
+		go func(server string) {
+			address, err := resolveMeshUDPAddr(server)
+			resolved <- resolvedServer{address: address, err: err}
+		}(server)
+	}
+	pending := make(map[[12]byte]struct{}, len(servers))
+	for range servers {
+		result := <-resolved
+		if result.err != nil {
 			continue
 		}
-		var tx [12]byte
-		rand.Read(tx[:])
-		req := make([]byte, 20)
-		binary.BigEndian.PutUint16(req, 1)
-		binary.BigEndian.PutUint32(req[4:], 0x2112A442)
-		copy(req[8:], tx[:])
-		c.SetReadDeadline(time.Now().Add(3 * time.Second))
-		if _, e = c.WriteToUDP(req, a); e != nil {
+		var transaction [12]byte
+		if _, err := rand.Read(transaction[:]); err != nil {
 			continue
 		}
-		b := make([]byte, 2048)
-		l, _, e := c.ReadFromUDP(b)
-		if e != nil || l < 20 || string(b[8:20]) != string(tx[:]) {
-			continue
-		}
-		for p := 20; p+4 <= l; {
-			typ, size := binary.BigEndian.Uint16(b[p:]), int(binary.BigEndian.Uint16(b[p+2:]))
-			v := b[p+4 : min(p+4+size, l)]
-			if typ == 0x0020 && len(v) >= 8 && v[1] == 1 {
-				port := binary.BigEndian.Uint16(v[2:4]) ^ 0x2112
-				ip := binary.BigEndian.Uint32(v[4:8]) ^ 0x2112A442
-				mapped = append(mapped, fmt.Sprintf("%d.%d.%d.%d:%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip), port))
-				break
-			}
-			p += 4 + (size+3)&^3
-		}
-		if len(mapped) == 2 {
-			if mapped[0] == mapped[1] {
-				return mapped[0], "cone", nil
-			}
-			return mapped[0], "symmetric", nil
+		request := make([]byte, 20)
+		binary.BigEndian.PutUint16(request, 1)
+		binary.BigEndian.PutUint32(request[4:], 0x2112A442)
+		copy(request[8:], transaction[:])
+		if _, err := c.WriteToUDP(request, result.address); err == nil {
+			pending[transaction] = struct{}{}
 		}
 	}
-	if len(mapped) > 0 {
+	if len(pending) == 0 {
+		return "", "", errors.New("no STUN server could be contacted")
+	}
+
+	// Send all probes before waiting. The previous sequential implementation
+	// could spend three seconds on every unavailable server, delaying startup
+	// and network recovery by up to nine seconds.
+	_ = c.SetReadDeadline(time.Now().Add(stunProbeTimeout))
+	mapped := make([]string, 0, 2)
+	buffer := make([]byte, 2048)
+	for len(pending) > 0 && len(mapped) < 2 {
+		length, _, err := c.ReadFromUDP(buffer)
+		if err != nil {
+			break
+		}
+		if length < 20 {
+			continue
+		}
+		var transaction [12]byte
+		copy(transaction[:], buffer[8:20])
+		if _, ok := pending[transaction]; !ok {
+			continue
+		}
+		if endpoint, ok := stunMappedEndpoint(buffer[:length], transaction); ok {
+			delete(pending, transaction)
+			mapped = append(mapped, endpoint)
+		}
+	}
+	if len(mapped) == 0 {
+		return "", "", errors.New("no STUN server responded")
+	}
+	if len(mapped) == 1 || mapped[0] == mapped[1] {
 		return mapped[0], "cone", nil
 	}
-	return "", "", errors.New("no STUN server responded")
+	return mapped[0], "symmetric", nil
+}
+
+func stunMappedEndpoint(response []byte, transaction [12]byte) (string, bool) {
+	if len(response) < 20 || binary.BigEndian.Uint16(response) != 0x0101 ||
+		binary.BigEndian.Uint32(response[4:8]) != 0x2112A442 || !bytes.Equal(response[8:20], transaction[:]) {
+		return "", false
+	}
+	for offset := 20; offset+4 <= len(response); {
+		typ, size := binary.BigEndian.Uint16(response[offset:]), int(binary.BigEndian.Uint16(response[offset+2:]))
+		end := offset + 4 + size
+		if end > len(response) {
+			return "", false
+		}
+		value := response[offset+4 : end]
+		if typ == 0x0020 && len(value) >= 8 && value[1] == 1 {
+			port := binary.BigEndian.Uint16(value[2:4]) ^ 0x2112
+			ip := binary.BigEndian.Uint32(value[4:8]) ^ 0x2112A442
+			return fmt.Sprintf("%d.%d.%d.%d:%d", byte(ip>>24), byte(ip>>16), byte(ip>>8), byte(ip), port), true
+		}
+		offset += 4 + (size+3)&^3
+	}
+	return "", false
 }
 
 func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
@@ -3823,7 +3923,9 @@ func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return net.ResolveUDPAddr("udp4", address)
 	}
-	ips, err := meshResolver().LookupHost(context.Background(), host)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ips, err := meshResolver().LookupHost(ctx, host)
 	if err != nil {
 		return nil, err
 	}
