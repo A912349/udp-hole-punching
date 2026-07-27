@@ -3826,7 +3826,13 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 	// the socket deadline so a probe cannot leave the data plane with a stale
 	// two-second read timeout.
 	defer c.SetReadDeadline(time.Time{})
-	servers := []string{"stun.nextcloud.com:3478", "stun.miwifi.com:3478", "stun.sipgate.net:3478"}
+	servers := []string{
+		"stun.nextcloud.com:3478",
+		"stun.miwifi.com:3478",
+		"stun.sipgate.net:3478",
+		"stun.cloudflare.com:3478",
+		"stun.l.google.com:19302",
+	}
 	type resolvedServer struct {
 		address *net.UDPAddr
 		err     error
@@ -3839,9 +3845,12 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 		}(server)
 	}
 	pending := make(map[[12]byte]struct{}, len(servers))
+	resolveFailures := 0
+	writeFailures := 0
 	for range servers {
 		result := <-resolved
 		if result.err != nil {
+			resolveFailures++
 			continue
 		}
 		var transaction [12]byte
@@ -3854,10 +3863,12 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 		copy(request[8:], transaction[:])
 		if _, err := c.WriteToUDP(request, result.address); err == nil {
 			pending[transaction] = struct{}{}
+		} else {
+			writeFailures++
 		}
 	}
 	if len(pending) == 0 {
-		return "", "", errors.New("no STUN server could be contacted")
+		return "", "", fmt.Errorf("no STUN server could be contacted (resolved=%d/%d, write failures=%d)", len(servers)-resolveFailures, len(servers), writeFailures)
 	}
 
 	// Send all probes before waiting. The previous sequential implementation
@@ -3922,6 +3933,12 @@ func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return net.ResolveUDPAddr("udp4", address)
+	}
+	// Prefer the platform resolver with an explicit udp4 network. This avoids
+	// IPv6 answers and is more reliable on minimal Linux/container images where
+	// the custom resolver has no usable nameserver configuration.
+	if resolved, resolveErr := net.ResolveUDPAddr("udp4", address); resolveErr == nil && resolved.IP.To4() != nil {
+		return resolved, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
