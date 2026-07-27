@@ -3830,8 +3830,9 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 		"stun.nextcloud.com:3478",
 		"stun.miwifi.com:3478",
 		"stun.sipgate.net:3478",
-		"stun.cloudflare.com:3478",
-		"stun.l.google.com:19302",
+		"stunserver2025.stunprotocol.org:3478",
+		"stun.zadarma.com:3478",
+		"stun.ipfire.org:3478",
 	}
 	type resolvedServer struct {
 		address *net.UDPAddr
