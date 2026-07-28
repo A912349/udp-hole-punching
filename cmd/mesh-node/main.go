@@ -1634,6 +1634,11 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 		select {
 		case received := <-responses:
 			selected = received.conn
+			// awaitSymmetricHello reads the handshake directly from the probe
+			// socket, so it does not pass through handleDatagram/touch. Mark the
+			// relay live here; otherwise linkHealth immediately sees a zero
+			// lastRX after a successful scan and starts the same scan again.
+			n.touch(relayID, received.addr)
 			ack := protocol.NewPacket("HELLO_ACK", n.id.ID, relayID, map[string]any{"session_id": sessionID})
 			if encoded, err := protocol.EncodePacket(ack, n.key); err == nil {
 				_, _ = selected.WriteToUDP(encoded, received.addr)
@@ -2065,7 +2070,10 @@ func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAdd
 	if observed != nil {
 		endpoint = observed.String()
 	}
-	n.startSymmetricScan(packet.Source, endpoint, sessionID, true)
+	// The control-plane event normally started the scan already. Restart only
+	// when the burst supplies a different observed mapping that can refine it.
+	refine := observed != nil && observed.String() != peer.Endpoint
+	n.startSymmetricScan(packet.Source, endpoint, sessionID, refine)
 }
 
 func payloadString(packet protocol.Packet, key string) string {
@@ -2327,6 +2335,10 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 	n.edgeRetryMu.Unlock()
 
 	go func() {
+		if !n.recoveryMu.TryLock() {
+			return
+		}
+		defer n.recoveryMu.Unlock()
 		defer func() {
 			n.edgeRetryMu.Lock()
 			delete(n.edgeRetries, id)
@@ -2457,7 +2469,7 @@ func (n *node) recoverNetwork() {
 func (n *node) detectEndpoint() (string, string, error) {
 	n.udpReadMu.Lock()
 	defer n.udpReadMu.Unlock()
-	return stunEndpoint(n.currentUDPConn())
+	return stunEndpoint(n.currentUDPConn(), n.handleDatagram)
 }
 
 func (n *node) helloAll() {
@@ -3821,7 +3833,7 @@ func min(a, b int) int {
 	}
 	return b
 }
-func stunEndpoint(c *net.UDPConn) (string, string, error) {
+func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr)) (string, string, error) {
 	// STUN shares the node's UDP socket with the receive loop. Always restore
 	// the socket deadline so a probe cannot leave the data plane with a stale
 	// two-second read timeout.
@@ -3879,16 +3891,22 @@ func stunEndpoint(c *net.UDPConn) (string, string, error) {
 	mapped := make([]string, 0, 2)
 	buffer := make([]byte, 2048)
 	for len(pending) > 0 && len(mapped) < 2 {
-		length, _, err := c.ReadFromUDP(buffer)
+		length, address, err := c.ReadFromUDP(buffer)
 		if err != nil {
 			break
 		}
 		if length < 20 {
+			if onPacket != nil {
+				onPacket(append([]byte(nil), buffer[:length]...), address)
+			}
 			continue
 		}
 		var transaction [12]byte
 		copy(transaction[:], buffer[8:20])
 		if _, ok := pending[transaction]; !ok {
+			if onPacket != nil {
+				onPacket(append([]byte(nil), buffer[:length]...), address)
+			}
 			continue
 		}
 		if endpoint, ok := stunMappedEndpoint(buffer[:length], transaction); ok {

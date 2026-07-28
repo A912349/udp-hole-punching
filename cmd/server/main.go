@@ -1624,7 +1624,9 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	}
 	s.enrichNodes(nodes)
 	for i := range nodes {
-		nodes[i].UptimeSeconds = now - nodes[i].CreatedAt
+		// A node's uptime is measured from its most recent registration, not
+		// from the first time its row was created.
+		nodes[i].UptimeSeconds = now - nodes[i].LastSeen
 		if nodes[i].UptimeSeconds < 0 {
 			nodes[i].UptimeSeconds = 0
 		}
@@ -2148,7 +2150,9 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 	uptime := map[string]int64{}
 	if len(nodes) > 0 {
 		for _, n := range nodes[0] {
-			uptime[n.ID] = max64(0, now.Unix()-n.CreatedAt)
+			// Registration is also the node heartbeat, so the current session
+			// starts at the most recent registration.
+			uptime[n.ID] = max64(0, now.Unix()-n.LastSeen)
 		}
 	}
 	for i := range links {
