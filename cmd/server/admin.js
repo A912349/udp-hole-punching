@@ -727,6 +727,7 @@ async function loadScopes() {
     // Keep the inspector stable while refreshing the live graph.
     overviewGraph();
     drawInteractive();
+    renderPeers();
     renderAllRemoveList()
   } catch (e) {
     $('liveDot').classList.remove('live');
@@ -751,6 +752,7 @@ async function refreshGraph() {
     state.topology = state.scope === 'all' ? all : online;
     overviewGraph();
     drawInteractive();
+    renderPeers();
     renderAllRemoveList();
   } catch (e) {
     // The normal refresh reports authentication/network errors to the user.

@@ -231,6 +231,29 @@ func TestAccountRegistrationLoginAndInvites(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	forwardRequest := authRequest(http.MethodPost, "/v1/admin/forwards", map[string]any{
+		"source_node_id": "alice-device",
+		"listen_host":    "127.0.0.1",
+		"listen_port":    18080,
+		"target_node_id": "alice-device",
+		"target_host":    "127.0.0.1",
+		"target_port":    8080,
+	})
+	forwardRequest.AddCookie(session)
+	forwardRequest.AddCookie(csrf)
+	forwardRequest.Header.Set("X-CSRF-Token", csrf.Value)
+	forwardResponse := httptest.NewRecorder()
+	s.adminForwards(forwardResponse, forwardRequest)
+	if forwardResponse.Code != http.StatusCreated {
+		t.Fatalf("account session could not create reverse port: status=%d body=%s", forwardResponse.Code, forwardResponse.Body.String())
+	}
+	forwardListRequest := authRequest(http.MethodGet, "/v1/admin/forwards", nil)
+	forwardListRequest.AddCookie(session)
+	forwardListResponse := httptest.NewRecorder()
+	s.adminForwards(forwardListResponse, forwardListRequest)
+	if forwardListResponse.Code != http.StatusOK || !strings.Contains(forwardListResponse.Body.String(), "alice-device") {
+		t.Fatalf("account session could not list reverse ports: status=%d body=%s", forwardListResponse.Code, forwardListResponse.Body.String())
+	}
 	aliceTopology := authRequest(http.MethodGet, "/v1/admin/topology?scope=all", nil)
 	aliceTopology.Header.Set("X-Mesh-Token", firstAccount.Token)
 	aliceTopologyResponse := httptest.NewRecorder()

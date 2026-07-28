@@ -3358,7 +3358,10 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	// This endpoint is used by the admin UI, so account sessions must be
+	// accepted in addition to the legacy network token. Mutating requests are
+	// protected by adminAuth's CSRF check for session-authenticated users.
+	if !s.adminAuth(w, r) {
 		return
 	}
 	accountID, scoped := s.accountIDForRequest(r)
@@ -3410,7 +3413,7 @@ func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
 	reply(w, 201, map[string]any{"status": "ok"})
 }
 func (s *server) adminForward(w http.ResponseWriter, r *http.Request) {
-	if !s.auth(w, r) {
+	if !s.adminAuth(w, r) {
 		return
 	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
