@@ -605,6 +605,7 @@ async function load() {
       let field = $('settingsForm').elements[k];
       if (field) field.value = state.config[k];
     }
+    $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
     render()
@@ -729,16 +730,15 @@ async function loadScopes() {
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || []
     };
+    $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     for (let k in state.config) {
       let field = $('settingsForm').elements[k];
       if (field) field.value = state.config[k];
     }
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
-    // Keep the inspector stable while refreshing the live graph.
-    overviewGraph();
-    drawInteractive();
-    renderPeers();
+    // Refresh every view derived from the new scoped snapshot together.
+    render();
     renderAllRemoveList()
   } catch (e) {
     $('liveDot').classList.remove('live');
@@ -761,9 +761,7 @@ async function refreshGraph() {
     ]);
     state.topologies = {online, all};
     state.topology = state.scope === 'all' ? all : online;
-    overviewGraph();
-    drawInteractive();
-    renderPeers();
+    render();
     renderAllRemoveList();
   } catch (e) {
     // The normal refresh reports authentication/network errors to the user.
