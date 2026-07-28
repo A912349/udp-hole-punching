@@ -2311,12 +2311,12 @@ func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
 	if scoped {
 		ownerValue = accountID
 	}
-	if _, err := s.db.Exec("INSERT INTO invites(token,created_at,expires_at,owner_id) VALUES(?,?,?,?)", token, now, now+30, ownerValue); err != nil {
+	if _, err := s.db.Exec("INSERT INTO invites(token,created_at,expires_at,owner_id) VALUES(?,?,?,?)", token, now, now+60, ownerValue); err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "invite_created", "six-digit device invite created")
-	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 30, "expires_in_seconds": 30})
+	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 60, "expires_in_seconds": 60})
 }
 
 // accountInvite manages high-entropy invitations for human accounts. The

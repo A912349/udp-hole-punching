@@ -157,9 +157,10 @@ func TestAccountRegistrationLoginAndInvites(t *testing.T) {
 		t.Fatalf("account six-digit invite status = %d, body=%s", deviceInviteResponse.Code, deviceInviteResponse.Body.String())
 	}
 	var deviceInvite struct {
-		Token string `json:"invite_token"`
+		Token     string `json:"invite_token"`
+		ExpiresIn int    `json:"expires_in_seconds"`
 	}
-	if err := json.Unmarshal(deviceInviteResponse.Body.Bytes(), &deviceInvite); err != nil || len(deviceInvite.Token) != 6 {
+	if err := json.Unmarshal(deviceInviteResponse.Body.Bytes(), &deviceInvite); err != nil || len(deviceInvite.Token) != 6 || deviceInvite.ExpiresIn != 60 {
 		t.Fatalf("invalid six-digit device invite: %s", deviceInviteResponse.Body.String())
 	}
 	if !s.consumeInvite(deviceInvite.Token) {
