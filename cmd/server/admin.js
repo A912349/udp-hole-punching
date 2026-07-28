@@ -565,6 +565,9 @@ function render() {
 }
 
 function renderPeers() {
+  // The scoped/live loader refreshes the table directly without calling the
+  // full render(), so keep the navigation badge in sync with the same data.
+  $('peerBadge').textContent = (state.topology.nodes || []).length;
   let q = $('peerSearch').value.toLowerCase(),
     role = $('roleFilter').value,
     nat = $('natFilter').value,
@@ -598,6 +601,10 @@ async function load() {
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || []
     };
+    for (let k in state.config) {
+      let field = $('settingsForm').elements[k];
+      if (field) field.value = state.config[k];
+    }
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
     render()
@@ -722,6 +729,10 @@ async function loadScopes() {
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || []
     };
+    for (let k in state.config) {
+      let field = $('settingsForm').elements[k];
+      if (field) field.value = state.config[k];
+    }
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
     // Keep the inspector stable while refreshing the live graph.
@@ -775,6 +786,7 @@ $('topologyScope').onchange = e => {
 };
 
 function renderPeers() {
+  $('peerBadge').textContent = (state.topology.nodes || []).length;
   let q = $('peerSearch').value.toLowerCase(),
     role = $('roleFilter').value,
     nat = $('natFilter').value,
