@@ -1369,6 +1369,9 @@ func (n *node) buildRoutes() map[string]string {
 			continue
 		}
 		for _, v := range adj[x.id] {
+			if x.id == n.id.ID && !n.usable(n.neighbors[v.id]) {
+				continue
+			}
 			c := x.cost + v.cost
 			if old, ok := cost[v.id]; !ok || c < old {
 				cost[v.id] = c
@@ -1382,7 +1385,7 @@ func (n *node) buildRoutes() map[string]string {
 		if d == n.id.ID {
 			continue
 		}
-		if _, ok := n.neighbors[d]; ok {
+		if p, ok := n.neighbors[d]; ok && n.usable(p) {
 			out[d] = d
 			continue
 		}
@@ -2335,15 +2338,15 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 	n.edgeRetryMu.Unlock()
 
 	go func() {
-		if !n.recoveryMu.TryLock() {
-			return
-		}
-		defer n.recoveryMu.Unlock()
 		defer func() {
 			n.edgeRetryMu.Lock()
 			delete(n.edgeRetries, id)
 			n.edgeRetryMu.Unlock()
 		}()
+		if !n.recoveryMu.TryLock() {
+			return
+		}
+		defer n.recoveryMu.Unlock()
 
 		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
 			n.resetSymmetricRelay(id)
@@ -3090,10 +3093,12 @@ func (n *node) linkHealth(ctx context.Context) {
 			return
 		case <-ticker.C:
 			deadEdges := make([]peer, 0)
+			stateChanged := false
 			n.mu.Lock()
 			for id, peer := range n.neighbors {
 				live := n.usable(peer)
 				if peer.up != live {
+					stateChanged = true
 					peer.up = live
 					state := "down"
 					if live {
@@ -3106,6 +3111,11 @@ func (n *node) linkHealth(ctx context.Context) {
 				}
 			}
 			n.mu.Unlock()
+			if stateChanged {
+				n.mu.Lock()
+				n.routes = n.buildRoutes()
+				n.mu.Unlock()
+			}
 			for _, peer := range deadEdges {
 				if n.c.nat == "symmetric" && peer.Role == "superpeer" {
 					n.logf("symmetric edge %s is down; retrying scan", peer.ID[:8])

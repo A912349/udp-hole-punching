@@ -167,6 +167,30 @@ func TestNextHopBypassesDeadDirectNeighbor(t *testing.T) {
 	}
 }
 
+func TestBuildRoutesDoesNotKeepDeadDirectNeighbor(t *testing.T) {
+	const selfID, destinationID, relayID = "self-0000", "dest-0000", "relay-00"
+	n := &node{
+		id: &protocol.Identity{ID: selfID},
+		dir: map[string]*peer{
+			destinationID: {ID: destinationID},
+			relayID:       {ID: relayID, lastRX: time.Now()},
+		},
+		neighbors: map[string]*peer{
+			destinationID: {ID: destinationID},
+			relayID:       {ID: relayID, lastRX: time.Now()},
+		},
+		links: []edge{
+			{A: selfID, B: destinationID, Cost: 1},
+			{A: selfID, B: relayID, Cost: 1},
+			{A: relayID, B: destinationID, Cost: 1},
+		},
+	}
+	got := n.buildRoutes()
+	if got[destinationID] != relayID {
+		t.Fatalf("route = %q, want relay %q", got[destinationID], relayID)
+	}
+}
+
 func TestResetTransportStateForcesFreshHandshake(t *testing.T) {
 	cancel := make(chan struct{})
 	n := &node{
