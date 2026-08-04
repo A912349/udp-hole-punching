@@ -50,6 +50,7 @@ type node struct {
 	Relay         bool                 `json:"relay_capable"`
 	LastSeen      int64                `json:"last_seen"`
 	CreatedAt     int64                `json:"created_at"`
+	ConnectedAt   int64                `json:"connected_at"`
 	UptimeSeconds int64                `json:"uptime_seconds,omitempty"`
 	Online        bool                 `json:"online"`
 	Name          string               `json:"name,omitempty"`
@@ -824,6 +825,14 @@ func (s *server) init() error {
 			return err
 		}
 	}
+	if !columns["connected_at"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN connected_at INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+		if _, err = s.db.Exec("UPDATE nodes SET connected_at=last_seen WHERE connected_at=0"); err != nil {
+			return err
+		}
+	}
 	if err = s.loadSettings(); err != nil {
 		return err
 	}
@@ -838,19 +847,19 @@ func (s *server) prepareRegisterStatements() error {
 	if err != nil {
 		return err
 	}
-	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.mesh_ip,n.owner_id,o.role
+	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.connected_at,n.mesh_ip,n.owner_id,o.role
 		FROM nodes n LEFT JOIN role_overrides o ON o.node_id=n.node_id WHERE n.node_id=?`)
 	if err != nil {
 		accountTokenUser.Close()
 		return err
 	}
-	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
 		return err
 	}
-	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,mesh_ip=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
+	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,connected_at=CASE WHEN last_seen < ? THEN ? ELSE connected_at END,mesh_ip=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
@@ -1535,7 +1544,7 @@ func (s *server) rebalanceRoles() error {
 
 func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	c := s.settings()
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(c.TTL)}
 	if ownerID != nil {
 		query += " AND owner_id=?"
@@ -1603,10 +1612,10 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	scope := r.URL.Query().Get("scope")
 	all := scope == "all"
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
 	args := []any{now - int64(ttl)}
 	if all {
-		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes"
+		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes"
 		args = nil
 	}
 	if scoped {
@@ -1624,9 +1633,9 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	}
 	s.enrichNodes(nodes)
 	for i := range nodes {
-		// A node's uptime is measured from its most recent registration, not
-		// from the first time its row was created.
-		nodes[i].UptimeSeconds = now - nodes[i].LastSeen
+		// Uptime is measured from the beginning of the current online session,
+		// not from persistent node creation or the latest heartbeat.
+		nodes[i].UptimeSeconds = now - nodes[i].ConnectedAt
 		if nodes[i].UptimeSeconds < 0 {
 			nodes[i].UptimeSeconds = 0
 		}
@@ -2631,7 +2640,7 @@ func (s *server) rows(query string, args ...any) ([]node, error) {
 	for rs.Next() {
 		var n node
 		var relay int
-		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.MeshIP); e != nil {
+		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP); e != nil {
 			return nil, e
 		}
 		n.Relay = relay != 0
@@ -2677,7 +2686,7 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 	if requested == "client" || nat != "cone" || !relay {
 		return "client", nil
 	}
-	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
+	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
 	if e != nil {
 		return "", e
 	}
@@ -2746,7 +2755,7 @@ func (s *server) registeredNode(id string) (*node, sql.NullInt64, sql.NullString
 	var override sql.NullString
 	err := s.registerLookupStmt.QueryRow(id).Scan(
 		&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole,
-		&relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.MeshIP, &owner, &override,
+		&relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &owner, &override,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, owner, override, nil
@@ -2871,9 +2880,9 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		ownerValue = accountID
 	}
 	if previous == nil {
-		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, ip, ownerValue)
+		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, now, ip, ownerValue)
 	} else {
-		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, ip, ownerValue, d.ID)
+		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, ownerValue, d.ID)
 	}
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
@@ -3290,7 +3299,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("node_id")
 	ttl := s.settings().TTL
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(ttl)}
 	if scoped {
 		query += " AND owner_id=?"

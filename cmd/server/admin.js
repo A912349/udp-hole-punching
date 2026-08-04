@@ -108,7 +108,8 @@ const esc = value => {
   return x.innerHTML
 };
 const peerLabel = n => n.name || n.node_id.slice(0, 8);
-const peerSub = n => n.name ? n.node_id.slice(0, 8) : duration(n.uptime_seconds) + ' up';
+const peerID = n => n.node_id.slice(0, 8);
+const peerSub = n => duration(n.uptime_seconds) + ' up';
 
 function duration(seconds) {
   seconds = Number(seconds) || 0;
@@ -195,7 +196,7 @@ function overviewGraph() {
     return a && b ? `<line class="edge ${e.status||'unknown'}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>` : ''
   }).join('') + nodes.map(n => {
     let q = p[n.node_id];
-    return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text></g>`
+    return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" x="${q.x}" y="${q.y+51}">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" x="${q.x}" y="${q.y+64}">${esc(peerSub(n))}</text></g>`
   }).join('');
   svg.querySelectorAll('[data-peer]').forEach(g => g.onclick = () => {
     page('topology');
@@ -225,7 +226,7 @@ function drawInteractive() {
     if (graphUI.selectedNode === n.node_id) classes.push('selected');
     if (graphUI.source === n.node_id) classes.push('linkSource');
     let ring = n.nat_type === 'symmetric' ? '<circle class="sym" r="26"/>' : '';
-    return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="58">${esc(peerSub(n))}</text></g>`
+    return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" y="53">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="66">${esc(peerSub(n))}</text></g>`
   }).join('');
   svg.querySelectorAll('[data-edge]').forEach(g => g.onclick = e => {
     e.stopPropagation();
