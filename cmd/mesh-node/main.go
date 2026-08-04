@@ -2343,10 +2343,6 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 			delete(n.edgeRetries, id)
 			n.edgeRetryMu.Unlock()
 		}()
-		if !n.recoveryMu.TryLock() {
-			return
-		}
-		defer n.recoveryMu.Unlock()
 
 		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
 			n.resetSymmetricRelay(id)
