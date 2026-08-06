@@ -206,6 +206,8 @@ type fastStats struct {
 	sentPackets, sentBytes           atomic.Uint64
 	deliveredPackets, deliveredBytes atomic.Uint64
 	deliveryDrops                    atomic.Uint64
+	controlRxPackets, controlRxBytes atomic.Uint64
+	controlTxPackets, controlTxBytes atomic.Uint64
 }
 type node struct {
 	c                config
@@ -2768,12 +2770,18 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			txBytes := current.sentBytes - previous.sentBytes
 			drops := current.queueDrops - previous.queueDrops
 			tunDrops := current.deliveryDrops - previous.deliveryDrops
+			controlRxPackets := current.controlRxPackets - previous.controlRxPackets
+			controlRxBytes := current.controlRxBytes - previous.controlRxBytes
+			controlTxPackets := current.controlTxPackets - previous.controlTxPackets
+			controlTxBytes := current.controlTxBytes - previous.controlTxBytes
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			seconds := interval.Seconds()
-			n.logf("fast stats %s: rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d heap=%.1f MiB goroutines=%d",
+			n.logf("stats %s: data rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps control rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d heap=%.1f MiB goroutines=%d",
 				interval, float64(rxPackets)/seconds, float64(rxBytes*8)/seconds/1e6,
 				float64(txPackets)/seconds, float64(txBytes*8)/seconds/1e6,
+				float64(controlRxPackets)/seconds, float64(controlRxBytes*8)/seconds/1e6,
+				float64(controlTxPackets)/seconds, float64(controlTxBytes*8)/seconds/1e6,
 				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), len(n.deliverQueue), cap(n.deliverQueue), drops, tunDrops,
 				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
 			previous = current
@@ -2787,6 +2795,8 @@ type fastStatsSnapshot struct {
 	sentPackets, sentBytes           uint64
 	deliveredPackets, deliveredBytes uint64
 	deliveryDrops                    uint64
+	controlRxPackets, controlRxBytes uint64
+	controlTxPackets, controlTxBytes uint64
 }
 
 func (n *node) fastStatsSnapshot() fastStatsSnapshot {
@@ -2794,12 +2804,13 @@ func (n *node) fastStatsSnapshot() fastStatsSnapshot {
 		receivedPackets: n.stats.receivedPackets.Load(), receivedBytes: n.stats.receivedBytes.Load(),
 		queueDrops: n.stats.queueDrops.Load(), sentPackets: n.stats.sentPackets.Load(), sentBytes: n.stats.sentBytes.Load(),
 		deliveredPackets: n.stats.deliveredPackets.Load(), deliveredBytes: n.stats.deliveredBytes.Load(), deliveryDrops: n.stats.deliveryDrops.Load(),
+		controlRxPackets: n.stats.controlRxPackets.Load(), controlRxBytes: n.stats.controlRxBytes.Load(), controlTxPackets: n.stats.controlTxPackets.Load(), controlTxBytes: n.stats.controlTxBytes.Load(),
 	}
 }
 
 func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 	n.stats.receivedPackets.Add(1)
-	n.stats.receivedBytes.Add(uint64(len(data)))
+	n.stats.receivedBytes.Add(uint64(len(data) + 28))
 	if len(data) > maxFastFrame {
 		n.debugf("drop fast frame from %s: exceeds MTU (%d bytes)", addr, len(data))
 		return
@@ -2924,6 +2935,8 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		n.enqueueFast(datagram, address)
 		return
 	}
+	n.stats.controlRxPackets.Add(1)
+	n.stats.controlRxBytes.Add(uint64(len(datagram) + 28)) // IPv4 + UDP overhead.
 	p, e := protocol.DecodePacket(datagram, n.key)
 	if e != nil || !n.remember(p.ID) {
 		return
@@ -2957,6 +2970,15 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		n.ensureNeighbor(p.Source)
 		n.data(p)
 	}
+}
+
+func (n *node) writeControlUDP(conn *net.UDPConn, data []byte, address *net.UDPAddr) (int, error) {
+	written, err := conn.WriteToUDP(data, address)
+	if err == nil {
+		n.stats.controlTxPackets.Add(1)
+		n.stats.controlTxBytes.Add(uint64(written + 28))
+	}
+	return written, err
 }
 
 func (n *node) handlePong(packet protocol.Packet) {
