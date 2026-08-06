@@ -986,6 +986,20 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 	}
 	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
 	n.logf("control reconnect: UDP endpoint changed %s -> %s", previousEndpoint, endpoint)
+	// A port-only change is a normal NAT rebinding. Do not tear down the
+	// transport here: for symmetric NAT that would start a new scan and
+	// unnecessarily reconnect all existing links. The coordinator receives
+	// the fresh endpoint through the heartbeat, while the current transport
+	// remains intact. Network/IP changes still use the full recovery path
+	// below.
+	if !ipChanged {
+		n.c.endpoint = endpoint
+		if n.requestedNAT == "auto" {
+			n.c.nat = nat
+		}
+		n.helloAll()
+		return
+	}
 	// The old UDP mapping is tied to the previous network. Clear all cached
 	// peer observations and per-superpeer sockets before rebuilding transport;
 	// otherwise a Wi-Fi -> LTE transition can keep stale symmetric state and
