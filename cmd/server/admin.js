@@ -1,4 +1,4 @@
-(function installAccountUI() {
+﻿(function installAccountUI() {
   const connect = document.querySelector('.connect');
   if (!connect) return;
   const auth = document.createElement('div');
@@ -609,6 +609,7 @@ async function load() {
     $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
+    let sel = $('dnsNodeChoice'); if (sel) { sel.innerHTML = '<option value="">Choose a Mesh node...</option>' + (topology.nodes || []).map(x => `<option value="${esc(x.mesh_ip)}:53">${esc(x.name||x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join(''); }
     render()
   } catch (e) {
     $('liveDot').classList.remove('live');
@@ -641,7 +642,7 @@ $('settingsForm').onsubmit = async e => {
   e.preventDefault();
   try {
     let body = {};
-    for (let x of new FormData(e.target)) body[x[0]] = Number(x[1]);
+    for (let x of new FormData(e.target)) body[x[0]] = x[0] === 'dns_upstream' ? x[1].trim() : Number(x[1]);
     await api('/v1/admin/config', {
       method: 'PUT',
       headers: {
@@ -1031,3 +1032,6 @@ $('createAccountInvite').onclick = async () => {
   };
   forwards();
 })();
+
+$('dnsNodeChoice').onchange = e => { if (e.target.value) $('settingsForm').elements.dns_upstream.value = e.target.value };
+

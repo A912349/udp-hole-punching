@@ -9,7 +9,7 @@ import (
 )
 
 const (
-	meshDNSFallback      = "127.0.0.1:5353"
+	meshDNSFallback      = "127.0.0.1:1053"
 	meshDNSVirtualPrefix = "10.77."
 	maxDNSQueries        = 64
 )
@@ -112,7 +112,15 @@ func (n *node) serveDNS(ctx context.Context) {
 		<-ctx.Done()
 		listener.Close()
 	}()
-	upstream := systemResolver()
+	n.mu.RLock()
+	upstream := n.dnsUpstream
+	n.mu.RUnlock()
+	if upstream == "" {
+		upstream = systemResolver()
+	} else if host, _, err := net.SplitHostPort(upstream); err == nil && host == n.c.meshIP {
+		// The selected central node must not forward to itself (DNS loop).
+		upstream = systemResolver()
+	}
 	n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
 	go n.serveDNSListener(ctx, listener, upstream)
 	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget, n.tunLUID); err != nil {
@@ -121,10 +129,10 @@ func (n *node) serveDNS(ctx context.Context) {
 }
 
 // openDNSListener prefers the node's unique mesh address. The old design also
-// claimed 127.0.0.1:53 and a shared 127.0.0.1:5353 socket, which caused noisy
+// claimed 127.0.0.1:53 and a shared 127.0.0.1:1053 socket, which caused noisy
 // bind failures whenever another resolver or another mesh-node was present on
 // the same host. A loopback listener is only a fallback when the mesh address
-// cannot be bound, and its port is allowed to move if 5353 is occupied.
+// cannot be bound, and its port is allowed to move if 1053 is occupied.
 func (n *node) openDNSListener() (net.PacketConn, string, error) {
 	if n.c.meshIP != "" {
 		address := net.JoinHostPort(n.c.meshIP, "53")

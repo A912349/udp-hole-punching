@@ -132,12 +132,13 @@ type edge struct {
 	Cost float64 `json:"cost"`
 }
 type topology struct {
-	Version   string        `json:"topology_version"`
-	Self      peer          `json:"self"`
-	Neighbors []peer        `json:"neighbors"`
-	Directory []peer        `json:"directory"`
-	Links     []edge        `json:"backbone_links"`
-	Forwards  []portForward `json:"forwards"`
+	Version     string        `json:"topology_version"`
+	Self        peer          `json:"self"`
+	Neighbors   []peer        `json:"neighbors"`
+	Directory   []peer        `json:"directory"`
+	Links       []edge        `json:"backbone_links"`
+	Forwards    []portForward `json:"forwards"`
+	DNSUpstream string        `json:"dns_upstream,omitempty"`
 }
 type portForward struct {
 	ID         int64  `json:"id"`
@@ -240,6 +241,7 @@ type node struct {
 	pingMu           sync.Mutex
 	pings            map[string]pingProbe
 	mu               sync.RWMutex
+	dnsUpstream      string
 	routeMu          sync.Mutex
 	dir              map[string]*peer
 	neighbors        map[string]*peer
@@ -1131,6 +1133,7 @@ func (n *node) applyTopology(t topology) {
 		return
 	}
 	n.mu.Lock()
+	n.dnsUpstream = t.DNSUpstream
 	old := n.neighbors
 	n.dir = map[string]*peer{}
 	n.meshNodes = map[netip.Addr]string{}

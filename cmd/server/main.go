@@ -95,6 +95,7 @@ type server struct {
 	ttl                                         int64
 	auto                                        int // 0 selects ceil(sqrt(eligible cone relays)); a positive value is an override.
 	backboneDegree, clientLinks, symmetricLinks int
+	dnsUpstream                                 string
 	configMu                                    sync.RWMutex
 	inviteMu                                    sync.Mutex
 	inviteAttempts                              map[string][]time.Time
@@ -718,7 +719,7 @@ func value(k, d string) string {
 	return d
 }
 func (s *server) init() error {
-	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);`)
+	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);`)
 	if err != nil {
 		return err
 	}
@@ -1425,17 +1426,18 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 }
 
 type topologySettings struct {
-	TTL            int `json:"node_ttl_seconds"`
-	AutoSuperpeers int `json:"auto_superpeers"`
-	BackboneDegree int `json:"backbone_degree"`
-	ClientLinks    int `json:"client_links"`
-	SymmetricLinks int `json:"symmetric_links"`
+	TTL            int    `json:"node_ttl_seconds"`
+	AutoSuperpeers int    `json:"auto_superpeers"`
+	BackboneDegree int    `json:"backbone_degree"`
+	ClientLinks    int    `json:"client_links"`
+	SymmetricLinks int    `json:"symmetric_links"`
+	DNSUpstream    string `json:"dns_upstream"`
 }
 
 func (s *server) settings() topologySettings {
 	s.configMu.RLock()
 	defer s.configMu.RUnlock()
-	return topologySettings{int(s.ttl), s.auto, s.backboneDegree, s.clientLinks, s.symmetricLinks}
+	return topologySettings{TTL: int(s.ttl), AutoSuperpeers: s.auto, BackboneDegree: s.backboneDegree, ClientLinks: s.clientLinks, SymmetricLinks: s.symmetricLinks, DNSUpstream: s.dnsUpstream}
 }
 
 func (s *server) loadSettings() error {
@@ -1476,8 +1478,30 @@ func (s *server) loadSettings() error {
 	s.backboneDegree = settings.BackboneDegree
 	s.clientLinks = settings.ClientLinks
 	s.symmetricLinks = settings.SymmetricLinks
+	s.dnsUpstream = settings.DNSUpstream
 	s.configMu.Unlock()
 	return nil
+}
+
+func normalizeDNSUpstream(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", nil
+	}
+	if h, port, err := net.SplitHostPort(v); err == nil {
+		p, e := strconv.Atoi(port)
+		if h == "" || e != nil || p < 1 || p > 65535 {
+			return "", fmt.Errorf("invalid dns address")
+		}
+		return net.JoinHostPort(h, strconv.Itoa(p)), nil
+	}
+	if ip := net.ParseIP(v); ip != nil {
+		return net.JoinHostPort(v, "53"), nil
+	}
+	if strings.ContainsAny(v, " /\\") {
+		return "", fmt.Errorf("invalid dns address")
+	}
+	return net.JoinHostPort(v, "53"), nil
 }
 
 func validSettings(c topologySettings) error {
@@ -1515,7 +1539,13 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusBadRequest, map[string]string{"error": message})
 		return
 	}
-	_, err := s.db.Exec(`INSERT INTO settings(key,value) VALUES('node_ttl_seconds',?),('auto_superpeers',?),('backbone_degree',?),('client_links',?),('symmetric_links',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, next.TTL, next.AutoSuperpeers, next.BackboneDegree, next.ClientLinks, next.SymmetricLinks)
+	var err error
+	next.DNSUpstream, err = normalizeDNSUpstream(next.DNSUpstream)
+	if err != nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	_, err = s.db.Exec(`INSERT INTO settings(key,value) VALUES('node_ttl_seconds',?),('auto_superpeers',?),('backbone_degree',?),('client_links',?),('symmetric_links',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, next.TTL, next.AutoSuperpeers, next.BackboneDegree, next.ClientLinks, next.SymmetricLinks)
 	if err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -1526,12 +1556,14 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	s.backboneDegree = next.BackboneDegree
 	s.clientLinks = next.ClientLinks
 	s.symmetricLinks = next.SymmetricLinks
+	s.dnsUpstream = next.DNSUpstream
 	s.configMu.Unlock()
 	s.invalidateLinkCache()
 	if err := s.rebalanceRoles(); err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
+	s.db.Exec(`INSERT INTO dns_settings(key,value) VALUES('upstream',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, next.DNSUpstream)
 	s.pushTopologies()
 	reply(w, http.StatusOK, next)
 }
@@ -3364,10 +3396,12 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	settings := s.settings()
 	version := bootstrapTopologyVersion(all, ls)
+	version += "-dns" + fmt.Sprintf("%x", sha256.Sum256([]byte(settings.DNSUpstream)))[:12]
 	encoded, _ := json.Marshal(forwards)
 	version += "-f" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
-	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
+	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
 }
 
 func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
