@@ -560,7 +560,7 @@ function render() {
   $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
   for (let k in state.config) {
     let f = $('settingsForm').elements[k];
-    if (f) f.value = state.config[k]
+    if (f && !isDirtySetting(f)) f.value = state.config[k] || ''
   }
   $('removePeer').innerHTML = n.map(x => `<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join('')
 }
@@ -602,14 +602,11 @@ async function load() {
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || []
     };
-    for (let k in state.config) {
-      let field = $('settingsForm').elements[k];
-      if (field) field.value = state.config[k];
-    }
+    applySettingsFromServer();
     $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
-    let sel = $('dnsNodeChoice'); if (sel) { sel.innerHTML = '<option value="">Choose a Mesh node...</option>' + (topology.nodes || []).map(x => `<option value="${esc(x.mesh_ip)}:53">${esc(x.name||x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join(''); }
+    renderDNSNodeChoice(topology.nodes || []);
     render()
   } catch (e) {
     $('liveDot').classList.remove('live');
@@ -651,6 +648,7 @@ $('settingsForm').onsubmit = async e => {
       body: JSON.stringify(body)
     });
     toast('Policy saved and pushed');
+    for (const field of e.target.elements) if (field.name) field.dataset.dirty = '0';
     load()
   } catch (x) {
     toast(x.message)
@@ -733,10 +731,8 @@ async function loadScopes() {
       blockedLinks: graphData.blocked_links || []
     };
     $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
-    for (let k in state.config) {
-      let field = $('settingsForm').elements[k];
-      if (field) field.value = state.config[k];
-    }
+    applySettingsFromServer();
+    renderDNSNodeChoice(all.nodes || []);
     $('liveDot').classList.add('live');
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
     // Refresh every view derived from the new scoped snapshot together.
@@ -753,6 +749,17 @@ function load() {
   return loadScopes()
 }
 
+function isDirtySetting(field) {
+  return field.dataset.dirty === '1' || document.activeElement === field;
+}
+
+function applySettingsFromServer() {
+  for (let k in state.config) {
+    const field = $('settingsForm').elements[k];
+    if (field && !isDirtySetting(field)) field.value = state.config[k] || '';
+  }
+}
+
 // Keep the visualization responsive to registrations, disconnects and
 // telemetry changes without waiting for the slower full admin refresh.
 async function refreshGraph() {
@@ -763,6 +770,7 @@ async function refreshGraph() {
     ]);
     state.topologies = {online, all};
     state.topology = state.scope === 'all' ? all : online;
+    renderDNSNodeChoice(all.nodes || []);
     render();
     renderAllRemoveList();
   } catch (e) {
@@ -1033,5 +1041,14 @@ $('createAccountInvite').onclick = async () => {
   forwards();
 })();
 
-$('dnsNodeChoice').onchange = e => { if (e.target.value) $('settingsForm').elements.dns_upstream.value = e.target.value };
+for (const field of $('settingsForm').elements) {
+  if (field.name) field.oninput = () => { field.dataset.dirty = '1'; };
+}
+$('dnsNodeChoice').onchange = e => {
+  if (e.target.value) {
+    const field = $('settingsForm').elements.dns_upstream;
+    field.value = e.target.value;
+    field.dataset.dirty = '1';
+  }
+};
 
