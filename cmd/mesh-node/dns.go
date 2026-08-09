@@ -122,7 +122,7 @@ func (n *node) serveDNS(ctx context.Context) {
 		upstream = systemResolver()
 	}
 	n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
-	go n.serveDNSListener(ctx, listener, upstream)
+	go n.serveDNSListener(ctx, listener)
 	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget, n.tunLUID); err != nil {
 		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, dnsTarget)
 	}
@@ -165,7 +165,7 @@ func dnsTargetForListener(address net.Addr) string {
 	return address.String()
 }
 
-func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn, upstream string) {
+func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn) {
 	buf := make([]byte, 4096)
 	for {
 		size, client, err := c.ReadFrom(buf)
@@ -189,6 +189,15 @@ func (n *node) serveDNSListener(ctx context.Context, c net.PacketConn, upstream 
 					_, _ = c.WriteTo(dnsAnswer(query, end, ip), client)
 					return
 				}
+			}
+			n.mu.RLock()
+			upstream := n.dnsUpstream
+			meshIP := n.c.meshIP
+			n.mu.RUnlock()
+			if upstream == "" {
+				upstream = systemResolver()
+			} else if host, _, err := net.SplitHostPort(upstream); err == nil && host == meshIP {
+				upstream = systemResolver()
 			}
 			u, err := net.DialTimeout("udp", upstream, 2*time.Second)
 			if err != nil {

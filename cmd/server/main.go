@@ -1469,6 +1469,11 @@ func (s *server) loadSettings() error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	var dnsValue string
+	if err := s.db.QueryRow("SELECT value FROM dns_settings WHERE key='upstream'").Scan(&dnsValue); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	settings.DNSUpstream = dnsValue
 	if err := validSettings(settings); err != nil {
 		return fmt.Errorf("stored topology settings: %w", err)
 	}
