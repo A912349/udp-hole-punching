@@ -93,7 +93,7 @@ type config struct {
 	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                bool
 	fastWorkers                                                                                                          int
 	statsInterval                                                                                                        time.Duration
-	services, allows                                                                                                     multi
+	services, allows, bootstrapDNS                                                                                       multi
 }
 type multi []string
 
@@ -404,6 +404,7 @@ func parse() config {
 	var c config
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	f.StringVar(&c.server, "server", "", "Control-plane base URL")
+	f.Var(&c.bootstrapDNS, "bootstrap-dns", "IPv4 DNS server for startup hostnames (repeatable, e.g. 1.1.1.1:53)")
 	f.StringVar(&c.token, "network-token", "", "shared network token")
 	f.StringVar(&c.inviteToken, "invite-token", "", "one-time coordinator invitation token")
 	f.StringVar(&c.role, "role", "auto", "auto, superpeer or client")
@@ -735,7 +736,7 @@ func (n *node) connectControl() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	wsConfig.Dialer = &net.Dialer{Timeout: 10 * time.Second, Resolver: meshResolver()}
+	wsConfig.Dialer = &net.Dialer{Timeout: 10 * time.Second, Resolver: meshResolver(n.c.bootstrapDNS...)}
 	wsConfig.Header.Set("X-Mesh-Token", n.c.token)
 	if n.c.inviteToken != "" {
 		wsConfig.Header.Set("X-Mesh-Invite", n.c.inviteToken)
@@ -769,20 +770,22 @@ func (n *node) connectControl() (bool, error) {
 // meshResolver avoids Android configurations that point libc DNS at an
 // unavailable IPv6 loopback resolver (::1). It deliberately resolves only
 // IPv4 addresses because the mesh transport is IPv4/UDP based.
-func meshResolver() *net.Resolver {
-	if !androidRuntime() {
-		return net.DefaultResolver
-	}
+func meshResolver(bootstrap ...string) *net.Resolver {
 	servers := []string{}
-	for _, prop := range []string{"net.dns1", "net.dns2", "net.dns3", "net.dns4"} {
-		if out, err := exec.Command("getprop", prop).Output(); err == nil {
-			v := strings.TrimSpace(string(out))
-			if ip := net.ParseIP(v); ip != nil && ip.To4() != nil {
-				servers = append(servers, net.JoinHostPort(v, "53"))
-			}
+	if system := systemResolver(); system != "" {
+		servers = append(servers, system)
+	}
+	for _, value := range bootstrap {
+		host, port, err := net.SplitHostPort(value)
+		if err != nil {
+			host, port = value, "53"
+		}
+		if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil && ip.To4() != nil {
+			servers = append(servers, net.JoinHostPort(ip.String(), port))
 		}
 	}
-	servers = append(servers, "1.1.1.1:53", "8.8.8.8:53")
+	// Last-resort public resolver for bootstrap connectivity.
+	servers = append(servers, "8.8.8.8:53")
 	var index atomic.Uint32
 	return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 		for i := 0; i < len(servers); i++ {
@@ -2487,7 +2490,7 @@ func (n *node) recoverNetwork() {
 func (n *node) detectEndpoint() (string, string, error) {
 	n.udpReadMu.Lock()
 	defer n.udpReadMu.Unlock()
-	return stunEndpoint(n.currentUDPConn(), n.handleDatagram)
+	return stunEndpoint(n.currentUDPConn(), n.handleDatagram, n.c.bootstrapDNS...)
 }
 
 func (n *node) helloAll() {
@@ -3878,7 +3881,7 @@ func min(a, b int) int {
 	}
 	return b
 }
-func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr)) (string, string, error) {
+func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr), bootstrap ...string) (string, string, error) {
 	// STUN shares the node's UDP socket with the receive loop. Always restore
 	// the socket deadline so a probe cannot leave the data plane with a stale
 	// two-second read timeout.
@@ -3898,7 +3901,7 @@ func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr)) (string, 
 	resolved := make(chan resolvedServer, len(servers))
 	for _, server := range servers {
 		go func(server string) {
-			address, err := resolveMeshUDPAddr(server)
+			address, err := resolveMeshUDPAddr(server, bootstrap...)
 			resolved <- resolvedServer{address: address, err: err}
 		}(server)
 	}
@@ -3990,7 +3993,7 @@ func stunMappedEndpoint(response []byte, transaction [12]byte) (string, bool) {
 	return "", false
 }
 
-func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
+func resolveMeshUDPAddr(address string, bootstrap ...string) (*net.UDPAddr, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
@@ -4001,7 +4004,12 @@ func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
 	// Prefer the platform resolver with an explicit udp4 network. This avoids
 	// IPv6 answers and is more reliable on minimal Linux/container images where
 	// the custom resolver has no usable nameserver configuration.
-	if resolved, resolveErr := net.ResolveUDPAddr("udp4", address); resolveErr == nil && resolved.IP.To4() != nil {
+	if len(bootstrap) == 0 {
+		if resolved, resolveErr := net.ResolveUDPAddr("udp4", address); resolveErr == nil && resolved.IP.To4() != nil {
+			return resolved, nil
+		}
+	}
+	if resolved, resolveErr := resolveUDPAddrWithResolver(address, meshResolver(bootstrap...)); resolveErr == nil {
 		return resolved, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -4016,6 +4024,29 @@ func resolveMeshUDPAddr(address string) (*net.UDPAddr, error) {
 			if err != nil {
 				return nil, err
 			}
+			return &net.UDPAddr{IP: ip, Port: p}, nil
+		}
+	}
+	return nil, errors.New("DNS returned no IPv4 address")
+}
+
+func resolveUDPAddrWithResolver(address string, resolver *net.Resolver) (*net.UDPAddr, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ips, err := resolver.LookupHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	p, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range ips {
+		if ip := net.ParseIP(raw).To4(); ip != nil {
 			return &net.UDPAddr{IP: ip, Port: p}, nil
 		}
 	}

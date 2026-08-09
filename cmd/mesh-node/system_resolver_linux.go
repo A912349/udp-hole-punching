@@ -11,5 +11,5 @@ func platformSystemResolver() string {
 			return resolver
 		}
 	}
-	return "1.1.1.1:53"
+	return ""
 }
