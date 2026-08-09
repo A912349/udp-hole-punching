@@ -760,6 +760,20 @@ function applySettingsFromServer() {
   }
 }
 
+function renderDNSNodeChoice(nodes) {
+  const select = $('dnsNodeChoice');
+  if (!select) return;
+  const field = $('settingsForm').elements.dns_upstream;
+  const current = field ? field.value : '';
+  select.innerHTML = '<option value="">Select a Mesh node...</option>' + (nodes || [])
+    .filter(node => node.mesh_ip)
+    .map(node => `<option value="${esc(node.mesh_ip)}:53">${esc(node.name || node.node_id.slice(0, 12))} · ${esc(node.mesh_ip)}${node.online === false ? ' · offline' : ''}</option>`)
+    .join('');
+  if ([...select.options].some(option => option.value === current)) {
+    select.value = current;
+  }
+}
+
 // Keep the visualization responsive to registrations, disconnects and
 // telemetry changes without waiting for the slower full admin refresh.
 async function refreshGraph() {
