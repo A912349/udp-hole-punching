@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"os"
@@ -49,21 +48,6 @@ func readTUN(device tunDevice, buffer []byte) (int, error) {
 		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
 	}
 	return syscall.Read(int(file.Fd()), buffer)
-}
-
-// writeTUN mirrors readTUN's direct syscall path. The delivery worker is the
-// sole TUN writer, so a blocking write only occupies that dedicated OS thread
-// and avoids the runtime netpoll bookkeeping on every IP packet.
-func writeTUN(device tunDevice, packet []byte) (int, error) {
-	file, ok := device.(*os.File)
-	if !ok {
-		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
-	}
-	n, err := syscall.Write(int(file.Fd()), packet)
-	if err == nil && n != len(packet) {
-		err = io.ErrShortWrite
-	}
-	return n, err
 }
 
 func configureTUN(name, ip string, prefix int, _ uint64) error {

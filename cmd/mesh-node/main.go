@@ -269,6 +269,7 @@ type node struct {
 	stop             context.CancelFunc
 	tun              tunDevice
 	tunLUID          uint64
+	meshIPv4         atomic.Uint32
 	startedAt        time.Time
 	fastQueue        chan fastFrame
 	udpSendQueue     chan outboundDatagram
@@ -1083,6 +1084,11 @@ func (n *node) register() error {
 	if out.MeshIP == "" {
 		return errors.New("coordinator did not assign mesh_ip")
 	}
+	meshIP, err := netip.ParseAddr(out.MeshIP)
+	if err != nil || !meshIP.Is4() {
+		return fmt.Errorf("coordinator assigned invalid mesh IPv4 address %q", out.MeshIP)
+	}
+	n.meshIPv4.Store(binary.BigEndian.Uint32(meshIP.AsSlice()))
 	n.c.meshIP = out.MeshIP
 	n.c.role = out.Role
 	if out.Token != "" {
@@ -3637,15 +3643,16 @@ func (n *node) tunLoop(ctx context.Context) {
 			n.debugf("drop TUN frame: invalid IPv4 or exceeds MTU (%d bytes)", l)
 			continue
 		}
-		src := netip.AddrFrom4([4]byte(b[12:16])).String()
+		srcAddr := netip.AddrFrom4([4]byte(b[12:16]))
 		dstAddr := netip.AddrFrom4([4]byte(b[16:20]))
 		if n.isTUNBroadcast(dstAddr) {
 			continue
 		}
-		dstIP := dstAddr.String()
 		dst := n.ownerOf(dstAddr)
 		if dst == "" {
-			n.debugf("drop TUN frame: no node owns %s", dstIP)
+			if n.c.debug {
+				n.debugf("drop TUN frame: no node owns %s", dstAddr)
+			}
 			continue
 		}
 		if dst == n.id.ID {
@@ -3656,13 +3663,19 @@ func (n *node) tunLoop(ctx context.Context) {
 			}
 			continue
 		}
-		if src != n.c.meshIP && !n.translateLocalPacket(b[:l], true) {
-			n.debugf("drop TUN frame: source %s is not local mesh IP", src)
+		if !n.isLocalMeshIP(srcAddr) && !n.translateLocalPacket(b[:l], true) {
+			if n.c.debug {
+				n.debugf("drop TUN frame: source %s is not local mesh IP", srcAddr)
+			}
 			continue
 		}
-		n.debugf("TUN IPv4 %s -> %s (%d bytes)", src, dstIP, l)
+		if n.c.debug {
+			n.debugf("TUN IPv4 %s -> %s (%d bytes)", srcAddr, dstAddr, l)
+		}
 		if !n.sendIP(dst, b[:l]) {
-			n.debugf("TUN IPv4 %s -> %s: send failed", src, dstIP)
+			if n.c.debug {
+				n.debugf("TUN IPv4 %s -> %s: send failed", srcAddr, dstAddr)
+			}
 		}
 	}
 }
@@ -3674,10 +3687,10 @@ func (n *node) isTUNBroadcast(addr netip.Addr) bool {
 	if addr == ipv4LimitedBroadcast {
 		return true
 	}
-	local, err := netip.ParseAddr(n.c.meshIP)
-	if err != nil || !local.Is4() || n.c.prefix < 0 || n.c.prefix > 30 {
+	if n.meshIPv4.Load() == 0 || n.c.prefix < 0 || n.c.prefix > 30 {
 		return false
 	}
+	local := n.localMeshIP()
 	prefix := netip.PrefixFrom(local, n.c.prefix).Masked()
 	if !prefix.Contains(addr) {
 		return false
@@ -3740,11 +3753,12 @@ func (n *node) deliver(src string, p []byte) {
 	if n.c.debug {
 		n.debugf("deliver candidate from %s: %s -> %s proto=%d", src[:8], sourceIP, destinationIP, p[9])
 	}
-	if !n.addressOwnedBy(src, sourceIP) || !(destinationIP.String() == n.c.meshIP || n.addressOwnedBy(n.id.ID, destinationIP)) {
+	localDestination := n.isLocalMeshIP(destinationIP)
+	if !n.addressOwnedBy(src, sourceIP) || !(localDestination || n.addressOwnedBy(n.id.ID, destinationIP)) {
 		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
 		return
 	}
-	if destinationIP.String() != n.c.meshIP && !n.translateLocalPacket(p, false) {
+	if !localDestination && !n.translateLocalPacket(p, false) {
 		n.debugf("drop IP packet from %s: missing local translation", src[:8])
 		return
 	}
@@ -3755,7 +3769,7 @@ func (n *node) deliver(src string, p []byte) {
 			n.debugf("deliver warning: invalid IPv4 header checksum")
 		}
 	}
-	if _, err := writeTUN(n.tun, p); err != nil {
+	if _, err := n.tun.Write(p); err != nil {
 		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
 		return
 	}
@@ -3799,7 +3813,7 @@ func (n *node) ownerOf(ip netip.Addr) string {
 func (n *node) addressOwnedBy(owner string, ip netip.Addr) bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	if p := n.dir[owner]; p != nil && p.MeshIP == ip.String() {
+	if n.meshNodes[ip] == owner {
 		return true
 	}
 	for _, route := range n.subnetRoutes {
@@ -3808,6 +3822,15 @@ func (n *node) addressOwnedBy(owner string, ip netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+func (n *node) localMeshIP() netip.Addr {
+	value := n.meshIPv4.Load()
+	return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
+}
+
+func (n *node) isLocalMeshIP(ip netip.Addr) bool {
+	return n.meshIPv4.Load() != 0 && ip == n.localMeshIP()
 }
 
 // translateLocalPacket performs a stateless 1:1 prefix translation. Host bits

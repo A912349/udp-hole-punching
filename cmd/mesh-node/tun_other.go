@@ -6,8 +6,6 @@ import (
 	"errors"
 )
 
-func writeTUN(device tunDevice, packet []byte) (int, error) { return device.Write(packet) }
-
 func openTUN(string) (tunDevice, error) {
 	return nil, errors.New("TUN is supported on Linux and Windows")
 }

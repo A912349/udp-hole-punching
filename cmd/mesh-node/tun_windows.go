@@ -59,8 +59,6 @@ type wintunDevice struct {
 	closed  bool
 }
 
-func writeTUN(device tunDevice, packet []byte) (int, error) { return device.Write(packet) }
-
 func (d *wintunDevice) adapterLUID() uint64 { return d.luid }
 
 func (d *wintunDevice) setDebug(v bool) { windowsTUNDebug.Store(v) }
