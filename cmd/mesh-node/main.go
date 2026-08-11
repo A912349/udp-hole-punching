@@ -2744,6 +2744,17 @@ func (n *node) startDeliverWorker(ctx context.Context) {
 				return
 			case frame := <-n.deliverQueue:
 				n.deliver(frame.source, frame.data)
+				// Keep per-socket/TUN ordering while draining work already queued.
+				// This avoids returning to select (and an unnecessary scheduler
+				// decision) for every packet during a receive burst.
+				for i := 0; i < 15; i++ {
+					select {
+					case frame := <-n.deliverQueue:
+						n.deliver(frame.source, frame.data)
+					default:
+						i = 15
+					}
+				}
 			}
 		}
 	}()
@@ -3744,7 +3755,7 @@ func (n *node) deliver(src string, p []byte) {
 			n.debugf("deliver warning: invalid IPv4 header checksum")
 		}
 	}
-	if _, err := n.tun.Write(p); err != nil {
+	if _, err := writeTUN(n.tun, p); err != nil {
 		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
 		return
 	}
