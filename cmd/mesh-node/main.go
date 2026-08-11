@@ -525,7 +525,7 @@ const interactiveConfigFile = "mesh-node-config.json"
 
 type savedConfig struct {
 	Server, Token, InviteToken, Role, NAT, Bind, Endpoint, MeshIP, TUN, State, ControlCA string
-	Port, Capacity, Prefix                                                               int
+	Port, Capacity, Prefix, SymmetricScanStep                                            int
 	NoRelay, AutoTUN, Debug, ControlInsecure                                             bool
 }
 
@@ -542,7 +542,11 @@ func loadInteractiveConfig() (config, error) {
 		// diagnostic mode enabled only by an explicit --debug flag.
 		// Public NAT mappings are not persistent credentials. Always rediscover
 		// the endpoint after a process/NAT restart instead of reusing stale JSON.
-		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
+		step := saved.SymmetricScanStep
+		if step == 0 {
+			step = symmetricScanDefaultStep
+		}
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, symmetricScanStep: step, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
 		if c.server == "" || (c.token == "" && c.inviteToken == "") {
 			return config{}, fmt.Errorf("saved configuration is empty; run --reset-config once")
 		}
@@ -550,7 +554,7 @@ func loadInteractiveConfig() (config, error) {
 	return c, err
 }
 func saveInteractiveConfig(c config) error {
-	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure}
+	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, SymmetricScanStep: c.symmetricScanStep, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure}
 	b, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
@@ -569,7 +573,7 @@ func askInteractiveConfig() config {
 		}
 		return v
 	}
-	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1}
+	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1, symmetricScanStep: symmetricScanDefaultStep}
 	credential := ask("Network token or 6-character invite", "")
 	if len(credential) == 6 {
 		c.inviteToken = credential
