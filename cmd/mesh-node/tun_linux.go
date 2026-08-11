@@ -50,6 +50,16 @@ func readTUN(device tunDevice, buffer []byte) (int, error) {
 	return syscall.Read(int(file.Fd()), buffer)
 }
 
+// Like readTUN, bypass os.File's poll wrapper. TUN writes are synchronous and
+// safe from multiple goroutines; a raw write avoids poll-descriptor overhead.
+func writeTUN(device tunDevice, buffer []byte) (int, error) {
+	file, ok := device.(*os.File)
+	if !ok {
+		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
+	}
+	return syscall.Write(int(file.Fd()), buffer)
+}
+
 func configureTUN(name, ip string, prefix int, _ uint64) error {
 	address, e := netip.ParseAddr(ip)
 	if e != nil || !address.Is4() {

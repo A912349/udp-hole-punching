@@ -162,6 +162,10 @@ func readTUN(device tunDevice, buffer []byte) (int, error) {
 	return device.Read(buffer)
 }
 
+func writeTUN(device tunDevice, buffer []byte) (int, error) {
+	return device.Write(buffer)
+}
+
 func (d *wintunDevice) Write(data []byte) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()

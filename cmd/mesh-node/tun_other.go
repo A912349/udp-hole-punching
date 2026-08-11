@@ -15,6 +15,9 @@ func configureTUN(string, string, int, uint64) error {
 func readTUN(tunDevice, []byte) (int, error) {
 	return 0, errors.New("TUN is supported only on Linux and Windows")
 }
+func writeTUN(tunDevice, []byte) (int, error) {
+	return 0, errors.New("TUN is supported only on Linux and Windows")
+}
 func configureTUNRoutes(string, map[string]bool, map[string]bool, uint64) error {
 	return errors.New("TUN is supported only on Linux")
 }

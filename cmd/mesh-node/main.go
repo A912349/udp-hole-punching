@@ -92,7 +92,7 @@ type config struct {
 	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
 	port, capacity, prefix, symmetricScanStep                                                                            int
 	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                bool
-	fastWorkers                                                                                                          int
+	fastWorkers, deliverWorkers                                                                                          int
 	statsInterval                                                                                                        time.Duration
 	services, allows, bootstrapDNS                                                                                       multi
 }
@@ -277,7 +277,8 @@ type node struct {
 	fastPool         sync.Pool
 	sendPool         sync.Pool
 	macPool          sync.Pool
-	deliverQueue     chan deliverFrame
+	deliverQueues    []chan deliverFrame
+	deliverPool      sync.Pool
 	stats            fastStats
 
 	topologyRefreshMu   sync.Mutex
@@ -426,6 +427,7 @@ func parse() config {
 	f.BoolVar(&c.debug, "debug", false, "log data-plane packet decisions")
 	f.IntVar(&c.symmetricScanStep, "symmetric-scan-step", symmetricScanDefaultStep, "port interval for symmetric NAT scan")
 	f.IntVar(&c.fastWorkers, "fast-workers", 0, "fast packet workers (0 = up to 2, max 16)")
+	f.IntVar(&c.deliverWorkers, "deliver-workers", 0, "TUN delivery workers (0 = up to 4, max 16)")
 	f.DurationVar(&c.statsInterval, "stats-interval", 0, "log fast-path throughput and queue statistics (0 = off)")
 	f.StringVar(&c.pprofListen, "pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6060")
 	f.StringVar(&c.call, "call", "", "NODE_ID:SERVICE to call")
@@ -2742,37 +2744,77 @@ func (n *node) startFastWorkers(ctx context.Context) {
 }
 
 func (n *node) startDeliverWorker(ctx context.Context) {
-	n.deliverQueue = make(chan deliverFrame, fastQueueSize)
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case frame := <-n.deliverQueue:
-				n.deliver(frame.source, frame.data)
-				// Keep per-socket/TUN ordering while draining work already queued.
-				// This avoids returning to select (and an unnecessary scheduler
-				// decision) for every packet during a receive burst.
-				for i := 0; i < 15; i++ {
-					select {
-					case frame := <-n.deliverQueue:
-						n.deliver(frame.source, frame.data)
-					default:
-						i = 15
+	workers := n.c.deliverWorkers
+	if workers <= 0 {
+		workers = min(runtime.GOMAXPROCS(0), 4)
+	}
+	workers = max(1, min(workers, 16))
+	n.deliverQueues = make([]chan deliverFrame, workers)
+	n.deliverPool.New = func() any { return make([]byte, maxTUN) }
+	for i := range n.deliverQueues {
+		queue := make(chan deliverFrame, fastQueueSize/workers)
+		n.deliverQueues[i] = queue
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case frame := <-queue:
+					n.deliver(frame.source, frame.data)
+					n.deliverPool.Put(frame.data[:maxTUN])
+					// Keep per-socket/TUN ordering while draining work already queued.
+					// This avoids returning to select (and an unnecessary scheduler
+					// decision) for every packet during a receive burst.
+					for i := 0; i < 15; i++ {
+						select {
+						case frame := <-queue:
+							n.deliver(frame.source, frame.data)
+							n.deliverPool.Put(frame.data[:maxTUN])
+						default:
+							i = 15
+						}
 					}
 				}
 			}
-		}
-	}()
+		}()
+	}
 }
 
 func (n *node) enqueueDeliver(source string, data []byte) {
+	if len(n.deliverQueues) == 0 || len(data) < 20 || len(data) > maxTUN {
+		n.stats.deliveryDrops.Add(1)
+		return
+	}
+	// Keep packets from one IPv4 flow on one worker. This permits parallel TUN
+	// writes without reordering TCP/UDP packets within a flow.
+	flow := uint32(data[9])
+	for _, b := range data[12:20] {
+		flow = flow*16777619 ^ uint32(b)
+	}
+	ihl := int(data[0]&15) * 4
+	if ihl >= 20 && len(data) >= ihl+4 && (data[9] == 6 || data[9] == 17) {
+		for _, b := range data[ihl : ihl+4] {
+			flow = flow*16777619 ^ uint32(b)
+		}
+	}
+	queue := n.deliverQueues[int(flow%uint32(len(n.deliverQueues)))]
+	owned := n.deliverPool.Get().([]byte)[:len(data)]
+	copy(owned, data)
 	select {
-	case n.deliverQueue <- deliverFrame{source: source, data: data}:
+	case queue <- deliverFrame{source: source, data: owned}:
 	default:
+		n.deliverPool.Put(owned[:maxTUN])
 		n.stats.deliveryDrops.Add(1)
 		n.debugf("drop IP packet from %s: TUN queue full", source[:8])
 	}
+}
+
+func (n *node) deliverQueueUsage() (length, capacity int) {
+	for _, queue := range n.deliverQueues {
+		length += len(queue)
+		capacity += cap(queue)
+	}
+	return
 }
 
 func (n *node) startPprof() error {
@@ -2819,12 +2861,13 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			var mem runtime.MemStats
 			runtime.ReadMemStats(&mem)
 			seconds := interval.Seconds()
+			deliverLength, deliverCapacity := n.deliverQueueUsage()
 			n.logf("stats %s: data rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps control rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d heap=%.1f MiB goroutines=%d",
 				interval, float64(rxPackets)/seconds, float64(rxBytes*8)/seconds/1e6,
 				float64(txPackets)/seconds, float64(txBytes*8)/seconds/1e6,
 				float64(controlRxPackets)/seconds, float64(controlRxBytes*8)/seconds/1e6,
 				float64(controlTxPackets)/seconds, float64(controlTxBytes*8)/seconds/1e6,
-				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), len(n.deliverQueue), cap(n.deliverQueue), drops, tunDrops,
+				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), deliverLength, deliverCapacity, drops, tunDrops,
 				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
 			previous = current
 		}
@@ -3769,7 +3812,7 @@ func (n *node) deliver(src string, p []byte) {
 			n.debugf("deliver warning: invalid IPv4 header checksum")
 		}
 	}
-	if _, err := n.tun.Write(p); err != nil {
+	if _, err := writeTUN(n.tun, p); err != nil {
 		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
 		return
 	}
