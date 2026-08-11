@@ -15,6 +15,8 @@ func (n *node) startUDPSender(ctx context.Context) {
 	go func() {
 		writers := make(map[*net.UDPConn]udpBatchWriter)
 		batch := make([]outboundDatagram, 0, udpSendBatchSize)
+		grouped := make(map[*net.UDPConn][]outboundDatagram)
+		connOrder := make([]*net.UDPConn, 0, udpSendBatchSize)
 		for {
 			select {
 			case <-ctx.Done():
@@ -37,26 +39,30 @@ func (n *node) startUDPSender(ctx context.Context) {
 				}
 			}
 		send:
-			for start := 0; start < len(batch); {
-				conn := batch[start].conn
-				end := start + 1
-				for end < len(batch) && batch[end].conn == conn {
-					end++
+			connOrder = connOrder[:0]
+			for i := range batch {
+				conn := batch[i].conn
+				if _, exists := grouped[conn]; !exists {
+					connOrder = append(connOrder, conn)
 				}
+				grouped[conn] = append(grouped[conn], batch[i])
+			}
+			for _, conn := range connOrder {
+				frames := grouped[conn]
 				writer := writers[conn]
 				if writer == nil {
 					writer = newUDPBatchWriter(conn)
 					writers[conn] = writer
 				}
-				sent, err := writer.write(batch[start:end])
-				for i := start; i < start+sent; i++ {
+				sent, err := writer.write(frames)
+				for i := 0; i < sent; i++ {
 					n.stats.sentPackets.Add(1)
-					n.stats.sentBytes.Add(uint64(len(batch[i].data)))
+					n.stats.sentBytes.Add(uint64(len(frames[i].data)))
 				}
 				if err != nil {
-					n.debugf("UDP batch send failed after %d/%d packets: %v", sent, end-start, err)
+					n.debugf("UDP batch send failed after %d/%d packets: %v", sent, len(frames), err)
 				}
-				start = end
+				delete(grouped, conn)
 			}
 			for i := range batch {
 				n.udpSendPool.Put(batch[i].data[:maxFastFrame])

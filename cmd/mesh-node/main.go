@@ -77,6 +77,7 @@ const (
 	fastQueueSize            = 1024
 	udpSendBatchSize         = 16
 	udpSendQueueSize         = 256
+	udpSocketBufferSize      = 4 << 20
 	fastSeenCapacity         = 10000
 	lanDiscoveryPort         = 37777
 	lanDiscoveryInterval     = time.Minute
@@ -638,6 +639,7 @@ func newNode(c config) (*node, error) {
 	if e != nil {
 		return nil, e
 	}
+	configureUDPSocket(conn)
 	k := sha256.Sum256([]byte(c.token))
 	n := &node{
 		c:                   c,
@@ -707,6 +709,17 @@ func (n *node) debugf(f string, a ...any) {
 	if n.c.debug {
 		n.logf(f, a...)
 	}
+}
+
+// UDP has no backpressure. Larger kernel queues absorb short bursts while the
+// workers are decrypting or routing an earlier batch. These calls are
+// best-effort because operating systems may clamp the requested size.
+func configureUDPSocket(conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetReadBuffer(udpSocketBufferSize)
+	_ = conn.SetWriteBuffer(udpSocketBufferSize)
 }
 
 type controlFrame struct {
@@ -1652,6 +1665,7 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 			probe.Close()
 			continue
 		}
+		configureUDPSocket(probe)
 		sockets = append(sockets, probe)
 		go n.awaitSymmetricHello(probe, relayID, sessionID, responses)
 	}
@@ -1869,6 +1883,7 @@ func (n *node) rebindUDPConn() error {
 		n.connMu.Unlock()
 		return err
 	}
+	configureUDPSocket(next)
 	n.conn = next
 	n.connMu.Unlock()
 	n.finishUDPConnReplacement(old, next)
