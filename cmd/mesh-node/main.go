@@ -2821,6 +2821,10 @@ func (n *node) startPprof() error {
 	if n.c.pprofListen == "" {
 		return nil
 	}
+	// Enable contention profiles only for diagnostic runs. These profiles are
+	// empty by default and are intentionally not enabled in normal operation.
+	runtime.SetBlockProfileRate(1)
+	runtime.SetMutexProfileFraction(1)
 	host, _, err := net.SplitHostPort(n.c.pprofListen)
 	if err != nil {
 		return fmt.Errorf("invalid --pprof-listen: %w", err)
