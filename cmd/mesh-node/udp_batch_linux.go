@@ -12,7 +12,7 @@ import (
 
 // A small batch amortizes recvmmsg overhead without keeping a large burst in
 // userspace while the node is handling earlier packets.
-const udpReceiveBatchSize = 16
+const udpReceiveBatchSize = 32
 
 type linuxUDPBatchReader struct {
 	conn      *ipv4.PacketConn

@@ -75,7 +75,7 @@ const (
 	maxTUN                   = 1279
 	fastBatchSize            = 32
 	fastQueueSize            = 1024
-	udpSendBatchSize         = 16
+	udpSendBatchSize         = 32
 	udpSendQueueSize         = 256
 	udpSocketBufferSize      = 4 << 20
 	fastSeenCapacity         = 10000
@@ -2253,7 +2253,6 @@ func (n *node) broadcastLANDiscovery() {
 func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 	buffer := make([]byte, protocol.MaxDatagramSize)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		length, address, err := conn.ReadFromUDP(buffer)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -2746,7 +2745,8 @@ func (n *node) startFastWorkers(ctx context.Context) {
 func (n *node) startDeliverWorker(ctx context.Context) {
 	workers := n.c.deliverWorkers
 	if workers <= 0 {
-		workers = min(runtime.GOMAXPROCS(0), 4)
+		// A TUN device is a single file descriptor; one default writer avoids scheduler and kernel-lock contention.
+		workers = 1
 	}
 	workers = max(1, min(workers, 16))
 	n.deliverQueues = make([]chan deliverFrame, workers)
@@ -2988,7 +2988,6 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 	}()
 	reader := newUDPBatchReader(conn)
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 		n.udpReadMu.RLock()
 		datagrams, e := reader.read()
 		n.udpReadMu.RUnlock()
