@@ -3694,6 +3694,15 @@ func (n *node) tunLoop(ctx context.Context) {
 		if n.isTUNBroadcast(dstAddr) {
 			continue
 		}
+		// The TUN carries the whole mesh subnet, including this node's own
+		// address. Do not look up a peer for a packet addressed to ourselves:
+		// inject it back into the kernel so the local IP stack receives it.
+		if n.isLocalMeshIP(dstAddr) {
+			if !n.loopbackTUNPacket(b[:l]) && n.c.debug {
+				n.debugf("TUN IPv4 %s -> %s: loopback failed", srcAddr, dstAddr)
+			}
+			continue
+		}
 		dst := n.ownerOf(dstAddr)
 		if dst == "" {
 			if n.c.debug {
@@ -3724,6 +3733,17 @@ func (n *node) tunLoop(ctx context.Context) {
 			}
 		}
 	}
+}
+
+func (n *node) loopbackTUNPacket(packet []byte) bool {
+	if n.tun == nil {
+		return false
+	}
+	if _, err := writeTUN(n.tun, packet); err != nil {
+		n.debugf("TUN loopback failed: %v", err)
+		return false
+	}
+	return true
 }
 
 // Broadcast is not an overlay unicast destination. Hosts commonly emit it
