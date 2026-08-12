@@ -43,20 +43,20 @@ const (
 var (
 	windowsTUNDebug          atomic.Bool
 	wintunDLL                *syscall.LazyDLL
-	wintunOpenAdapter        *syscall.Proc
-	wintunCreateAdapter      *syscall.Proc
-	wintunCloseAdapter       *syscall.Proc
-	wintunStartSession       *syscall.Proc
-	wintunEndSession         *syscall.Proc
-	wintunGetReadWaitEvent   *syscall.Proc
-	wintunReceivePacket      *syscall.Proc
-	wintunReleaseReceive     *syscall.Proc
-	wintunAllocateSend       *syscall.Proc
-	wintunSendPacket         *syscall.Proc
+	wintunOpenAdapter        *syscall.LazyProc
+	wintunCreateAdapter      *syscall.LazyProc
+	wintunCloseAdapter       *syscall.LazyProc
+	wintunStartSession       *syscall.LazyProc
+	wintunEndSession         *syscall.LazyProc
+	wintunGetReadWaitEvent   *syscall.LazyProc
+	wintunReceivePacket      *syscall.LazyProc
+	wintunReleaseReceive     *syscall.LazyProc
+	wintunAllocateSend       *syscall.LazyProc
+	wintunSendPacket         *syscall.LazyProc
 	iphlpapiDLL              = syscall.NewLazyDLL("iphlpapi.dll")
 	convertInterfaceLUID     = iphlpapiDLL.NewProc("ConvertInterfaceLuidToIndex")
 	kernel32WaitForSingleObj = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
-	wintunGetAdapterLUID     *syscall.Proc
+	wintunGetAdapterLUID     *syscall.LazyProc
 )
 
 func init() {
