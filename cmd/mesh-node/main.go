@@ -114,6 +114,7 @@ type peer struct {
 	DNSRecords []dnsRecord          `json:"dns_records,omitempty"`
 	last       net.Addr
 	lastRX     time.Time
+	lastPong   time.Time
 	discovered time.Time
 	up         bool
 	rttMS      float64
@@ -1277,6 +1278,7 @@ func (n *node) applyTopology(t topology) {
 		if q := old[p.ID]; q != nil {
 			p.last = q.last
 			p.lastRX = q.lastRX
+			p.lastPong = q.lastPong
 			p.up = q.up
 			p.discovered = q.discovered
 		}
@@ -2372,6 +2374,7 @@ func (n *node) resetTransportState() {
 	for _, peer := range n.neighbors {
 		peer.last = nil
 		peer.lastRX = time.Time{}
+		peer.lastPong = time.Time{}
 		peer.up = false
 	}
 	n.mu.Unlock()
@@ -2498,6 +2501,10 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 			if current == nil {
 				return
 			}
+			// HELLO is deliberately sent on every retry, even when the cached
+			// observed address is stale: sendHello also tries the endpoint from
+			// the latest topology snapshot. This is what reopens a lost NAT
+			// mapping and causes the peer to refresh its address on both sides.
 			n.sendHello(snapshot)
 			if attempt < edgeRetryAttempts {
 				time.Sleep(edgeRetryDelay)
@@ -2537,8 +2544,8 @@ func (n *node) recoverNetwork() {
 		// local NAT mapping is only justified when every observed neighbor is
 		// stale; otherwise an unrelated peer can repeatedly disrupt healthy
 		// traffic on this node.
-		if (!peer.lastRX.IsZero() && time.Since(peer.lastRX) < linkTimeout) ||
-			(peer.lastRX.IsZero() && time.Since(peer.discovered) < linkGrace) {
+		if (!peer.lastPong.IsZero() && time.Since(peer.lastPong) < linkTimeout) ||
+			(peer.lastPong.IsZero() && time.Since(peer.discovered) < linkGrace) {
 			stale = false
 			break
 		}
@@ -2642,6 +2649,19 @@ func (n *node) pingAll() {
 	for _, target := range targets {
 		p := protocol.NewPacket("PING", n.id.ID, target.id, map[string]any{})
 		if !n.sendDirect(p, target.endpoint, target.observed) {
+			// Do not wait for the next linkHealth tick when the socket cannot
+			// even send the probe. This used to leave a dead edge without any
+			// retry until another, unrelated state transition occurred.
+			n.mu.RLock()
+			current := n.neighbors[target.id]
+			var snapshot peer
+			if current != nil {
+				snapshot = *current
+			}
+			n.mu.RUnlock()
+			if current != nil {
+				n.retryDeadEdge(target.id, snapshot)
+			}
 			continue
 		}
 		n.pingMu.Lock()
@@ -2698,7 +2718,7 @@ func (n *node) reportTelemetry() error {
 	n.mu.RLock()
 	links := make([]measurement, 0, len(n.neighbors))
 	for id, p := range n.neighbors {
-		links = append(links, measurement{id, p.rttMS, !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout})
+		links = append(links, measurement{id, p.rttMS, !p.lastPong.IsZero() && time.Since(p.lastPong) < linkTimeout})
 	}
 	n.mu.RUnlock()
 	return n.request("POST", "/v1/telemetry", map[string]any{"node_id": n.id.ID, "links": links}, &map[string]any{})
@@ -2708,7 +2728,7 @@ func (n *node) usable(p *peer) bool {
 	// through it until this node has actually received traffic from the peer.
 	// Treating a zero lastRX as usable made one side show link up immediately
 	// while the other side was still establishing the UDP path.
-	return p != nil && !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout
+	return p != nil && !p.lastPong.IsZero() && time.Since(p.lastPong) < linkTimeout
 }
 func (n *node) send(p protocol.Packet) bool {
 	hop, q := n.nextHop(p.Destination)
@@ -3164,6 +3184,7 @@ func (n *node) handlePong(packet protocol.Packet) {
 	n.mu.Lock()
 	if peer := n.neighbors[packet.Source]; peer != nil {
 		peer.rttMS = float64(time.Since(probe.sent).Microseconds()) / 1000
+		peer.lastPong = time.Now()
 	}
 	n.mu.Unlock()
 }
