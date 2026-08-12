@@ -129,6 +129,14 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Download Wintun for embedding
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
+          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'wintun') -Force
+          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun\wintun\bin\amd64\wintun.dll') cmd\mesh-node\wintun.dll
+
       - name: Test Windows client
         run: go test ./cmd/mesh-node ./internal/protocol
 
@@ -153,14 +161,6 @@ jobs:
         shell: pwsh
         run: |
           upx --best --lzma bin\mesh-node.exe
-
-      - name: Bundle official Wintun runtime
-        shell: pwsh
-        run: |
-          $zip = Join-Path $env:RUNNER_TEMP 'wintun.zip'
-          Invoke-WebRequest -Uri 'https://www.wintun.net/builds/wintun-0.14.1.zip' -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath (Join-Path $env:RUNNER_TEMP 'wintun') -Force
-          Copy-Item (Join-Path $env:RUNNER_TEMP 'wintun\wintun\bin\amd64\wintun.dll') bin\wintun.dll
 
       - name: Upload Windows client
         uses: actions/upload-artifact@v4

@@ -10,3 +10,4 @@ state-*/
 /punch-client
 /.gocache/
 /.gopath/
+cmd/mesh-node/wintun.dll

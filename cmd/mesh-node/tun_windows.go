@@ -7,6 +7,7 @@ package main
 // the data plane identical to Linux while avoiding a custom kernel driver.
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,6 +25,13 @@ import (
 	"time"
 	"unsafe"
 )
+
+// wintun.dll is downloaded by the Windows CI job and embedded into the
+// executable. Keeping the file in the source tree only as a CI build input
+// avoids requiring a separate runtime file beside mesh-node.exe.
+//
+//go:embed wintun.dll
+var embeddedWintun []byte
 
 const (
 	wintunSessionCapacity = 8 * 1024 * 1024
@@ -33,22 +42,41 @@ const (
 
 var (
 	windowsTUNDebug          atomic.Bool
-	wintunDLL                = syscall.NewLazyDLL("wintun.dll")
-	wintunOpenAdapter        = wintunDLL.NewProc("WintunOpenAdapter")
-	wintunCreateAdapter      = wintunDLL.NewProc("WintunCreateAdapter")
-	wintunCloseAdapter       = wintunDLL.NewProc("WintunCloseAdapter")
-	wintunStartSession       = wintunDLL.NewProc("WintunStartSession")
-	wintunEndSession         = wintunDLL.NewProc("WintunEndSession")
-	wintunGetReadWaitEvent   = wintunDLL.NewProc("WintunGetReadWaitEvent")
-	wintunReceivePacket      = wintunDLL.NewProc("WintunReceivePacket")
-	wintunReleaseReceive     = wintunDLL.NewProc("WintunReleaseReceivePacket")
-	wintunAllocateSend       = wintunDLL.NewProc("WintunAllocateSendPacket")
-	wintunSendPacket         = wintunDLL.NewProc("WintunSendPacket")
+	wintunDLL                *syscall.LazyDLL
+	wintunOpenAdapter        *syscall.Proc
+	wintunCreateAdapter      *syscall.Proc
+	wintunCloseAdapter       *syscall.Proc
+	wintunStartSession       *syscall.Proc
+	wintunEndSession         *syscall.Proc
+	wintunGetReadWaitEvent   *syscall.Proc
+	wintunReceivePacket      *syscall.Proc
+	wintunReleaseReceive     *syscall.Proc
+	wintunAllocateSend       *syscall.Proc
+	wintunSendPacket         *syscall.Proc
 	iphlpapiDLL              = syscall.NewLazyDLL("iphlpapi.dll")
 	convertInterfaceLUID     = iphlpapiDLL.NewProc("ConvertInterfaceLuidToIndex")
 	kernel32WaitForSingleObj = syscall.NewLazyDLL("kernel32.dll").NewProc("WaitForSingleObject")
-	wintunGetAdapterLUID     = wintunDLL.NewProc("WintunGetAdapterLUID")
+	wintunGetAdapterLUID     *syscall.Proc
 )
+
+func init() {
+	path := filepath.Join(os.TempDir(), "home-udp-mesh-wintun.dll")
+	if err := os.WriteFile(path, embeddedWintun, 0600); err != nil {
+		log.Printf("write embedded wintun.dll: %v", err)
+	}
+	wintunDLL = syscall.NewLazyDLL(path)
+	wintunOpenAdapter = wintunDLL.NewProc("WintunOpenAdapter")
+	wintunCreateAdapter = wintunDLL.NewProc("WintunCreateAdapter")
+	wintunCloseAdapter = wintunDLL.NewProc("WintunCloseAdapter")
+	wintunStartSession = wintunDLL.NewProc("WintunStartSession")
+	wintunEndSession = wintunDLL.NewProc("WintunEndSession")
+	wintunGetReadWaitEvent = wintunDLL.NewProc("WintunGetReadWaitEvent")
+	wintunReceivePacket = wintunDLL.NewProc("WintunReceivePacket")
+	wintunReleaseReceive = wintunDLL.NewProc("WintunReleaseReceivePacket")
+	wintunAllocateSend = wintunDLL.NewProc("WintunAllocateSendPacket")
+	wintunSendPacket = wintunDLL.NewProc("WintunSendPacket")
+	wintunGetAdapterLUID = wintunDLL.NewProc("WintunGetAdapterLUID")
+}
 
 type wintunDevice struct {
 	adapter uintptr

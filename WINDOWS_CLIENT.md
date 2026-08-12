@@ -7,8 +7,8 @@ as on Linux; the Windows data-plane adapter is provided by the official
 
 ## Installation
 
-1. Put `mesh-node.exe` and the matching `wintun.dll` in the same directory.
-   The Windows CI artifact already contains both files.
+1. Put `mesh-node.exe` in a directory of your choice. The Windows build embeds
+   the matching `wintun.dll` and extracts it to `%TEMP%` automatically.
 2. Open **PowerShell as Administrator**. Creating/configuring a virtual
 adapter and changing its routes/DNS requires elevation.
 3. Allow the selected UDP port through Windows Firewall if the machine is
@@ -26,7 +26,7 @@ signed Wintun driver. It does not install or require WireGuard itself.
 .\mesh-node.exe `
   --server http://LINUX_SERVER:8001 `
   --network-token "ACCOUNT_NETWORK_TOKEN" `
-  --state-dir "$env:ProgramData\HomeUdpMesh\state" `
+  --state-dir "$env:ProgramData\HomeUdpMesh\mesh-node.json" `
   --tun-name mesh0 `
   --tun-auto-configure
 ```
@@ -38,7 +38,11 @@ closes the UDP/WebSocket session, removes routes owned by the process and
 restores adapter DNS to DHCP.
 
 If the adapter name is already used by another Wintun instance, choose another
-name with `--tun-name`. Each client must use its own `--state-dir` and identity.
+name with `--tun-name`. Each client must use its own state JSON file and identity.
+
+The current format stores configuration and the persistent X25519 private key in
+one `mesh-node.json` file. Older installations using `mesh-node-config.json`
+and `<state-dir>\identity.json` are migrated automatically on first start.
 
 Run the local smoke test from the repository after starting the client:
 
@@ -57,8 +61,8 @@ topology and retries the handshake.
 
 ## Troubleshooting
 
-- `load wintun.dll`: copy the architecture-matching Wintun DLL beside the
-  executable; do not use an x86 DLL with an amd64 executable.
+- `load embedded wintun.dll`: the executable contains the amd64 Wintun DLL and
+  extracts it to `%TEMP%` automatically.
 - `open or create Wintun adapter`: run the terminal elevated and remove a
   broken stale adapter from **Network Connections**, then retry.
 - `route.exe` or `netsh` errors: check that the terminal is elevated and that

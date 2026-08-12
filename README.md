@@ -70,13 +70,13 @@ legacy network token is authenticated.
 ./mesh-node \
   --server https://SERVER_IP:8001 \
   --network-token "$ACCOUNT_NETWORK_TOKEN" \
-  --state-dir state-node
+  --state-dir mesh-node.json
 ```
 
 The node uses STUN to discover its public endpoint and classify the mapping.
 For restricted or offline environments, provide both `--nat-type` and
-`--public-endpoint HOST:PORT` explicitly. Each node needs its own state
-directory because it holds its persistent X25519 identity.
+`--public-endpoint HOST:PORT` explicitly. Each node needs its own state JSON
+file because it holds its persistent X25519 identity and configuration.
 
 For symmetric NAT traversal, `--symmetric-scan-step` controls the interval
 between ports in each scan pass (default: `200`). For example, a target port
@@ -87,14 +87,14 @@ Publish a one-shot TCP service:
 
 ```bash
 ./mesh-node --server https://SERVER_IP:8001 --network-token "$ACCOUNT_NETWORK_TOKEN" \
-  --state-dir state-home --service web=127.0.0.1:8080
+  --state-dir mesh-node.json --service web=127.0.0.1:8080
 ```
 
 Call it from another node (the destination can be a unique node-ID prefix):
 
 ```bash
 cat request.bin | ./mesh-node --server https://SERVER_IP:8001 \
-  --network-token "$ACCOUNT_NETWORK_TOKEN" --state-dir state-client \
+  --network-token "$ACCOUNT_NETWORK_TOKEN" --state-dir mesh-node.json \
   --call NODE_ID:web > response.bin
 ```
 

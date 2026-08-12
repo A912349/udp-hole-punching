@@ -420,7 +420,7 @@ func parse() config {
 	f.IntVar(&c.prefix, "mesh-prefix", 24, "mesh prefix")
 	f.BoolVar(&c.autoTUN, "tun-auto-configure", false, "configure TUN")
 	f.IntVar(&c.capacity, "capacity", 1, "relay capacity")
-	f.StringVar(&c.state, "state-dir", "mesh-state", "identity directory")
+	f.StringVar(&c.state, "state-dir", unifiedStateFile, "state JSON file (legacy directory paths are migrated automatically)")
 	f.Var(&c.services, "service", "publish NAME=HOST:PORT")
 	f.Var(&c.allows, "allow-node", "allow node ID for services")
 	f.BoolVar(&c.noRelay, "no-relay", false, "disable relay")
@@ -437,8 +437,10 @@ func parse() config {
 	f.BoolVar(&c.resetConfig, "reset-config", false, "delete saved interactive configuration and ask again")
 	f.Parse(os.Args[1:])
 	if c.resetConfig {
-		if err := os.Remove(interactiveConfigFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-			log.Fatal("reset configuration: ", err)
+		for _, path := range []string{unifiedStateFile, interactiveConfigFile} {
+			if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Fatal("reset configuration: ", err)
+			}
 		}
 		fmt.Println("Saved configuration reset. Run without parameters to configure it again.")
 		os.Exit(0)
@@ -466,7 +468,7 @@ func parse() config {
 			if c.inviteToken == "" {
 				c.inviteToken = saved.inviteToken
 			}
-			if c.state == "mesh-state" {
+			if c.state == unifiedStateFile {
 				c.state = saved.state
 			}
 			if c.tun == "" {
@@ -525,17 +527,26 @@ func parse() config {
 	return c
 }
 
-const interactiveConfigFile = "mesh-node-config.json"
+const (
+	unifiedStateFile      = "mesh-node.json"
+	interactiveConfigFile = "mesh-node-config.json"
+)
 
 type savedConfig struct {
 	Server, Token, InviteToken, Role, NAT, Bind, Endpoint, MeshIP, TUN, State, ControlCA string
 	Port, Capacity, Prefix, SymmetricScanStep                                            int
 	NoRelay, AutoTUN, Debug, ControlInsecure                                             bool
+	PrivateKey                                                                           string `json:"private_key,omitempty"`
 }
 
 func loadInteractiveConfig() (config, error) {
 	var c config
-	b, err := os.ReadFile(interactiveConfigFile)
+	path := unifiedStateFile
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		path = interactiveConfigFile
+		b, err = os.ReadFile(path)
+	}
 	if err != nil {
 		return c, err
 	}
@@ -550,7 +561,22 @@ func loadInteractiveConfig() (config, error) {
 		if step == 0 {
 			step = symmetricScanDefaultStep
 		}
-		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: saved.State, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, symmetricScanStep: step, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: unifiedStateFile, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, symmetricScanStep: step, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
+		if saved.PrivateKey == "" && saved.State != "" {
+			if legacy, readErr := os.ReadFile(filepath.Join(saved.State, "identity.json")); readErr == nil {
+				var identity struct {
+					PrivateKey string `json:"private_key"`
+				}
+				if json.Unmarshal(legacy, &identity) == nil {
+					saved.PrivateKey = identity.PrivateKey
+				}
+			}
+		}
+		if saved.PrivateKey != "" || path == interactiveConfigFile {
+			if saveErr := saveInteractiveConfigWithKey(c, saved.PrivateKey); saveErr != nil {
+				return config{}, saveErr
+			}
+		}
 		if c.server == "" || (c.token == "" && c.inviteToken == "") {
 			return config{}, fmt.Errorf("saved configuration is empty; run --reset-config once")
 		}
@@ -558,12 +584,23 @@ func loadInteractiveConfig() (config, error) {
 	return c, err
 }
 func saveInteractiveConfig(c config) error {
-	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: c.state, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, SymmetricScanStep: c.symmetricScanStep, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure}
+	return saveInteractiveConfigWithKey(c, "")
+}
+func saveInteractiveConfigWithKey(c config, privateKey string) error {
+	if privateKey == "" {
+		if b, err := os.ReadFile(unifiedStateFile); err == nil {
+			var existing savedConfig
+			if json.Unmarshal(b, &existing) == nil {
+				privateKey = existing.PrivateKey
+			}
+		}
+	}
+	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: unifiedStateFile, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, SymmetricScanStep: c.symmetricScanStep, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure, PrivateKey: privateKey}
 	b, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(interactiveConfigFile, b, 0600)
+	return os.WriteFile(unifiedStateFile, b, 0600)
 }
 func askInteractiveConfig() config {
 	fmt.Fprintln(os.Stderr, "[mesh-node] first start: waiting for configuration input; network connection has not started yet")
@@ -577,7 +614,7 @@ func askInteractiveConfig() config {
 		}
 		return v
 	}
-	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: "mesh-state", tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1, symmetricScanStep: symmetricScanDefaultStep}
+	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: unifiedStateFile, tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1, symmetricScanStep: symmetricScanDefaultStep}
 	credential := ask("Network token or 6-character invite", "")
 	if len(credential) == 6 {
 		c.inviteToken = credential
@@ -588,6 +625,22 @@ func askInteractiveConfig() config {
 	return c
 }
 func loadIdentity(dir string) (*protocol.Identity, error) {
+	if b, e := os.ReadFile(dir); e == nil {
+		var x struct {
+			Private string `json:"private_key"`
+		}
+		if json.Unmarshal(b, &x) == nil && x.Private != "" {
+			raw, e := protocol.B64Decode(x.Private)
+			if e != nil {
+				return nil, e
+			}
+			return protocol.ParsePrivateDER(raw)
+		}
+		// The unified file exists but has no identity yet; generate one below.
+		if filepath.Base(dir) == unifiedStateFile {
+			return createUnifiedIdentity(dir)
+		}
+	}
 	if e := os.MkdirAll(dir, 0700); e != nil {
 		return nil, e
 	}
@@ -622,6 +675,31 @@ func loadIdentity(dir string) (*protocol.Identity, error) {
 		e = os.WriteFile(p, b, 0600)
 	}
 	return i, e
+}
+
+func createUnifiedIdentity(path string) (*protocol.Identity, error) {
+	i, err := protocol.NewIdentity()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := protocol.MarshalPrivateDER(i)
+	if err != nil {
+		return nil, err
+	}
+	var saved savedConfig
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(b, &saved); err != nil {
+		return nil, err
+	}
+	saved.PrivateKey = protocol.B64Encode(raw)
+	encoded, err := json.MarshalIndent(saved, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return i, os.WriteFile(path, encoded, 0600)
 }
 func newNode(c config) (*node, error) {
 	id, e := loadIdentity(c.state)
