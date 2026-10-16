@@ -39,25 +39,26 @@ func openTUN(name string) (tunDevice, error) {
 	return f, nil
 }
 
-// readTUN deliberately bypasses os.File.Read. Go's runtime poller rejects
-// some /dev/net/tun implementations with "not pollable", while the raw Linux
-// read(2) syscall is valid and blocks until the kernel supplies an IP frame.
+// readTUN deliberately bypasses os.File.Read for the native TUN descriptor.
+// Go's runtime poller rejects some /dev/net/tun implementations with "not
+// pollable", while the raw Linux read(2) syscall is valid and blocks until the
+// kernel supplies an IP frame. Other tunDevice implementations (test doubles,
+// alternative backends) use their interface Read.
 func readTUN(device tunDevice, buffer []byte) (int, error) {
-	file, ok := device.(*os.File)
-	if !ok {
-		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
+	if file, ok := device.(*os.File); ok {
+		return syscall.Read(int(file.Fd()), buffer)
 	}
-	return syscall.Read(int(file.Fd()), buffer)
+	return device.Read(buffer)
 }
 
-// Like readTUN, bypass os.File's poll wrapper. TUN writes are synchronous and
-// safe from multiple goroutines; a raw write avoids poll-descriptor overhead.
+// Like readTUN, bypass os.File's poll wrapper for the native descriptor. TUN
+// writes are synchronous and safe from multiple goroutines; a raw write avoids
+// poll-descriptor overhead.
 func writeTUN(device tunDevice, buffer []byte) (int, error) {
-	file, ok := device.(*os.File)
-	if !ok {
-		return 0, fmt.Errorf("unexpected Linux TUN implementation %T", device)
+	if file, ok := device.(*os.File); ok {
+		return syscall.Write(int(file.Fd()), buffer)
 	}
-	return syscall.Write(int(file.Fd()), buffer)
+	return device.Write(buffer)
 }
 
 func configureTUN(name, ip string, prefix int, _ uint64) error {

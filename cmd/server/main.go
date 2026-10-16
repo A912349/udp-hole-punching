@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -104,6 +105,7 @@ type server struct {
 
 	sessionsMu          sync.Mutex
 	sessions            map[string]map[string]*rendezvousPeer
+	registerMu          sync.Mutex
 	controlMu           sync.Mutex
 	controls            map[*controlClient]string
 	symmetricMu         sync.Mutex
@@ -113,6 +115,7 @@ type server struct {
 	topologyMu          sync.Mutex
 	linkCache           map[string]cachedLinks
 	cacheEpoch          uint64
+	metricStamp         atomic.Uint64
 }
 
 type symmetricRendezvous struct {
@@ -163,7 +166,20 @@ type rendezvousPeer struct {
 	other    string
 	otherNAT string
 	ready    chan struct{}
+	created  time.Time
 }
+
+// The legacy punch endpoints are unauthenticated by design. Both bounds keep
+// an attacker from growing the process heap with never-matched sessions: a
+// session is dropped after this TTL and the total number of live sessions is
+// capped (re-registering an existing session ID still works).
+const (
+	rendezvousSessionTTL   = 15 * time.Minute
+	rendezvousMaxSessions  = 65536
+	inviteEnrollmentWindow = 10 * time.Minute
+	controlMaxFrameBytes   = 64 << 10
+	controlIdleReadTimeout = 150 * time.Second
+)
 
 func envInt(name string, fallback int) int {
 	if v, e := strconv.Atoi(os.Getenv(name)); e == nil && v > 0 {
@@ -433,6 +449,10 @@ func (s *server) controlWS(ws *websocket.Conn) {
 		credential = s.token
 	}
 	client := &controlClient{c: ws, invited: ws.Request().Header.Get("X-Mesh-Invite") != "", invite: ws.Request().Header.Get("X-Mesh-Invite"), credential: credential}
+	// Control frames are small JSON documents. The library default of 32 MiB
+	// per frame lets one authenticated client exhaust memory with a single
+	// oversized frame.
+	ws.MaxPayloadBytes = controlMaxFrameBytes
 	defer func() {
 		s.controlMu.Lock()
 		delete(s.controls, client)
@@ -440,6 +460,11 @@ func (s *server) controlWS(ws *websocket.Conn) {
 		ws.Close()
 	}()
 	for {
+		// Nodes push a heartbeat through this connection at least every
+		// heartbeat interval. A silent connection is dead (lost NAT, powered
+		// off host without a TCP reset): close it so its goroutine and control
+		// slot are released instead of lingering until the next failed push.
+		_ = ws.SetReadDeadline(time.Now().Add(controlIdleReadTimeout))
 		var in controlFrame
 		if err := websocket.JSON.Receive(ws, &in); err != nil {
 			return
@@ -1391,8 +1416,22 @@ func (s *server) inviteRegistrationAuthorized(r *http.Request) bool {
 	if token == "" {
 		return false
 	}
+	// A 6-character code is only brute-force resistant while attempts are
+	// bounded. The WebSocket upgrade applies the same per-IP limit; this
+	// covers the legacy HTTP registration path as well. The bucket is kept
+	// separate so enrollment retries cannot lock out the handshake quota.
+	if !s.allowInviteAttempt(requestHost(r) + "\x00register") {
+		return false
+	}
 	var used sql.NullInt64
-	return s.db.QueryRow("SELECT used_at FROM invites WHERE token=?", token).Scan(&used) == nil && used.Valid
+	if err := s.db.QueryRow("SELECT used_at FROM invites WHERE token=?", token).Scan(&used); err != nil || !used.Valid {
+		return false
+	}
+	// A consumed invite must only authorize the follow-up registration of the
+	// node that just enrolled over the WebSocket. Accepting it forever turned
+	// every historical invite into a permanent (and brute-forceable)
+	// registration credential.
+	return time.Since(time.Unix(used.Int64, 0)) <= inviteEnrollmentWindow
 }
 
 func (s *server) networkTokenValid(r *http.Request) bool {
@@ -2140,6 +2179,7 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now()
+	stateChanged := false
 	s.metricsMu.Lock()
 	for _, x := range report.Links {
 		if x.PeerID == "" || x.PeerID == report.NodeID {
@@ -2154,13 +2194,21 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 				old.RTTMS = old.RTTMS*.7 + x.RTTMS*.3
 			}
 		}
+		// A new link or an up/down transition changes link costs and must
+		// invalidate the cached topology graph. Pure RTT reports arrive every
+		// few seconds; invalidating on those made the shared link cache
+		// useless and turned every bootstrap into a full recomputation.
+		if old.Seen.IsZero() || old.Up != x.Up {
+			stateChanged = true
+		}
 		old.Up = x.Up
 		old.Seen = now
 		s.metrics[k] = old
 	}
 	s.metricsMu.Unlock()
-	// Telemetry influences peer preference and link costs.
-	s.invalidateLinkCache()
+	if stateChanged {
+		s.metricStamp.Add(1)
+	}
 	reply(w, 200, map[string]string{"status": "ok"})
 }
 func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
@@ -2289,6 +2337,9 @@ func (s *server) allowInviteAttempt(remote string) bool {
 	cutoff := now.Add(-30 * time.Second)
 	s.inviteMu.Lock()
 	defer s.inviteMu.Unlock()
+	if s.inviteAttempts == nil {
+		s.inviteAttempts = map[string][]time.Time{}
+	}
 	old := s.inviteAttempts[host]
 	kept := old[:0]
 	for _, t := range old {
@@ -2871,6 +2922,10 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		d.Capacity = 1000
 	}
 	now := time.Now().Unix()
+	// Allocation, stale-lease reclamation and the insert are a check-then-act
+	// sequence. Two concurrent first registrations could otherwise both pass
+	// the free-address check and receive the same mesh IP.
+	s.registerMu.Lock()
 	ip := d.MeshIP
 	if ip == "" && previous != nil {
 		ip = previous.MeshIP
@@ -2878,6 +2933,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if ip == "" {
 		ip, e = s.allocate()
 		if e != nil {
+			s.registerMu.Unlock()
 			reply(w, 500, map[string]any{"error": e.Error()})
 			return
 		}
@@ -2889,6 +2945,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		s.db.QueryRow("SELECT node_id,last_seen FROM nodes WHERE mesh_ip=? AND node_id!=?", ip, d.ID).Scan(&owner, &ownerLastSeen)
 		if owner != "" {
 			if ownerLastSeen >= now-int64(ttl) {
+				s.registerMu.Unlock()
 				reply(w, 409, map[string]any{"error": "mesh_ip is already assigned"})
 				return
 			}
@@ -2896,6 +2953,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 			// registry. It is safe to reclaim it once the previous registration is
 			// outside the online TTL; keep the old device row for offline inventory.
 			if _, e = s.db.Exec("UPDATE nodes SET mesh_ip='' WHERE node_id=?", owner); e != nil {
+				s.registerMu.Unlock()
 				reply(w, 500, map[string]any{"error": e.Error()})
 				return
 			}
@@ -2921,6 +2979,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	} else {
 		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, ownerValue, d.ID)
 	}
+	s.registerMu.Unlock()
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
@@ -3005,12 +3064,33 @@ func (s *server) rendezvousRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.sessionsMu.Lock()
+	// Prune expired sessions so unauthenticated legacy clients cannot grow the
+	// heap without limit. Waiters hold their own HTTP timeouts, so dropping a
+	// session only ends matching for long-dead peers.
+	now := time.Now()
+	for id, peers := range s.sessions {
+		fresh := false
+		for _, peer := range peers {
+			if now.Sub(peer.created) < rendezvousSessionTTL {
+				fresh = true
+				break
+			}
+		}
+		if !fresh {
+			delete(s.sessions, id)
+		}
+	}
 	peers := s.sessions[request.Session]
 	if peers == nil {
+		if len(s.sessions) >= rendezvousMaxSessions {
+			s.sessionsMu.Unlock()
+			reply(w, http.StatusTooManyRequests, map[string]any{"error": "rendezvous capacity reached; retry later"})
+			return
+		}
 		peers = map[string]*rendezvousPeer{}
 		s.sessions[request.Session] = peers
 	}
-	peers[request.ID] = &rendezvousPeer{endpoint: request.External, natType: request.NATType, status: "waiting", ready: make(chan struct{})}
+	peers[request.ID] = &rendezvousPeer{endpoint: request.External, natType: request.NATType, status: "waiting", ready: make(chan struct{}), created: now}
 	if len(peers) == 2 {
 		ids := make([]string, 0, 2)
 		for id := range peers {
@@ -3041,6 +3121,10 @@ func (s *server) rendezvousWait(w http.ResponseWriter, r *http.Request) {
 		timeout = 30
 	}
 	timeout = min(timeout, 120)
+	// The server-wide WriteTimeout counts from the start of the request. A
+	// peer that registers 40 seconds into this poll would otherwise never
+	// receive the ready response, so extend the deadline for this wait only.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(time.Duration(timeout)*time.Second + 10*time.Second))
 	s.sessionsMu.Lock()
 	peer := s.sessions[session][id]
 	s.sessionsMu.Unlock()
@@ -3227,7 +3311,10 @@ func (s *server) blockedLinksForNodes(nodes []node) []link {
 // responses in one topology push. The directory remains freshly loaded per
 // request, so endpoint and lease data are never served from this cache.
 func (s *server) cachedTopologyLinks(nodes []node) []link {
-	key := topologyVersion(nodes)
+	// The metric stamp only changes when a link appears or flips up/down, so
+	// steady-state telemetry keeps cache hits while still invalidating on
+	// meaningful health changes.
+	key := topologyVersion(nodes) + "#" + strconv.FormatUint(s.metricStamp.Load(), 10)
 	s.topologyMu.Lock()
 	defer s.topologyMu.Unlock()
 	if entry, ok := s.linkCache[key]; ok && entry.epoch == s.cacheEpoch {
@@ -3236,6 +3323,9 @@ func (s *server) cachedTopologyLinks(nodes []node) []link {
 	links := s.links(nodes)
 	if s.linkCache == nil {
 		s.linkCache = make(map[string]cachedLinks)
+	}
+	if len(s.linkCache) > 64 {
+		s.linkCache = nil
 	}
 	s.linkCache[key] = cachedLinks{epoch: s.cacheEpoch, links: append([]link(nil), links...)}
 	return links
@@ -3382,7 +3472,11 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		serviceArgs = append(serviceArgs, accountID)
 	}
 	serviceQuery += " ORDER BY services.node_id,services.name"
-	rs, _ := s.db.Query(serviceQuery, serviceArgs...)
+	rs, e := s.db.Query(serviceQuery, serviceArgs...)
+	if e != nil {
+		reply(w, 500, map[string]any{"error": e.Error()})
+		return
+	}
 	var services []map[string]string
 	for rs.Next() {
 		var n, x string

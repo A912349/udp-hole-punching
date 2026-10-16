@@ -284,8 +284,9 @@ type node struct {
 	topologyRefreshMu   sync.Mutex
 	topologyRefreshNext time.Time
 
-	sharedKeys map[string]cachedKey
-	reassembly map[string]*reassembly
+	sharedKeys     map[string]cachedKey
+	reassembly     map[string]*reassembly
+	routeRecompute atomic.Int64
 
 	symmetricMu         sync.Mutex
 	symmetricReady      bool
@@ -1029,6 +1030,17 @@ func (n *node) request(method, path string, in, out any) error {
 			continue
 		}
 		ws, replies := n.control, n.controlReply
+		// A request that timed out may still deliver its reply later. Without
+		// draining, the next request would consume that stale response and
+		// act on a body/status that belongs to an earlier operation.
+	drain:
+		for {
+			select {
+			case <-replies:
+			default:
+				break drain
+			}
+		}
 		frame := controlFrame{Method: method, Path: path, Body: body}
 		_ = ws.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := websocket.JSON.Send(ws, frame); err != nil {
@@ -2759,6 +2771,14 @@ func (n *node) nextHop(destination string) (string, *peer) {
 	}
 
 	adjacency := map[string][]qitem{}
+	// Without a usable cached hop every data packet would re-run Dijkstra
+	// here. During an outage with traffic flowing that is a CPU storm on a
+	// mutex-held path; bound full recomputations to a few per second.
+	if last := n.routeRecompute.Load(); time.Since(time.Unix(0, last)) < 250*time.Millisecond {
+		n.mu.RUnlock()
+		return "", nil
+	}
+	n.routeRecompute.Store(time.Now().UnixNano())
 	for _, edge := range n.links {
 		adjacency[edge.A] = append(adjacency[edge.A], qitem{edge.B, edge.Cost})
 		adjacency[edge.B] = append(adjacency[edge.B], qitem{edge.A, edge.Cost})
@@ -4104,7 +4124,6 @@ func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr), bootstrap
 		"stun.nextcloud.com:3478",
 		"stun.miwifi.com:3478",
 		"stun.sipgate.net:3478",
-		"stunserver2025.stunprotocol.org:3478",
 		"stun.zadarma.com:3478",
 		"stun.ipfire.org:3478",
 	}
