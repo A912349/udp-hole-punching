@@ -237,6 +237,8 @@ type node struct {
 	control          *websocket.Conn
 	controlConnected bool
 	controlMu        sync.Mutex
+	controlRxAt      atomic.Int64
+	closing          atomic.Bool
 	controlCall      sync.Mutex
 	controlReply     chan controlFrame
 	pingMu           sync.Mutex
@@ -943,8 +945,17 @@ func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
 				n.control = nil
 			}
 			n.controlMu.Unlock()
+			// Clearing the pointer alone leaked one file descriptor per
+			// reconnect and left the dead socket in place. Close it and start
+			// reconnecting immediately instead of waiting up to a full
+			// heartbeat (plus two send/reply timeouts) for the next register.
+			_ = ws.Close()
+			if !n.closing.Load() {
+				go n.pokeControlReconnect()
+			}
 			return
 		}
+		n.controlRxAt.Store(time.Now().UnixNano())
 		if frame.Event == "topology" {
 			var t topology
 			if err := json.Unmarshal(frame.Body, &t); err != nil {
@@ -989,6 +1000,30 @@ func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
 		default:
 			n.logf("unexpected control-plane reply discarded")
 		}
+	}
+}
+
+// pokeControlReconnect rebuilds the control channel as soon as the reader
+// observes a dead connection. Without it a node stayed offline for up to a
+// heartbeat interval even though it had already lost the coordinator. The
+// jitter prevents every node from dialing in the same millisecond after a
+// coordinator restart.
+func (n *node) pokeControlReconnect() {
+	var jitter [2]byte
+	if _, err := rand.Read(jitter[:]); err == nil {
+		time.Sleep(time.Duration(binary.BigEndian.Uint16(jitter[:])%2000) * time.Millisecond)
+	}
+	if n.closing.Load() {
+		return
+	}
+	n.controlMu.Lock()
+	alive := n.control != nil
+	n.controlMu.Unlock()
+	if alive {
+		return // a concurrent request already reconnected
+	}
+	if err := n.register(); err != nil {
+		n.logf("control reconnect after disconnect failed: %v", err)
 	}
 }
 
@@ -1067,6 +1102,14 @@ func (n *node) request(method, path string, in, out any) error {
 				return json.Unmarshal(reply.Body, out)
 			case <-responseTimer.C:
 				last = errors.New("control websocket response timed out")
+				// Frames are still arriving, so the coordinator is slow (for
+				// example waiting on the single SQLite writer) rather than
+				// unreachable. Keep the socket so the retry reuses it;
+				// reconnecting here dropped healthy connections and turned one
+				// slow reply into a reconnect and endpoint-refresh storm.
+				if time.Since(time.Unix(0, n.controlRxAt.Load())) < 5*time.Second {
+					continue
+				}
 			}
 		}
 		n.controlMu.Lock()
@@ -3659,6 +3702,7 @@ func (n *node) call(dst, name string, data []byte) ([]byte, error) {
 	}
 }
 func (n *node) close() {
+	n.closing.Store(true)
 	if n.stop != nil {
 		n.stop()
 	}

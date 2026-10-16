@@ -500,6 +500,18 @@ func (s *server) controlWS(ws *websocket.Conn) {
 			}
 			if json.Unmarshal(in.Body, &registration) == nil && registration.ID != "" {
 				s.controlMu.Lock()
+				// A reconnecting node's previous, half-open connection can keep
+				// the node ID bound until its reader notices. Rebind
+				// exclusively: otherwise the node has two bindings and event
+				// delivery picks one at random, so topology pushes and
+				// symmetric-scan requests can silently land on the dead one.
+				for other := range s.controls {
+					if other != client && s.controls[other] == registration.ID {
+						delete(s.controls, other)
+						stale := other
+						go func() { _ = stale.c.Close() }()
+					}
+				}
 				alreadySynced := s.controls[client] == registration.ID
 				s.controls[client] = registration.ID
 				s.controlMu.Unlock()
@@ -531,22 +543,28 @@ func (s *server) registeredControlID(client *controlClient) string {
 
 func (s *server) sendControlEvent(nodeID string, frame controlFrame) bool {
 	s.controlMu.Lock()
-	var target *controlClient
+	targets := make([]*controlClient, 0, 2)
 	for client, id := range s.controls {
 		if id == nodeID {
-			target = client
-			break
+			targets = append(targets, client)
 		}
 	}
 	s.controlMu.Unlock()
-	if target == nil {
+	if len(targets) == 0 {
 		return false
 	}
-	if err := target.send(frame); err != nil {
-		_ = target.c.Close()
-		return false
+	// The register rebind normally leaves a single live candidate. Trying
+	// every candidate keeps delivery working while a half-open connection has
+	// not been reaped yet; map iteration order would otherwise flip a coin
+	// between the live and the dead socket.
+	for _, target := range targets {
+		if err := target.send(frame); err != nil {
+			_ = target.c.Close()
+			continue
+		}
+		return true
 	}
-	return true
+	return false
 }
 
 func validSymmetricSessionID(id string) bool {
