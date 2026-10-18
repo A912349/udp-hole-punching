@@ -1438,7 +1438,7 @@ func (s *server) inviteRegistrationAuthorized(r *http.Request) bool {
 	// bounded. The WebSocket upgrade applies the same per-IP limit; this
 	// covers the legacy HTTP registration path as well. The bucket is kept
 	// separate so enrollment retries cannot lock out the handshake quota.
-	if !s.allowInviteAttempt(requestHost(r) + "\x00register") {
+	if !s.allowInviteAttempt(r.RemoteAddr) {
 		return false
 	}
 	var used sql.NullInt64
