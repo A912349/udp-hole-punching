@@ -41,7 +41,7 @@ func TestFastFrameInPlaceSealLayout(t *testing.T) {
 	plain := []byte("fragment header and an IP packet")
 	plainAt := fastHeader + aead.NonceSize()
 	sealedEnd := plainAt + len(plain) + aead.Overhead()
-	frame := make([]byte, plainAt+len(plain), sealedEnd+fastMAC)
+	frame := make([]byte, plainAt+len(plain), sealedEnd)
 	copy(frame[plainAt:], plain)
 	if err := sequence.NextInto(frame[fastHeader:plainAt]); err != nil {
 		t.Fatal(err)

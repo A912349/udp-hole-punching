@@ -7,7 +7,6 @@ import (
 	"container/heap"
 	"context"
 	"crypto/cipher"
-	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
@@ -18,7 +17,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"hash"
 	"io"
 	"log"
 	"net"
@@ -70,9 +68,8 @@ const (
 	symmetricRetryDelay      = 2 * time.Second
 	symmetricBurstRetries    = 4
 	fastMagic                = "MIP1"
-	fastMAC                  = 32
 	fastHeader               = 49
-	maxTUN                   = 1279
+	maxTUN                   = 1350
 	fastBatchSize            = 32
 	fastQueueSize            = 1024
 	udpSendBatchSize         = 32
@@ -82,7 +79,8 @@ const (
 	lanDiscoveryPort         = 37777
 	lanDiscoveryInterval     = time.Minute
 	initialTelemetryDelay    = 3 * time.Second
-	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + 16 + fastMAC
+	aeadTag                  = 16
+	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + aeadTag
 )
 
 var fastMagicBytes = []byte(fastMagic)
@@ -278,7 +276,6 @@ type node struct {
 	udpSendPool      sync.Pool
 	fastPool         sync.Pool
 	sendPool         sync.Pool
-	macPool          sync.Pool
 	deliverQueues    []chan deliverFrame
 	deliverPool      sync.Pool
 	stats            fastStats
@@ -766,7 +763,6 @@ func newNode(c config) (*node, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("initialize packet ID sequence: %w", e)
 	}
-	n.macPool.New = func() any { return hmac.New(sha256.New, n.key) }
 	n.sendPool.New = func() any { return make([]byte, maxFastFrame) }
 	for _, v := range c.allows {
 		if v != "" {
@@ -3735,45 +3731,33 @@ func (n *node) close() {
 	n.controlMu.Unlock()
 }
 
-func (n *node) networkMAC(data, dst []byte) []byte {
-	h := n.macPool.Get().(hash.Hash)
-	h.Reset()
-	h.Write(data)
-	result := h.Sum(dst)
-	n.macPool.Put(h)
-	return result
-}
-
-// Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment | HMAC.
+// Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment.
+// The ChaCha20-Poly1305 tag authenticates the ciphertext plus the
+// source:destination AAD; no separate frame MAC is computed. Header fields
+// (TTL, packet ID) are mutable by design: relays decrement TTL in place and
+// replay protection relies on the packet ID dedupe, not on authentication.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
-	if len(data) < fastHeader+28+fastMAC {
+	if len(data) < fastHeader+28 {
 		n.debugf("drop fast frame from %s: truncated (%d bytes)", a, len(data))
 		return
 	}
-	auth, mac := data[:len(data)-fastMAC], data[len(data)-fastMAC:]
-	var expectedMAC [fastMAC]byte
-	if !hmac.Equal(mac, n.networkMAC(auth, expectedMAC[:0])) {
-		n.debugf("drop fast frame from %s: HMAC failed", a)
-		return
-	}
-	ttl := int(auth[4])
-	src := hex.EncodeToString(auth[5:21])
+	ttl := int(data[4])
+	src := hex.EncodeToString(data[5:21])
 	var packetID [12]byte
-	copy(packetID[:], auth[37:49])
+	copy(packetID[:], data[37:49])
 	if ttl < 1 || ttl > protocol.DefaultTTL || !n.rememberFast(packetID) {
 		n.debugf("drop fast frame from %s: invalid TTL or duplicate", src[:8])
 		return
 	}
 	// Control packets refresh the endpoint and liveness. Updating it on every
 	// data packet only adds a contended lock and a clock read to the fast path.
-	if !bytes.Equal(auth[21:37], n.idBinary[:]) {
-		dst := hex.EncodeToString(auth[21:37])
+	if !bytes.Equal(data[21:37], n.idBinary[:]) {
+		dst := hex.EncodeToString(data[21:37])
 		if n.c.role == "superpeer" && ttl > 1 {
-			// Reserve space for the new MAC while copying: the old frame's
-			// backing array belongs to the UDP read buffer and cannot be reused.
-			auth = append(make([]byte, 0, len(auth)+fastMAC), auth...)
-			auth[4]--
-			n.sendFast(dst, n.networkMAC(auth, auth))
+			// data is an owned copy from the fast pool, so the TTL can be
+			// decremented in place before forwarding.
+			data[4]--
+			n.sendFast(dst, data)
 		}
 		return
 	}
@@ -3782,7 +3766,7 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
-	plain, e := protocol.OpenBytesWithAEAD(aead, auth[fastHeader:], aad)
+	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], aad)
 	if e != nil {
 		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
 		return
@@ -3946,7 +3930,9 @@ func (n *node) sendIP(dst string, p []byte) bool {
 
 	// Build header, nonce and plaintext in one backing array. Seal appends its
 	// output exactly over the plaintext region, which is an overlap supported by
-	// cipher.AEAD, and leaves room for the final network HMAC.
+	// cipher.AEAD. The AEAD tag authenticates the ciphertext and the
+	// source:destination AAD; the frame header itself is deliberately mutable
+	// so relays can decrement TTL without re-encrypting.
 	nonceSize := aead.NonceSize()
 	plainAt := fastHeader + nonceSize
 	plainSize := 12 + len(p)
@@ -3967,7 +3953,7 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	binary.BigEndian.PutUint16(pkt[plainAt+10:plainAt+12], 1)
 	copy(pkt[plainAt+12:], p)
 	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], aad)
-	return n.sendFast(dst, n.networkMAC(pkt, pkt))
+	return n.sendFast(dst, pkt)
 }
 func (n *node) deliver(src string, p []byte) {
 	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {

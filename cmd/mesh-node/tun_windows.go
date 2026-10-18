@@ -327,7 +327,7 @@ func configureTUN(name, ip string, prefix int, luid uint64) error {
 	if err := configureWindowsAddress(name, ip, prefix, mask, luid); err != nil {
 		return err
 	}
-	if err := runWindows("netsh", "interface", "ipv4", "set", "subinterface", "name="+name, "mtu=1279", "store=active"); err != nil {
+	if err := runWindows("netsh", "interface", "ipv4", "set", "subinterface", "name="+name, "mtu=1350", "store=active"); err != nil {
 		return fmt.Errorf("set Wintun MTU: %w", err)
 	}
 	return addWindowsRoute(name, netip.PrefixFrom(address, prefix).Masked().String(), luid)

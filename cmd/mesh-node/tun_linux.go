@@ -77,7 +77,7 @@ func configureTUN(name, ip string, prefix int, _ uint64) error {
 		}
 		return nil
 	}
-	if e = run("link", "set", "dev", name, "mtu", "1279", "up"); e != nil {
+	if e = run("link", "set", "dev", name, "mtu", "1350", "up"); e != nil {
 		return e
 	}
 	if e = run("addr", "replace", fmt.Sprintf("%s/%d", ip, prefix), "dev", name); e != nil {
