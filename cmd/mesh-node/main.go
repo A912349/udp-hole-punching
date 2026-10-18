@@ -3771,6 +3771,13 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
 		return
 	}
+	// The header packet ID is unauthenticated and only pre-filters replays;
+	// the sealed copy is authoritative. A mismatch means the header was
+	// mutated in flight to bypass dedupe (replay forgery).
+	if len(plain) < 12 || !bytes.Equal(plain[:12], packetID[:]) {
+		n.debugf("drop fast frame from %s: packet ID mismatch", src[:8])
+		return
+	}
 	n.debugf("fast frame from %s received (%d bytes encrypted)", src[:8], len(data))
 	n.acceptIPFragment(src, plain)
 }
