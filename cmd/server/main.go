@@ -3183,6 +3183,15 @@ func topologyVersion(nodes []node) string {
 // effective edges. Otherwise a pushed manual/config/route change can carry
 // the old version and be silently discarded by clients.
 func bootstrapTopologyVersion(nodes []node, links []link) string {
+	// Lease refreshes and uptime do not change the forwarding view. Hash a
+	// copy so live status fields remain available in full/admin responses.
+	nodes = append([]node(nil), nodes...)
+	// Cache hits may represent an empty edge list as nil rather than [].
+	links = append([]link(nil), links...)
+	for i := range nodes {
+		nodes[i].LastSeen = 0
+		nodes[i].UptimeSeconds = 0
+	}
 	b, _ := json.Marshal(struct {
 		Nodes []node `json:"nodes"`
 		Links []link `json:"links"`
@@ -3518,6 +3527,11 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	version += "-dns" + fmt.Sprintf("%x", sha256.Sum256([]byte(settings.DNSUpstream)))[:12]
 	encoded, _ := json.Marshal(forwards)
 	version += "-f" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
+	encoded, _ = json.Marshal(services)
+	version += "-s" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
+	if bootstrapUnchanged(w, r, version) {
+		return
+	}
 	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
 }
 

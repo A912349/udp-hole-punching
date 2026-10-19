@@ -131,6 +131,7 @@ type edge struct {
 	Cost float64 `json:"cost"`
 }
 type topology struct {
+	Unchanged   bool          `json:"unchanged,omitempty"`
 	Version     string        `json:"topology_version"`
 	Self        peer          `json:"self"`
 	Neighbors   []peer        `json:"neighbors"`
@@ -1258,8 +1259,17 @@ func (n *node) register() error {
 	return nil
 }
 func (n *node) bootstrap() error {
+	n.mu.RLock()
+	version := n.topologyVersion
+	n.mu.RUnlock()
+	path := "/v1/bootstrap/" + n.id.ID
+	// Older coordinators ignore this optional body and return a full snapshot.
+	var condition any
+	if version != "" {
+		condition = map[string]string{"version": version}
+	}
 	var t topology
-	if e := n.request("GET", "/v1/bootstrap/"+n.id.ID, nil, &t); e != nil {
+	if e := n.request("GET", path, condition, &t); e != nil {
 		// The coordinator intentionally hides stale nodes from topology. A
 		// short control-plane/NAT interruption can therefore make bootstrap
 		// return 404 even though the node still exists. Refresh the lease and
@@ -1269,7 +1279,7 @@ func (n *node) bootstrap() error {
 			if registerErr := n.register(); registerErr != nil {
 				return fmt.Errorf("bootstrap unknown node; re-register failed: %w", registerErr)
 			}
-			if retryErr := n.request("GET", "/v1/bootstrap/"+n.id.ID, nil, &t); retryErr != nil {
+			if retryErr := n.request("GET", path, condition, &t); retryErr != nil {
 				return retryErr
 			}
 		} else {
@@ -1281,7 +1291,9 @@ func (n *node) bootstrap() error {
 }
 func (n *node) applyTopology(t topology) {
 	n.mu.RLock()
-	unchanged := t.Version != "" && n.topologyVersion == t.Version
+	// A push may have installed a newer view while a conditional request
+	// was in flight. A version-only response must never replace that view.
+	unchanged := t.Unchanged || (t.Version != "" && n.topologyVersion == t.Version)
 	n.mu.RUnlock()
 	if unchanged {
 		// A network switch can remove OS routes without changing the
@@ -2665,6 +2677,11 @@ func (n *node) helloAll() {
 	}
 	targets := make([]helloTarget, 0, len(n.neighbors))
 	for id, peer := range n.neighbors {
+		// PING/PONG already maintains healthy paths and learns rebinding.
+		// HELLO is still sent on startup, to stale peers and by edge retries.
+		if n.usable(peer) {
+			continue
+		}
 		target := helloTarget{id: id, declared: peer.Endpoint}
 		if address, ok := peer.last.(*net.UDPAddr); ok {
 			target.observed = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
