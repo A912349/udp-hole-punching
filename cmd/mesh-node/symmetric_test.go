@@ -1,6 +1,5 @@
 package main
 
-// These tests cover symmetric behavior and regression cases.
 import (
 	"net"
 	"reflect"

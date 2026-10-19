@@ -188,7 +188,6 @@ func envInt(name string, fallback int) int {
 	return fallback
 }
 
-// main initializes persistence, registers HTTP routes, and serves the coordinator API.
 func main() {
 	pprofListen := flag.String("pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6061")
 	if len(os.Args) > 1 && (os.Args[1] == "--add-autostart" || os.Args[1] == "--del-autostart") {

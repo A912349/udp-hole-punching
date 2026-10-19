@@ -1,6 +1,5 @@
 package main
 
-// These tests cover bootstrap conditional behavior and regression cases.
 import (
 	"encoding/json"
 	"net/http"

@@ -1,6 +1,5 @@
 package main
 
-// These tests cover udp send behavior and regression cases.
 import (
 	"errors"
 	"io"

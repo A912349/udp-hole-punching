@@ -1,6 +1,5 @@
 package main
 
-// These tests cover dns lifecycle behavior and regression cases.
 import (
 	"bytes"
 	"context"

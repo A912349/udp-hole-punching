@@ -1,6 +1,5 @@
 package main
 
-// These tests cover site routes behavior and regression cases.
 import (
 	"encoding/binary"
 	"home-udp-mesh/internal/protocol"

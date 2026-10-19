@@ -319,7 +319,6 @@ type node struct {
 	edgeRetries         map[string]bool
 }
 
-// main loads configuration, connects to the coordinator, and runs the mesh node.
 func main() {
 	for _, arg := range os.Args[1:] {
 		if arg == "--add-autostart" || arg == "--del-autostart" {
@@ -423,7 +422,6 @@ func (n *node) debugStartupNetwork() {
 		}
 	}
 }
-// parse reads command-line options and returns the node configuration.
 func parse() config {
 	var c config
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -3016,6 +3014,7 @@ func (n *node) send(p protocol.Packet) bool {
 
 // nextHop selects a cached or newly computed route for a destination.
 func (n *node) nextHop(destination string) (string, *peer) {
+	// Routes can change while packets are in flight; validate a cached peer before using it.
 	n.mu.RLock()
 	hop := n.routes[destination]
 	previousHop := hop
@@ -4116,11 +4115,10 @@ func fastAAD(dst, peerAAD, packetID []byte) []byte {
 	return append(dst, packetID...)
 }
 
-// Compact fast IPv4 frame: MIP1 | ttl | source | destination | packet ID |
-// nonce | ciphertext | AEAD tag. Destinations authenticate the packet ID
-// before modifying their duplicate cache. Relays cannot verify this tag:
-// forwarding and mutable TTL are NOT authenticated by this envelope.
-// fast handles the compact encrypted data-plane frame.
+// fast handles compact encrypted frames. Destinations authenticate the packet ID
+// before duplicate suppression; relays cannot verify the end-to-end tag and
+// forward by changing the unauthenticated TTL. Frame layout: MIP1 | TTL | source |
+// destination | packet ID | nonce | ciphertext | AEAD tag.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
 	if len(data) < fastHeader+28 || len(data) > maxFastFrame {
 		n.debugf("drop fast frame from %s: invalid size (%d bytes)", a, len(data))

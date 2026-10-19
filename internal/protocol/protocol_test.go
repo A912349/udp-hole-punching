@@ -1,6 +1,5 @@
 package protocol
 
-// These tests cover protocol behavior and regression cases.
 import (
 	"bytes"
 	"crypto/cipher"

@@ -1,4 +1,3 @@
-// This file embeds the static administration interface into the server binary.
 
 package main
 

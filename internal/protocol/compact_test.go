@@ -1,6 +1,5 @@
 package protocol
 
-// These tests cover compact behavior and regression cases.
 import (
 	"bytes"
 	"strings"

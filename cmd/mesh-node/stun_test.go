@@ -1,6 +1,5 @@
 package main
 
-// These tests cover stun behavior and regression cases.
 import (
 	"encoding/binary"
 	"testing"

@@ -212,6 +212,7 @@ func (s *NonceSequence) NextInto(nonce []byte) error {
 	var count uint32
 	for {
 		previous := s.counter.Load()
+		// A wrapped counter would repeat a nonce under the same key, breaking AEAD security.
 		if previous == ^uint32(0) {
 			return fmt.Errorf("%w: nonce sequence exhausted", ErrProtocol)
 		}

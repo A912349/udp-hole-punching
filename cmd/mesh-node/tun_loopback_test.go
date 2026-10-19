@@ -1,6 +1,5 @@
 package main
 
-// These tests cover tun loopback behavior and regression cases.
 import (
 	"bytes"
 	"io"

@@ -1,6 +1,5 @@
 package main
 
-// These tests cover topology behavior and regression cases.
 import "testing"
 import "net/netip"
 import "time"

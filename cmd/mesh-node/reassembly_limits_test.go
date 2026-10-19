@@ -1,6 +1,5 @@
 package main
 
-// These tests cover reassembly limits behavior and regression cases.
 import (
 	"bytes"
 	"encoding/binary"

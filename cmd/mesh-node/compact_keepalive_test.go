@@ -1,6 +1,5 @@
 package main
 
-// These tests cover compact keepalive behavior and regression cases.
 import (
 	"net"
 	"net/netip"

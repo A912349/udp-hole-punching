@@ -1,6 +1,5 @@
 package main
 
-// These tests cover dns behavior and regression cases.
 import (
 	"net"
 	"testing"
