@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -19,6 +20,28 @@ const (
 	iffTUN    = 0x0001
 	iffNoPI   = 0x1000
 )
+
+// Cache Fd once: os.File.Fd can call SetBlocking (fcntl) on every call,
+// even after the descriptor has already been put in blocking mode.
+// Retain the File as the owner of the descriptor and its finalizer.
+type linuxTUNDevice struct {
+	file *os.File
+	fd   int
+}
+
+func (d *linuxTUNDevice) Read(buffer []byte) (int, error) {
+	n, err := syscall.Read(d.fd, buffer)
+	runtime.KeepAlive(d)
+	return n, err
+}
+
+func (d *linuxTUNDevice) Write(buffer []byte) (int, error) {
+	n, err := syscall.Write(d.fd, buffer)
+	runtime.KeepAlive(d)
+	return n, err
+}
+
+func (d *linuxTUNDevice) Close() error { return d.file.Close() }
 
 func openTUN(name string) (tunDevice, error) {
 	if len(name) == 0 || len(name) > 15 {
@@ -31,12 +54,13 @@ func openTUN(name string) (tunDevice, error) {
 	var req [18]byte
 	copy(req[:16], name)
 	*(*uint16)(unsafe.Pointer(&req[16])) = iffTUN | iffNoPI
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(tunSetIFF), uintptr(unsafe.Pointer(&req[0])))
+	fd := f.Fd()
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(tunSetIFF), uintptr(unsafe.Pointer(&req[0])))
 	if errno != 0 {
 		f.Close()
 		return nil, errno
 	}
-	return f, nil
+	return &linuxTUNDevice{file: f, fd: int(fd)}, nil
 }
 
 // readTUN deliberately bypasses os.File.Read for the native TUN descriptor.
