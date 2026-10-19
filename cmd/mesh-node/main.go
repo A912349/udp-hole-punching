@@ -3731,21 +3731,27 @@ func (n *node) close() {
 	n.controlMu.Unlock()
 }
 
-// Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment.
-// The ChaCha20-Poly1305 tag authenticates the ciphertext plus the
-// source:destination AAD; no separate frame MAC is computed. Header fields
-// (TTL, packet ID) are mutable by design: relays decrement TTL in place and
-// replay protection relies on the packet ID dedupe, not on authentication.
+// fastAAD binds the immutable packet ID as well as the source and destination
+// to the existing end-to-end tag, without a second per-packet MAC.
+func fastAAD(dst, peerAAD, packetID []byte) []byte {
+	dst = append(dst, peerAAD...)
+	return append(dst, packetID...)
+}
+
+// Compact fast IPv4 frame: MIP1 | ttl | source | destination | packet ID |
+// nonce | ciphertext | AEAD tag. Destinations authenticate the packet ID
+// before modifying their duplicate cache. Relays cannot verify this tag:
+// forwarding and mutable TTL are NOT authenticated by this envelope.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
-	if len(data) < fastHeader+28 {
-		n.debugf("drop fast frame from %s: truncated (%d bytes)", a, len(data))
+	if len(data) < fastHeader+28 || len(data) > maxFastFrame {
+		n.debugf("drop fast frame from %s: invalid size (%d bytes)", a, len(data))
 		return
 	}
 	ttl := int(data[4])
 	src := hex.EncodeToString(data[5:21])
 	var packetID [12]byte
 	copy(packetID[:], data[37:49])
-	if ttl < 1 || ttl > protocol.DefaultTTL || !n.rememberFast(packetID) {
+	if ttl < 1 || ttl > protocol.DefaultTTL {
 		n.debugf("drop fast frame from %s: invalid TTL or duplicate", src[:8])
 		return
 	}
@@ -3753,9 +3759,8 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	// data packet only adds a contended lock and a clock read to the fast path.
 	if !bytes.Equal(data[21:37], n.idBinary[:]) {
 		dst := hex.EncodeToString(data[21:37])
-		if n.c.role == "superpeer" && ttl > 1 {
-			// data is an owned copy from the fast pool, so the TTL can be
-			// decremented in place before forwarding.
+		if n.c.role == "superpeer" && ttl > 1 && n.rememberFast(packetID) {
+			// Only duplicate suppression is possible here, not authentication.
 			data[4]--
 			n.sendFast(dst, data)
 		}
@@ -3766,9 +3771,13 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
-	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], aad)
+	var aadBuffer [77]byte // 32-byte hex IDs + ':' + 12-byte packet ID
+	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], fastAAD(aadBuffer[:0], aad, packetID[:]))
 	if e != nil {
 		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
+		return
+	}
+	if !n.rememberFast(packetID) {
 		return
 	}
 	n.debugf("fast frame from %s received (%d bytes encrypted)", src[:8], len(data))
@@ -3930,9 +3939,8 @@ func (n *node) sendIP(dst string, p []byte) bool {
 
 	// Build header, nonce and plaintext in one backing array. Seal appends its
 	// output exactly over the plaintext region, which is an overlap supported by
-	// cipher.AEAD. The AEAD tag authenticates the ciphertext and the
-	// source:destination AAD; the frame header itself is deliberately mutable
-	// so relays can decrement TTL without re-encrypting.
+	// cipher.AEAD. The existing end-to-end tag binds the packet ID and peer
+	// IDs. TTL remains mutable so relays can decrement it without re-sealing.
 	nonceSize := aead.NonceSize()
 	plainAt := fastHeader + nonceSize
 	plainSize := 12 + len(p)
@@ -3952,7 +3960,8 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	clear(pkt[plainAt : plainAt+12])
 	binary.BigEndian.PutUint16(pkt[plainAt+10:plainAt+12], 1)
 	copy(pkt[plainAt+12:], p)
-	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], aad)
+	var aadBuffer [77]byte
+	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], fastAAD(aadBuffer[:0], aad, packetID[:]))
 	return n.sendFast(dst, pkt)
 }
 func (n *node) deliver(src string, p []byte) {
