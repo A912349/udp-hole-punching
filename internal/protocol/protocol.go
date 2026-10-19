@@ -29,6 +29,15 @@ const (
 
 var ErrProtocol = errors.New("mesh protocol error")
 
+// LinkMeasurement is one neighbor observation as reported by a node to the
+// coordinator (in /v1/telemetry and, on newer nodes, piggybacked on
+// /v1/register).
+type LinkMeasurement struct {
+	PeerID string  `json:"peer_id"`
+	RTTMS  float64 `json:"rtt_ms"`
+	Up     bool    `json:"up"`
+}
+
 func B64Encode(b []byte) string          { return base64.RawURLEncoding.EncodeToString(b) }
 func B64Decode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
@@ -320,4 +329,128 @@ func DecodePacket(data, networkKey []byte) (Packet, error) {
 		return Packet{}, fmt.Errorf("%w: unsupported packet", ErrProtocol)
 	}
 	return Packet{typ, src, dst, payload, id, int(ttl), ts}, nil
+}
+
+// ---------- Compact binary keepalive format (PING/PONG) ----------
+//
+// The JSON envelope costs ~225 bytes per keepalive. Nodes exchange PING every
+// pingInterval with every neighbor, so idle traffic is dominated by repeated
+// JSON keys and hex-encoded identifiers. The compact format encodes the same
+// Packet as fixed-width binary fields protected by a truncated HMAC:
+//
+//	offset  size  field
+//	0       1     magic 0xC1
+//	1       1     type: 1=PING, 2=PONG
+//	2       16    source node ID (raw)
+//	18      16    destination node ID (raw)
+//	34      12    packet ID (raw; hex-encoded on the Packet struct)
+//	46      8     unix timestamp, big endian
+//	54      12    PONG only: echoed ping_id (raw)
+//	last    16    HMAC-SHA256(everything before)[:16]
+//
+// PING encodes to CompactPingSize bytes and PONG to CompactPongSize bytes
+// (~-70% versus JSON). The magic byte deliberately differs from the fast-path
+// "MIP1" prefix and from '{' so receivers can demultiplex in one comparison.
+// Receivers reply in the format they received, so mixed-version fleets keep
+// working: old nodes still send and receive JSON, relays re-encode to JSON on
+// the forwarding path.
+const (
+	compactMagic    = 0xC1
+	compactTypePing = 1
+	compactTypePong = 2
+	compactHMACSize = 16
+	CompactPingSize = 70
+	CompactPongSize = 82
+)
+
+// IsCompact reports whether the datagram uses the binary keepalive format.
+func IsCompact(data []byte) bool {
+	return len(data) >= 2 && data[0] == compactMagic
+}
+
+// EncodeCompact serializes a PING or PONG packet into the binary keepalive
+// format. Any other packet type fails; callers fall back to EncodePacket.
+func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
+	var typ byte
+	switch p.Type {
+	case "PING":
+		typ = compactTypePing
+	case "PONG":
+		typ = compactTypePong
+	default:
+		return nil, fmt.Errorf("%w: compact encoding supports only PING/PONG", ErrProtocol)
+	}
+	src, err := hex.DecodeString(p.Source)
+	if err != nil || len(src) != 16 {
+		return nil, fmt.Errorf("%w: source must be a 32-hex node ID", ErrProtocol)
+	}
+	dst, err := hex.DecodeString(p.Destination)
+	if err != nil || len(dst) != 16 {
+		return nil, fmt.Errorf("%w: destination must be a 32-hex node ID", ErrProtocol)
+	}
+	id, err := hex.DecodeString(p.ID)
+	if err != nil || len(id) != 12 {
+		return nil, fmt.Errorf("%w: packet ID must be a 24-hex value", ErrProtocol)
+	}
+	body := make([]byte, 0, CompactPongSize)
+	body = append(body, compactMagic, typ)
+	body = append(body, src...)
+	body = append(body, dst...)
+	body = append(body, id...)
+	body = binary.BigEndian.AppendUint64(body, uint64(p.Timestamp))
+	if typ == compactTypePong {
+		if pingID, _ := p.Payload["ping_id"].(string); len(pingID) > 0 {
+			raw, err := hex.DecodeString(pingID)
+			if err != nil || len(raw) != 12 {
+				return nil, fmt.Errorf("%w: ping_id must be a 24-hex value", ErrProtocol)
+			}
+			body = append(body, raw...)
+		} else {
+			return nil, fmt.Errorf("%w: compact PONG requires ping_id", ErrProtocol)
+		}
+	}
+	mac := hmac.New(sha256.New, networkKey)
+	mac.Write(body)
+	// Sum appends the 32-byte digest; keep only the truncated prefix.
+	return mac.Sum(body)[:len(body)+compactHMACSize], nil
+}
+
+// DecodeCompact parses the binary keepalive format back into the common
+// Packet shape so keepalive bookkeeping (replay cache, RTT probes) works
+// without caring about the wire format.
+func DecodeCompact(data, networkKey []byte) (Packet, error) {
+	if !IsCompact(data) {
+		return Packet{}, fmt.Errorf("%w: not a compact packet", ErrProtocol)
+	}
+	want := CompactPingSize
+	var kind string
+	switch data[1] {
+	case compactTypePing:
+		kind = "PING"
+	case compactTypePong:
+		kind, want = "PONG", CompactPongSize
+	default:
+		return Packet{}, fmt.Errorf("%w: unknown compact type %d", ErrProtocol, data[1])
+	}
+	if len(data) != want {
+		return Packet{}, fmt.Errorf("%w: compact packet has %d bytes, want %d", ErrProtocol, len(data), want)
+	}
+	mac := hmac.New(sha256.New, networkKey)
+	mac.Write(data[:len(data)-compactHMACSize])
+	sum := mac.Sum(nil)
+	if !hmac.Equal(sum[:compactHMACSize], data[len(data)-compactHMACSize:]) {
+		return Packet{}, fmt.Errorf("%w: compact authentication failed", ErrProtocol)
+	}
+	p := Packet{
+		Type:        kind,
+		Source:      hex.EncodeToString(data[2:18]),
+		Destination: hex.EncodeToString(data[18:34]),
+		ID:          hex.EncodeToString(data[34:46]),
+		TTL:         DefaultTTL,
+		Timestamp:   int64(binary.BigEndian.Uint64(data[46:54])),
+	}
+	if kind == "PONG" {
+		p.Payload = map[string]any{"ping_id": hex.EncodeToString(data[54:66])}
+	}
+	return p, nil
 }

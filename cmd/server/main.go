@@ -2182,12 +2182,8 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var report struct {
-		NodeID string `json:"node_id"`
-		Links  []struct {
-			PeerID string  `json:"peer_id"`
-			RTTMS  float64 `json:"rtt_ms"`
-			Up     bool    `json:"up"`
-		} `json:"links"`
+		NodeID string                     `json:"node_id"`
+		Links  []protocol.LinkMeasurement `json:"links"`
 	}
 	if err := decodeJSON(w, r, &report); err != nil || report.NodeID == "" {
 		reply(w, 400, map[string]string{"error": "invalid telemetry"})
@@ -2196,14 +2192,25 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if !s.requireNodeAccess(w, r, report.NodeID) {
 		return
 	}
+	if s.updateLinkMetrics(report.NodeID, report.Links) {
+		s.metricStamp.Add(1)
+	}
+	reply(w, 200, map[string]string{"status": "ok"})
+}
+
+// updateLinkMetrics folds link observations into the shared metrics table and
+// reports whether the cached topology graph must be invalidated. Only real
+// up/down transitions or first sightings change link costs; pure RTT reports
+// arrive every few seconds and must not thrash the shared link cache.
+func (s *server) updateLinkMetrics(nodeID string, links []protocol.LinkMeasurement) bool {
 	now := time.Now()
 	stateChanged := false
 	s.metricsMu.Lock()
-	for _, x := range report.Links {
-		if x.PeerID == "" || x.PeerID == report.NodeID {
+	for _, x := range links {
+		if x.PeerID == "" || x.PeerID == nodeID {
 			continue
 		}
-		k := metricKey(report.NodeID, x.PeerID)
+		k := metricKey(nodeID, x.PeerID)
 		old := s.metrics[k]
 		if x.RTTMS > 0 && x.RTTMS < 60000 {
 			if old.RTTMS == 0 {
@@ -2212,10 +2219,6 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 				old.RTTMS = old.RTTMS*.7 + x.RTTMS*.3
 			}
 		}
-		// A new link or an up/down transition changes link costs and must
-		// invalidate the cached topology graph. Pure RTT reports arrive every
-		// few seconds; invalidating on those made the shared link cache
-		// useless and turned every bootstrap into a full recomputation.
 		if old.Seen.IsZero() || old.Up != x.Up {
 			stateChanged = true
 		}
@@ -2224,10 +2227,7 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 		s.metrics[k] = old
 	}
 	s.metricsMu.Unlock()
-	if stateChanged {
-		s.metricStamp.Add(1)
-	}
-	reply(w, 200, map[string]string{"status": "ok"})
+	return stateChanged
 }
 func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAuth(w, r) {
@@ -2887,14 +2887,15 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	var d struct {
-		ID       string `json:"node_id"`
-		Public   string `json:"public_key"`
-		NAT      string `json:"nat_type"`
-		Role     string `json:"role"`
-		Endpoint string `json:"endpoint"`
-		MeshIP   string `json:"mesh_ip"`
-		Capacity int    `json:"capacity"`
-		Relay    *bool  `json:"relay_capable"`
+		ID       string                     `json:"node_id"`
+		Public   string                     `json:"public_key"`
+		NAT      string                     `json:"nat_type"`
+		Role     string                     `json:"role"`
+		Endpoint string                     `json:"endpoint"`
+		MeshIP   string                     `json:"mesh_ip"`
+		Capacity int                        `json:"capacity"`
+		Relay    *bool                      `json:"relay_capable"`
+		Links    []protocol.LinkMeasurement `json:"links"`
 	}
 	if decodeJSON(w, r, &d) != nil || d.ID == "" || len(d.ID) > 128 || d.Public == "" || len(d.Public) > 256 || d.Endpoint == "" || len(d.Endpoint) > 256 || !(d.NAT == "cone" || d.NAT == "symmetric") || !(d.Role == "auto" || d.Role == "client" || d.Role == "superpeer") {
 		reply(w, 400, map[string]any{"error": "missing or invalid required fields"})
@@ -3001,6 +3002,13 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
 		return
+	}
+	// Newer nodes fold their link measurements into the heartbeat so the
+	// coordinator keeps fresh RTT/up-state without a separate telemetry
+	// request every few seconds. Optional: older clients omit links and keep
+	// using /v1/telemetry.
+	if len(d.Links) > 0 && s.updateLinkMetrics(d.ID, d.Links) {
+		s.metricStamp.Add(1)
 	}
 	var enrollmentToken string
 	if accountScoped && r.Header.Get("X-Mesh-Invite") != "" {

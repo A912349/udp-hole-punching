@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -214,76 +215,80 @@ type fastStats struct {
 	controlTxPackets, controlTxBytes atomic.Uint64
 }
 type node struct {
-	c                config
-	requestedRole    string
-	requestedNAT     string
-	id               *protocol.Identity
-	idBinary         [16]byte
-	packetPrefix     [4]byte
-	packetCounter    atomic.Uint64
-	key              []byte
-	conn             *net.UDPConn
-	connMu           sync.RWMutex
-	symmetricConnMu  sync.RWMutex
-	symmetricConns   map[string]*net.UDPConn
-	receiveMu        sync.Mutex
-	receiveCtx       context.Context
-	receiveStarted   bool
-	receiveSockets   map[*net.UDPConn]struct{}
-	receiveWG        sync.WaitGroup
-	lanConn          *net.UDPConn
-	udpReadMu        sync.RWMutex
-	recoveryMu       sync.Mutex
-	recoveryNext     time.Time
-	recoveryFails    int
-	control          *websocket.Conn
-	controlConnected bool
-	controlMu        sync.Mutex
-	controlRxAt      atomic.Int64
-	closing          atomic.Bool
-	controlCall      sync.Mutex
-	controlReply     chan controlFrame
-	pingMu           sync.Mutex
-	pings            map[string]pingProbe
-	mu               sync.RWMutex
-	dnsUpstream      string
-	routeMu          sync.Mutex
-	dir              map[string]*peer
-	neighbors        map[string]*peer
-	links            []edge
-	topologyVersion  string
-	lastLoggedMeshIP string
-	lastLoggedRole   string
-	routes           map[string]string
-	meshNodes        map[netip.Addr]string
-	subnetRoutes     []subnetRoute
-	installedRoutes  map[string]bool
-	seen             map[string]struct{}
-	fastSeenMu       sync.Mutex
-	fastSeen         map[[12]byte]struct{}
-	fastSeenRing     [][12]byte
-	fastSeenNext     int
-	pending          map[string]chan serviceResult
-	services         map[string]string
-	allow            map[string]bool
-	forwardMu        sync.Mutex
-	forwardListeners map[int64]net.Listener
-	forwardRules     map[int64]portForward
-	tunnels          map[string]net.Conn
-	stop             context.CancelFunc
-	tun              tunDevice
-	tunLUID          uint64
-	meshIPv4         atomic.Uint32
-	startedAt        time.Time
-	fastQueue        chan fastFrame
-	udpSendQueue     chan outboundDatagram
-	udpSendDone      <-chan struct{}
-	udpSendPool      sync.Pool
-	fastPool         sync.Pool
-	sendPool         sync.Pool
-	deliverQueues    []chan deliverFrame
-	deliverPool      sync.Pool
-	stats            fastStats
+	c                  config
+	requestedRole      string
+	requestedNAT       string
+	id                 *protocol.Identity
+	idBinary           [16]byte
+	packetPrefix       [4]byte
+	packetCounter      atomic.Uint64
+	key                []byte
+	conn               *net.UDPConn
+	connMu             sync.RWMutex
+	symmetricConnMu    sync.RWMutex
+	symmetricConns     map[string]*net.UDPConn
+	receiveMu          sync.Mutex
+	receiveCtx         context.Context
+	receiveStarted     bool
+	receiveSockets     map[*net.UDPConn]struct{}
+	receiveWG          sync.WaitGroup
+	lanConn            *net.UDPConn
+	udpReadMu          sync.RWMutex
+	recoveryMu         sync.Mutex
+	recoveryNext       time.Time
+	recoveryFails      int
+	control            *websocket.Conn
+	controlConnected   bool
+	controlMu          sync.Mutex
+	controlRxAt        atomic.Int64
+	closing            atomic.Bool
+	controlCall        sync.Mutex
+	controlReply       chan controlFrame
+	pingMu             sync.Mutex
+	pings              map[string]pingProbe
+	linksRejected      atomic.Bool // coordinator cannot accept piggybacked link reports
+	telemetryMu        sync.Mutex
+	lastTelemetrySent  time.Time
+	lastTelemetryLinks []protocol.LinkMeasurement
+	mu                 sync.RWMutex
+	dnsUpstream        string
+	routeMu            sync.Mutex
+	dir                map[string]*peer
+	neighbors          map[string]*peer
+	links              []edge
+	topologyVersion    string
+	lastLoggedMeshIP   string
+	lastLoggedRole     string
+	routes             map[string]string
+	meshNodes          map[netip.Addr]string
+	subnetRoutes       []subnetRoute
+	installedRoutes    map[string]bool
+	seen               map[string]struct{}
+	fastSeenMu         sync.Mutex
+	fastSeen           map[[12]byte]struct{}
+	fastSeenRing       [][12]byte
+	fastSeenNext       int
+	pending            map[string]chan serviceResult
+	services           map[string]string
+	allow              map[string]bool
+	forwardMu          sync.Mutex
+	forwardListeners   map[int64]net.Listener
+	forwardRules       map[int64]portForward
+	tunnels            map[string]net.Conn
+	stop               context.CancelFunc
+	tun                tunDevice
+	tunLUID            uint64
+	meshIPv4           atomic.Uint32
+	startedAt          time.Time
+	fastQueue          chan fastFrame
+	udpSendQueue       chan outboundDatagram
+	udpSendDone        <-chan struct{}
+	udpSendPool        sync.Pool
+	fastPool           sync.Pool
+	sendPool           sync.Pool
+	deliverQueues      []chan deliverFrame
+	deliverPool        sync.Pool
+	stats              fastStats
 
 	topologyRefreshMu   sync.Mutex
 	topologyRefreshNext time.Time
@@ -1209,13 +1214,28 @@ func endpointIPChanged(previous, next string) bool {
 
 func (n *node) register() error {
 	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.requestedRole, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
+	// Piggyback link measurements on the heartbeat so the coordinator keeps
+	// fresh RTT/up-state without a separate telemetry request. Coordinators
+	// decode with DisallowUnknownFields, so an older one rejects the field;
+	// remember that and let the telemetry loop cover metrics instead.
+	if !n.linksRejected.Load() {
+		r["links"] = n.currentLinks()
+	}
 	var out struct {
 		MeshIP string `json:"mesh_ip"`
 		Role   string `json:"assigned_role"`
 		Token  string `json:"network_token"`
 	}
 	if e := n.request("POST", "/v1/register", r, &out); e != nil {
-		return e
+		if !n.linksRejected.Load() && strings.Contains(e.Error(), "status 400") {
+			n.linksRejected.Store(true)
+			delete(r, "links")
+			if e = n.request("POST", "/v1/register", r, &out); e != nil {
+				return e
+			}
+		} else {
+			return e
+		}
 	}
 	if out.MeshIP == "" {
 		return errors.New("coordinator did not assign mesh_ip")
@@ -2323,6 +2343,22 @@ func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
 	}
 	_, _ = conn.WriteToUDP(encoded, address)
 }
+
+// sendCompact emits PING/PONG in the binary keepalive format, cutting each
+// keepalive from ~225 to ~70 bytes. It mirrors sendToAddress and falls back
+// to the JSON envelope when the packet cannot be compact-encoded.
+func (n *node) sendCompact(packet protocol.Packet, address *net.UDPAddr) {
+	encoded, err := protocol.EncodeCompact(packet, n.key)
+	if err != nil {
+		n.sendToAddress(packet, address)
+		return
+	}
+	conn := n.connForPeer(packet.Destination)
+	if conn == nil {
+		return
+	}
+	_, _ = conn.WriteToUDP(encoded, address)
+}
 func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 	// Nodes commonly start at the same time (service restart, container
 	// rollout, or a laptop waking up). A small per-loop phase prevents all
@@ -2756,9 +2792,13 @@ func (n *node) sendDirect(packet protocol.Packet, endpoint string, observed *net
 			return false
 		}
 	}
-	encoded, err := protocol.EncodePacket(packet, n.key)
+	// Keepalives use the ~70-byte binary format; anything else (or a compact
+	// encoding failure) falls back to the JSON envelope.
+	encoded, err := protocol.EncodeCompact(packet, n.key)
 	if err != nil {
-		return false
+		if encoded, err = protocol.EncodePacket(packet, n.key); err != nil {
+			return false
+		}
 	}
 	conn := n.connForPeer(packet.Destination)
 	if conn == nil {
@@ -2778,19 +2818,72 @@ func prunePings(pings map[string]pingProbe, before time.Time) {
 		}
 	}
 }
-func (n *node) reportTelemetry() error {
-	type measurement struct {
-		PeerID string  `json:"peer_id"`
-		RTTMS  float64 `json:"rtt_ms"`
-		Up     bool    `json:"up"`
-	}
+
+// telemetryKeepalive bounds how long a coordinator may consider link metrics
+// fresh when nothing changes. It must stay below the server's 45-second
+// unknown-state threshold so idle networks keep their topology ranking even
+// on older coordinators without piggybacked register links.
+const telemetryKeepalive = 40 * time.Second
+
+// currentLinks snapshots the neighbor observations reported to the coordinator.
+func (n *node) currentLinks() []protocol.LinkMeasurement {
 	n.mu.RLock()
-	links := make([]measurement, 0, len(n.neighbors))
+	links := make([]protocol.LinkMeasurement, 0, len(n.neighbors))
 	for id, p := range n.neighbors {
-		links = append(links, measurement{id, p.rttMS, !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout})
+		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout})
 	}
 	n.mu.RUnlock()
+	return links
+}
+
+// reportTelemetry sends link measurements only when they changed (link set,
+// up/down state, or a meaningful RTT shift) or when the keepalive window
+// elapsed. In a stable network this removes nearly all telemetry traffic;
+// any change is still reported within one telemetryInterval, so monitoring
+// responsiveness is unchanged. Fresh RTT for every link also arrives with
+// each register heartbeat.
+func (n *node) reportTelemetry() error {
+	links := n.currentLinks()
+	n.telemetryMu.Lock()
+	send := telemetryChanged(n.lastTelemetryLinks, links) || time.Since(n.lastTelemetrySent) >= telemetryKeepalive
+	if send {
+		n.lastTelemetryLinks = links
+		n.lastTelemetrySent = time.Now()
+	}
+	n.telemetryMu.Unlock()
+	if !send {
+		return nil
+	}
 	return n.request("POST", "/v1/telemetry", map[string]any{"node_id": n.id.ID, "links": links}, &map[string]any{})
+}
+
+// telemetryChanged reports whether the new measurements differ from the last
+// sent snapshot enough to justify a report. RTT jitter within 30% and 3 ms is
+// deliberately not reported: the coordinator smooths RTT with an EMA and a
+// fresh exact value arrives with every register heartbeat anyway.
+func telemetryChanged(sent, links []protocol.LinkMeasurement) bool {
+	if len(sent) != len(links) {
+		return true
+	}
+	previous := make(map[string]protocol.LinkMeasurement, len(sent))
+	for _, l := range sent {
+		previous[l.PeerID] = l
+	}
+	for _, l := range links {
+		old, ok := previous[l.PeerID]
+		if !ok || old.Up != l.Up || rttDrifted(old.RTTMS, l.RTTMS) {
+			return true
+		}
+	}
+	return false
+}
+
+func rttDrifted(prev, next float64) bool {
+	if prev == 0 || next == 0 {
+		return prev != next
+	}
+	diff := math.Abs(prev - next)
+	return diff > 3 && diff > 0.3*math.Max(prev, next)
 }
 func (n *node) usable(p *peer) bool {
 	// A topology entry is only a candidate endpoint. Do not report or route
@@ -3205,10 +3298,17 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	}
 	n.stats.controlRxPackets.Add(1)
 	n.stats.controlRxBytes.Add(uint64(len(datagram) + 28)) // IPv4 + UDP overhead.
-	p, e := protocol.DecodePacket(datagram, n.key)
+	var p protocol.Packet
+	var e error
+	if protocol.IsCompact(datagram) {
+		p, e = protocol.DecodeCompact(datagram, n.key)
+	} else {
+		p, e = protocol.DecodePacket(datagram, n.key)
+	}
 	if e != nil || !n.remember(p.ID) {
 		return
 	}
+	compact := protocol.IsCompact(datagram)
 	if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
 		n.touch(p.Source, address)
 	}
@@ -3228,7 +3328,14 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
 		n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
 	case "PING":
-		n.sendToAddress(protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID}), address)
+		pong := protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID})
+		if compact {
+			// Reply in the format the PING used so mixed-version fleets stay
+			// interoperable during rolling upgrades.
+			n.sendCompact(pong, address)
+		} else {
+			n.sendToAddress(pong, address)
+		}
 	case "PONG":
 		n.handlePong(p)
 	case "SYMMETRIC_BURST":
