@@ -31,7 +31,38 @@ func writeUDPBatch(writer udpBatchWriter, batch []outboundDatagram) (int, error)
 	return total, nil
 }
 
+// enqueueUDP takes ownership of frame.data, returning it to the pool on
+// failure. Only locally originated traffic waits: blocking a relay worker here
+// would couple receive-side progress to outgoing congestion.
+func (n *node) enqueueUDP(frame outboundDatagram, wait bool) bool {
+	if wait {
+		select {
+		case <-n.udpSendDone:
+			n.udpSendPool.Put(frame.data[:maxFastFrame])
+			return false
+		default:
+		}
+		select {
+		case n.udpSendQueue <- frame:
+			return true
+		case <-n.udpSendDone:
+			n.udpSendPool.Put(frame.data[:maxFastFrame])
+			return false
+		}
+	}
+	select {
+	case n.udpSendQueue <- frame:
+		return true
+	default:
+		n.udpSendPool.Put(frame.data[:maxFastFrame])
+		n.stats.queueDrops.Add(1)
+		n.stats.txQueueDrops.Add(1)
+		return false
+	}
+}
+
 func (n *node) startUDPSender(ctx context.Context) {
+	n.udpSendDone = ctx.Done()
 	n.udpSendQueue = make(chan outboundDatagram, udpSendQueueSize)
 	n.udpSendPool.New = func() any { return make([]byte, maxFastFrame) }
 	go func() {

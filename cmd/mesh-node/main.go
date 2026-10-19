@@ -204,6 +204,8 @@ type outboundDatagram struct {
 type fastStats struct {
 	receivedPackets, receivedBytes   atomic.Uint64
 	queueDrops                       atomic.Uint64
+	rxQueueDrops                     atomic.Uint64
+	txQueueDrops                     atomic.Uint64
 	sentPackets, sentBytes           atomic.Uint64
 	deliveredPackets, deliveredBytes atomic.Uint64
 	deliveryDrops                    atomic.Uint64
@@ -274,6 +276,7 @@ type node struct {
 	startedAt        time.Time
 	fastQueue        chan fastFrame
 	udpSendQueue     chan outboundDatagram
+	udpSendDone      <-chan struct{}
 	udpSendPool      sync.Pool
 	fastPool         sync.Pool
 	sendPool         sync.Pool
@@ -3012,6 +3015,8 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			txPackets := current.sentPackets - previous.sentPackets
 			txBytes := current.sentBytes - previous.sentBytes
 			drops := current.queueDrops - previous.queueDrops
+			rxDrops := current.rxQueueDrops - previous.rxQueueDrops
+			txDrops := current.txQueueDrops - previous.txQueueDrops
 			tunDrops := current.deliveryDrops - previous.deliveryDrops
 			controlRxPackets := current.controlRxPackets - previous.controlRxPackets
 			controlRxBytes := current.controlRxBytes - previous.controlRxBytes
@@ -3021,12 +3026,12 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 			runtime.ReadMemStats(&mem)
 			seconds := interval.Seconds()
 			deliverLength, deliverCapacity := n.deliverQueueUsage()
-			n.logf("stats %s: data rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps control rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d heap=%.1f MiB goroutines=%d",
+			n.logf("stats %s: data rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps control rx=%.0f pps %.2f Mbps tx=%.0f pps %.2f Mbps tun=%.0f pps queues=%d/%d,%d/%d drops=%d/%d udpTxQueue=%d/%d rxDrops=%d txDrops=%d heap=%.1f MiB goroutines=%d",
 				interval, float64(rxPackets)/seconds, float64(rxBytes*8)/seconds/1e6,
 				float64(txPackets)/seconds, float64(txBytes*8)/seconds/1e6,
 				float64(controlRxPackets)/seconds, float64(controlRxBytes*8)/seconds/1e6,
 				float64(controlTxPackets)/seconds, float64(controlTxBytes*8)/seconds/1e6,
-				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), deliverLength, deliverCapacity, drops, tunDrops,
+				float64(current.deliveredPackets-previous.deliveredPackets)/seconds, len(n.fastQueue), cap(n.fastQueue), deliverLength, deliverCapacity, drops, tunDrops, len(n.udpSendQueue), cap(n.udpSendQueue), rxDrops, txDrops,
 				float64(mem.HeapAlloc)/(1024*1024), runtime.NumGoroutine())
 			previous = current
 		}
@@ -3036,6 +3041,7 @@ func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 type fastStatsSnapshot struct {
 	receivedPackets, receivedBytes   uint64
 	queueDrops                       uint64
+	rxQueueDrops, txQueueDrops       uint64
 	sentPackets, sentBytes           uint64
 	deliveredPackets, deliveredBytes uint64
 	deliveryDrops                    uint64
@@ -3047,6 +3053,7 @@ func (n *node) fastStatsSnapshot() fastStatsSnapshot {
 	return fastStatsSnapshot{
 		receivedPackets: n.stats.receivedPackets.Load(), receivedBytes: n.stats.receivedBytes.Load(),
 		queueDrops: n.stats.queueDrops.Load(), sentPackets: n.stats.sentPackets.Load(), sentBytes: n.stats.sentBytes.Load(),
+		rxQueueDrops: n.stats.rxQueueDrops.Load(), txQueueDrops: n.stats.txQueueDrops.Load(),
 		deliveredPackets: n.stats.deliveredPackets.Load(), deliveredBytes: n.stats.deliveredBytes.Load(), deliveryDrops: n.stats.deliveryDrops.Load(),
 		controlRxPackets: n.stats.controlRxPackets.Load(), controlRxBytes: n.stats.controlRxBytes.Load(), controlTxPackets: n.stats.controlTxPackets.Load(), controlTxBytes: n.stats.controlTxBytes.Load(),
 	}
@@ -3071,6 +3078,7 @@ func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 		// packet drop instead of an unbounded allocation or stalled receiver.
 		n.fastPool.Put(owned[:maxFastFrame])
 		n.stats.queueDrops.Add(1)
+		n.stats.rxQueueDrops.Add(1)
 		n.debugf("drop fast frame from %s: worker queue full", addr)
 	}
 }
@@ -3795,6 +3803,10 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 	n.acceptIPFragment(src, plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
+	return n.sendFastMode(dst, data, false)
+}
+
+func (n *node) sendFastMode(dst string, data []byte, wait bool) bool {
 	_, p := n.nextHop(dst)
 	if !n.usable(p) {
 		n.debugf("fast send to %s: no usable route", dst[:8])
@@ -3817,15 +3829,7 @@ func (n *node) sendFast(dst string, data []byte) bool {
 	}
 	owned := n.udpSendPool.Get().([]byte)[:len(data)]
 	copy(owned, data)
-	select {
-	case n.udpSendQueue <- outboundDatagram{conn: conn, data: owned, address: address}:
-		return true
-	default:
-		n.udpSendPool.Put(owned[:maxFastFrame])
-		n.stats.queueDrops.Add(1)
-		n.debugf("drop fast frame to %s: UDP send queue full", dst[:8])
-		return false
-	}
+	return n.enqueueUDP(outboundDatagram{conn: conn, data: owned, address: address}, wait)
 }
 func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
@@ -3973,7 +3977,10 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	copy(pkt[plainAt+12:], p)
 	var aadBuffer [77]byte
 	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], fastAAD(aadBuffer[:0], aad, packetID[:]))
-	return n.sendFast(dst, pkt)
+	// Local TUN traffic can apply backpressure to the kernel rather than
+	// discard encrypted packets when the UDP sender momentarily falls behind.
+	// Relay traffic still uses the nonblocking sendFast path.
+	return n.sendFastMode(dst, pkt, true)
 }
 func (n *node) deliver(src string, p []byte) {
 	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
