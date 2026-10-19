@@ -79,6 +79,9 @@ const (
 	fastSeenCapacity         = 10000
 	lanDiscoveryPort         = 37777
 	lanDiscoveryInterval     = time.Minute
+	lanDiscoveryBurstCount   = 5
+	lanHoldTimeout           = 30 * time.Second
+	localSubnetsRefresh      = 30 * time.Second
 	initialTelemetryDelay    = 3 * time.Second
 	aeadTag                  = 16
 	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + aeadTag
@@ -113,6 +116,8 @@ type peer struct {
 	DNSRecords []dnsRecord          `json:"dns_records,omitempty"`
 	last       net.Addr
 	lastRX     time.Time
+	lastLAN    *net.UDPAddr
+	lastLANRX  time.Time
 	discovered time.Time
 	up         bool
 	rttMS      float64
@@ -233,6 +238,10 @@ type node struct {
 	receiveSockets     map[*net.UDPConn]struct{}
 	receiveWG          sync.WaitGroup
 	lanConn            *net.UDPConn
+	pendingLAN         map[string]*net.UDPAddr
+	subnetsMu          sync.Mutex
+	subnets            []netip.Prefix
+	subnetsAt          time.Time
 	udpReadMu          sync.RWMutex
 	recoveryMu         sync.Mutex
 	recoveryNext       time.Time
@@ -743,6 +752,7 @@ func newNode(c config) (*node, error) {
 		symmetricConns:      map[string]*net.UDPConn{},
 		receiveSockets:      map[*net.UDPConn]struct{}{},
 		dir:                 map[string]*peer{},
+		pendingLAN:          map[string]*net.UDPAddr{},
 		neighbors:           map[string]*peer{},
 		routes:              map[string]string{},
 		meshNodes:           map[netip.Addr]string{},
@@ -1358,6 +1368,11 @@ func (n *node) applyTopology(t topology) {
 		}
 	}
 	n.neighbors = map[string]*peer{}
+	type lanHello struct {
+		id   string
+		addr *net.UDPAddr
+	}
+	lanHellos := make([]lanHello, 0, 2)
 	for _, v := range t.Neighbors {
 		p := v
 		p.discovered = time.Now()
@@ -1366,6 +1381,16 @@ func (n *node) applyTopology(t topology) {
 			p.lastRX = q.lastRX
 			p.up = q.up
 			p.discovered = q.discovered
+			p.lastLAN = q.lastLAN
+			p.lastLANRX = q.lastLANRX
+		}
+		if candidate := n.pendingLAN[p.ID]; candidate != nil {
+			delete(n.pendingLAN, p.ID)
+			// Candidate only: lastLANRX is confirmed by touch() once traffic
+			// really arrives from the LAN address.
+			p.lastLAN = candidate
+			p.last = candidate
+			lanHellos = append(lanHellos, lanHello{id: p.ID, addr: candidate})
 		}
 		n.neighbors[p.ID] = &p
 	}
@@ -1373,6 +1398,15 @@ func (n *node) applyTopology(t topology) {
 	n.topologyVersion = t.Version
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
+	for _, hello := range lanHellos {
+		n.logf("LAN endpoint candidate for %s: %s", hello.id[:8], hello.addr)
+		n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, hello.id, map[string]any{"public_key": n.id.Public}), hello.addr)
+	}
+	if n.sameNATPeerExists() {
+		// A same-NAT peer just appeared or the topology changed: broadcast once
+		// right away instead of waiting for the next burst/interval tick.
+		n.broadcastLANDiscovery()
+	}
 	n.syncPortForwards(t.Forwards)
 	n.cancelObsoleteSymmetricScans()
 	if n.c.debug {
@@ -2408,8 +2442,28 @@ func (n *node) startLANDiscovery(ctx context.Context) error {
 	n.lanConn = conn
 	go n.lanDiscoveryLoop(ctx, conn)
 	n.broadcastLANDiscovery()
+	go n.lanDiscoveryBurst(ctx)
 	go n.periodic(ctx, lanDiscoveryInterval, n.broadcastLANDiscovery)
 	return nil
+}
+
+// lanDiscoveryBurst repeats the broadcast a few times with an exponential
+// backoff right after startup. A peer that is still bootstrapping cannot use
+// discovery candidates that arrive before its topology is ready; short
+// retries close that window instead of waiting a full interval.
+func (n *node) lanDiscoveryBurst(ctx context.Context) {
+	delay := time.Second
+	for i := 0; i < lanDiscoveryBurstCount; i++ {
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		n.broadcastLANDiscovery()
+		delay *= 2
+	}
 }
 
 func (n *node) broadcastLANDiscovery() {
@@ -2420,6 +2474,12 @@ func (n *node) broadcastLANDiscovery() {
 	}
 	conn := n.lanConn
 	n.mu.RUnlock()
+	if !n.sameNATPeerExists() {
+		// Every known node is behind a different NAT: nobody on this segment
+		// can hear the broadcast, so do not send it.
+		n.debugf("LAN discovery skipped: no peer shares this node's external IP")
+		return
+	}
 	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
 	p := protocol.NewPacket("LAN_DISCOVERY", n.id.ID, "", map[string]any{"udp_port": port})
 	b, err := protocol.EncodePacket(p, n.key)
@@ -2456,17 +2516,28 @@ func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 		if err != nil || json.Unmarshal(raw, &payload) != nil || payload.Port < 1 || payload.Port > 65535 {
 			continue
 		}
-		candidate := &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: payload.Port}
+		candidate := copyUDPAddr(&net.UDPAddr{IP: address.IP, Port: payload.Port})
 		n.mu.Lock()
 		peer := n.neighbors[packet.Source]
 		if peer != nil {
+			// Candidate only: lastLANRX is set by touch() once traffic actually
+			// arrives from this address, so an unreachable candidate (LAN
+			// segmentation, AP isolation) never suppresses the public path.
+			peer.lastLAN = candidate
 			peer.last = candidate
+		} else {
+			// The peer is not installed yet (still bootstrapping, or this node
+			// just started). Buffer the candidate so it survives until
+			// applyTopology creates the peer; dropping it used to leave the
+			// NAT-hairpin public path as the only option.
+			if n.pendingLAN == nil {
+				n.pendingLAN = map[string]*net.UDPAddr{}
+			}
+			n.pendingLAN[packet.Source] = candidate
 		}
 		n.mu.Unlock()
-		if peer != nil {
-			n.debugf("LAN endpoint candidate for %s: %s", packet.Source[:8], candidate)
-			n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, packet.Source, map[string]any{"public_key": n.id.Public}), candidate)
-		}
+		n.debugf("LAN endpoint candidate for %s: %s", packet.Source[:8], candidate)
+		n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, packet.Source, map[string]any{"public_key": n.id.Public}), candidate)
 	}
 }
 
@@ -2475,8 +2546,11 @@ func (n *node) resetTransportState() {
 	for _, peer := range n.neighbors {
 		peer.last = nil
 		peer.lastRX = time.Time{}
+		peer.lastLAN = nil
+		peer.lastLANRX = time.Time{}
 		peer.up = false
 	}
+	n.pendingLAN = map[string]*net.UDPAddr{}
 	n.mu.Unlock()
 	current := n.currentUDPConn()
 	n.symmetricConnMu.Lock()
@@ -2618,6 +2692,10 @@ func (n *node) sendHello(p peer) {
 	if observed, ok := p.last.(*net.UDPAddr); ok {
 		n.sendToAddress(packet, observed)
 	}
+	// Edge retries are the recovery path: always also try the declared public
+	// endpoint. LAN preference and sameNAT are hints, never a reason to
+	// withhold a candidate here — the LAN segment may be unreachable even when
+	// both nodes share one external IP.
 	if address, err := net.ResolveUDPAddr("udp", p.Endpoint); err == nil {
 		n.sendToAddress(packet, address)
 	}
@@ -2707,9 +2785,10 @@ func (n *node) detectEndpoint() (string, string, error) {
 func (n *node) helloAll() {
 	n.mu.RLock()
 	type helloTarget struct {
-		id       string
-		observed *net.UDPAddr
-		declared string
+		id           string
+		observed     *net.UDPAddr
+		declared     string
+		skipDeclared bool
 	}
 	targets := make([]helloTarget, 0, len(n.neighbors))
 	for id, peer := range n.neighbors {
@@ -2722,6 +2801,12 @@ func (n *node) helloAll() {
 		if address, ok := peer.last.(*net.UDPAddr); ok {
 			target.observed = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
 		}
+		if freshLAN(peer, time.Now()) && n.sameNAT(peer) {
+			// The LAN path is confirmed working (traffic received) and both
+			// nodes share one external IP: a duplicate HELLO to the declared
+			// public endpoint would only hairpin through the NAT device.
+			target.skipDeclared = true
+		}
 		targets = append(targets, target)
 	}
 	n.mu.RUnlock()
@@ -2731,6 +2816,7 @@ func (n *node) helloAll() {
 			n.sendToAddress(packet, target.observed)
 		}
 		if address, err := net.ResolveUDPAddr("udp", target.declared); err == nil &&
+			!target.skipDeclared &&
 			(target.observed == nil || address.String() != target.observed.String()) {
 			n.sendToAddress(packet, address)
 		}
@@ -3449,15 +3535,146 @@ func (n *node) nextPacketID(dst []byte) bool {
 		}
 	}
 }
+
+// sameNATPeerExists reports whether any known node other than this one
+// publishes an external endpoint with the same IP — i.e., LAN discovery has a
+// plausible target on the local segment. Same external IP is a hint, not a
+// guarantee, but when no peer matches there is nobody to find on the LAN and
+// broadcasts are pure noise.
+func (n *node) sameNATPeerExists() bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for id, p := range n.dir {
+		if id != n.id.ID && n.sameNAT(p) {
+			return true
+		}
+	}
+	for id, p := range n.neighbors {
+		if id != n.id.ID && n.sameNAT(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// copyUDPAddr returns a detached copy of a so stored endpoints never alias
+// receive buffers.
+func copyUDPAddr(a *net.UDPAddr) *net.UDPAddr {
+	return &net.UDPAddr{IP: append(net.IP(nil), a.IP...), Port: a.Port, Zone: a.Zone}
+}
+
+// localSubnets returns the IPv4 prefixes of the up local interfaces. The
+// result is cached: enumerating interfaces on every keepalive would add
+// syscalls to the control path.
+func (n *node) localSubnets() []netip.Prefix {
+	n.subnetsMu.Lock()
+	defer n.subnetsMu.Unlock()
+	now := time.Now()
+	if n.subnets != nil && now.Sub(n.subnetsAt) < localSubnetsRefresh {
+		return n.subnets
+	}
+	subnets := make([]netip.Prefix, 0, 4)
+	if interfaces, err := net.Interfaces(); err == nil {
+		for _, iface := range interfaces {
+			if iface.Flags&net.FlagUp == 0 {
+				continue
+			}
+			addrs, err := iface.Addrs()
+			if err != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ipnet, ok := addr.(*net.IPNet)
+				if !ok {
+					continue
+				}
+				ip, ok := netip.AddrFromSlice(ipnet.IP)
+				if !ok {
+					continue
+				}
+				ip = ip.Unmap()
+				if !ip.Is4() {
+					continue
+				}
+				bits, _ := net.IPMask(ipnet.Mask).Size()
+				subnets = append(subnets, netip.PrefixFrom(ip, bits))
+			}
+		}
+	}
+	n.subnets = subnets
+	n.subnetsAt = now
+	return subnets
+}
+
+// isLANAddr reports whether ip belongs to a subnet of a local interface.
+func (n *node) isLANAddr(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	if !addr.Is4() {
+		return false
+	}
+	for _, subnet := range n.localSubnets() {
+		if subnet.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// sameNAT reports whether the peer's published external endpoint shares this
+// node's external IP — a hint that both nodes sit behind one router, where a
+// direct LAN path usually beats NAT hairpinning. It is never a guarantee of
+// reachability: LAN segmentation, VLANs or AP isolation can still make the
+// LAN address unusable. sameNAT therefore only trims a redundant duplicate
+// HELLO while the LAN path is confirmed working, and it never withholds a
+// recovery path.
+func (n *node) sameNAT(p *peer) bool {
+	if p == nil || p.Endpoint == "" || n.c.endpoint == "" {
+		return false
+	}
+	peerIP := endpointIP(p.Endpoint)
+	return peerIP != "" && peerIP == endpointIP(n.c.endpoint)
+}
+
+// freshLAN reports whether traffic was recently received from the peer's LAN
+// address. Only a traffic-confirmed LAN path justifies skipping the public
+// endpoint; a merely discovered candidate never does.
+func freshLAN(p *peer, now time.Time) bool {
+	return p != nil && p.lastLAN != nil && now.Sub(p.lastLANRX) < lanHoldTimeout
+}
+
 func (n *node) touch(id string, a net.Addr) {
+	// Classify the source before taking the topology lock: the subnet cache
+	// may refresh and touch the network stack.
+	lanSource := false
+	address, isUDP := a.(*net.UDPAddr)
+	if isUDP {
+		lanSource = n.isLANAddr(address.IP)
+	}
+	now := time.Now()
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
-		if address, ok := a.(*net.UDPAddr); ok {
-			p.last = &net.UDPAddr{IP: append(net.IP(nil), address.IP...), Port: address.Port, Zone: address.Zone}
+		if isUDP {
+			if lanSource {
+				// A LAN address always wins: same-subnet traffic does not
+				// traverse the NAT device at all.
+				p.lastLAN = copyUDPAddr(address)
+				p.lastLANRX = now
+				p.last = p.lastLAN
+			} else if !freshLAN(p, now) || p.last != net.Addr(p.lastLAN) {
+				// Public source: either a real WAN path or NAT hairpin. Do not
+				// downgrade a current, fresh LAN path because one hairpin
+				// packet happened to arrive; if the LAN path dies, lastLANRX
+				// goes stale and the public address takes over again.
+				p.last = copyUDPAddr(address)
+			}
 		} else {
 			p.last = a
 		}
-		p.lastRX = time.Now()
+		p.lastRX = now
 		p.up = true
 	}
 	n.mu.Unlock()
