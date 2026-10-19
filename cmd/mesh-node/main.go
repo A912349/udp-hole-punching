@@ -165,6 +165,7 @@ type cachedKey struct {
 	public  string
 	key     []byte
 	aead    cipher.AEAD
+	nonces  *protocol.NonceSequence
 	peerID  [16]byte
 	openAAD []byte
 	sealAAD []byte
@@ -214,8 +215,8 @@ type node struct {
 	requestedNAT     string
 	id               *protocol.Identity
 	idBinary         [16]byte
-	packetPrefix     [8]byte
-	packetCounter    atomic.Uint32
+	packetPrefix     [4]byte
+	packetCounter    atomic.Uint64
 	key              []byte
 	conn             *net.UDPConn
 	connMu           sync.RWMutex
@@ -3304,16 +3305,13 @@ func (n *node) nextPacketID(dst []byte) bool {
 	}
 	for {
 		previous := n.packetCounter.Load()
-		if previous == ^uint32(0) {
+		if previous == ^uint64(0) {
 			return false
 		}
 		count := previous + 1
 		if n.packetCounter.CompareAndSwap(previous, count) {
-			// 8 random session bytes + 32-bit counter: unique per session, and
-			// the prefix re-rolls on every restart, keeping nonce reuse at the
-			// 2^-64 birthday bound under the peer's static key.
 			copy(dst, n.packetPrefix[:])
-			binary.BigEndian.PutUint32(dst[len(n.packetPrefix):], count)
+			binary.BigEndian.PutUint64(dst[len(n.packetPrefix):], count)
 			return true
 		}
 	}
@@ -3428,8 +3426,12 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 		if cipherErr != nil {
 			return nil, nil, cipherErr
 		}
+		nonces, nonceErr := protocol.NewNonceSequence()
+		if nonceErr != nil {
+			return nil, nil, nonceErr
+		}
 		n.mu.Lock()
-		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, peerID: peerID, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
+		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
 		n.mu.Unlock()
 	}
 	return k, p, e
@@ -3448,17 +3450,17 @@ func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
 	return cached.aead, cached.openAAD, nil
 }
 
-func (n *node) peerCipher(id string) (cipher.AEAD, []byte, [16]byte, error) {
+func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, [16]byte, error) {
 	if _, _, err := n.peerKey(id); err != nil {
-		return nil, nil, [16]byte{}, err
+		return nil, nil, nil, [16]byte{}, err
 	}
 	n.mu.RLock()
 	cached, ok := n.sharedKeys[id]
 	n.mu.RUnlock()
-	if !ok || cached.aead == nil {
-		return nil, nil, [16]byte{}, errors.New("missing peer cipher")
+	if !ok || cached.aead == nil || cached.nonces == nil {
+		return nil, nil, nil, [16]byte{}, errors.New("missing peer cipher")
 	}
-	return cached.aead, cached.sealAAD, cached.peerID, nil
+	return cached.aead, cached.nonces, cached.sealAAD, cached.peerID, nil
 }
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	k, _, e := n.peerKey(dst)
@@ -3730,12 +3732,10 @@ func (n *node) close() {
 }
 
 // Compact fast IPv4 frame: MIP1 | ttl | source node ID | destination node ID | packet ID | sealed fragment.
-// The ChaCha20-Poly1305 tag authenticates the ciphertext, the
-// source:destination AAD and the nonce, which doubles as the header packet
-// ID; no separate frame MAC is computed. Only the TTL stays mutable so relays
-// can decrement it in place. Replay protection combines packet ID dedupe
-// (rememberFast) with the tag-bound ID: a captured frame replayed under a
-// forged header ID fails decryption instead of bypassing dedupe.
+// The ChaCha20-Poly1305 tag authenticates the ciphertext plus the
+// source:destination AAD; no separate frame MAC is computed. Header fields
+// (TTL, packet ID) are mutable by design: relays decrement TTL in place and
+// replay protection relies on the packet ID dedupe, not on authentication.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
 	if len(data) < fastHeader+28 {
 		n.debugf("drop fast frame from %s: truncated (%d bytes)", a, len(data))
@@ -3766,13 +3766,16 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		n.debugf("drop fast frame from %s: %v", src[:8], e)
 		return
 	}
-	// The packet ID doubles as the AEAD nonce, so it is bound to the Poly1305
-	// tag: a frame replayed with a forged header ID (to bypass dedupe) or with
-	// a mutated ID fails to open here. Verbatim replays are already dropped by
-	// rememberFast above.
-	plain, e := aead.Open(nil, packetID[:], data[fastHeader+aead.NonceSize():], aad)
+	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], aad)
 	if e != nil {
 		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
+		return
+	}
+	// The header packet ID is unauthenticated and only pre-filters replays;
+	// the sealed copy is authoritative. A mismatch means the header was
+	// mutated in flight to bypass dedupe (replay forgery).
+	if len(plain) < 12 || !bytes.Equal(plain[:12], packetID[:]) {
+		n.debugf("drop fast frame from %s: packet ID mismatch", src[:8])
 		return
 	}
 	n.debugf("fast frame from %s received (%d bytes encrypted)", src[:8], len(data))
@@ -3921,7 +3924,7 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	if len(p) > maxTUN {
 		return false
 	}
-	aead, aad, target, e := n.peerCipher(dst)
+	aead, nonces, aad, target, e := n.peerCipher(dst)
 	if e != nil {
 		n.debugf("IP send to %s: %v", dst[:8], e)
 		return false
@@ -3932,13 +3935,11 @@ func (n *node) sendIP(dst string, p []byte) bool {
 		return false
 	}
 
-	// Build header, nonce and plaintext in one backing array. The nonce region
-	// is a copy of the header packet ID, binding that unauthenticated field to
-	// the AEAD tag at zero extra cost. Seal appends its output exactly over the
-	// plaintext region, which is an overlap supported by cipher.AEAD. The tag
-	// authenticates the ciphertext, the source:destination AAD and the nonce;
-	// only the TTL header byte stays mutable so relays can decrement it in
-	// place without re-encrypting.
+	// Build header, nonce and plaintext in one backing array. Seal appends its
+	// output exactly over the plaintext region, which is an overlap supported by
+	// cipher.AEAD. The AEAD tag authenticates the ciphertext and the
+	// source:destination AAD; the frame header itself is deliberately mutable
+	// so relays can decrement TTL without re-encrypting.
 	nonceSize := aead.NonceSize()
 	plainAt := fastHeader + nonceSize
 	plainSize := 12 + len(p)
@@ -3950,9 +3951,9 @@ func (n *node) sendIP(dst string, p []byte) bool {
 	copy(pkt[5:21], n.idBinary[:])
 	copy(pkt[21:37], target[:])
 	copy(pkt[37:49], packetID[:])
-	// The nonce is the header packet ID itself: one sequence feeds both fields
-	// (and there is no separate uint32 nonce counter to exhaust).
-	copy(pkt[fastHeader:plainAt], packetID[:])
+	if e = nonces.NextInto(pkt[fastHeader:plainAt]); e != nil {
+		return false
+	}
 	// Fragment ID and index remain zero. Count=1 takes the receiver's optimized
 	// no-reassembly path, so a random fragment ID has no observable purpose.
 	clear(pkt[plainAt : plainAt+12])
