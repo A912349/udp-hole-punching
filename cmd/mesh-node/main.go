@@ -54,6 +54,10 @@ const (
 	recoveryCheck      = 5 * time.Second
 	topologyPoll       = 90 * time.Second
 	linkTimeout        = 30 * time.Second
+	// Upper bound for one blocking UDP receive. The receive loop renews the
+	// deadline each iteration; the brief unlock between reads lets rebind or
+	// STUN take the exclusive udpReadMu lock (see receiveSocket).
+	udpReadWindow      = 1 * time.Second
 	linkGrace          = 20 * time.Second
 	recoveryMinBackoff = 10 * time.Second
 	recoveryMaxBackoff = 5 * time.Minute
@@ -3364,6 +3368,12 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 	reader := newUDPBatchReader(conn)
 	for {
 		n.udpReadMu.RLock()
+		// Every read must stay inside a bounded window. rebindUDPConn and STUN
+		// wait for the exclusive lock, and a reader parked forever in recvmsg on
+		// a socket that stopped receiving traffic (dead NAT mapping after an IP
+		// change) would block them permanently, so the endpoint refresh after a
+		// network change never completed and the node stayed on a dead endpoint.
+		_ = conn.SetReadDeadline(time.Now().Add(udpReadWindow))
 		datagrams, e := reader.read()
 		n.udpReadMu.RUnlock()
 		if e != nil {
