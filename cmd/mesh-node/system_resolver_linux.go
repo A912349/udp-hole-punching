@@ -1,5 +1,7 @@
 //go:build linux
 
+// platformSystemResolver reads the configured upstream DNS server on Linux.
+
 package main
 
 import "os"

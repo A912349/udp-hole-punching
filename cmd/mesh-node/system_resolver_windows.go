@@ -1,5 +1,7 @@
 //go:build windows
 
+// platformSystemResolver reads the configured upstream DNS server on Windows.
+
 package main
 
 import (

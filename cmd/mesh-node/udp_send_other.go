@@ -1,5 +1,7 @@
 //go:build !linux && !android
 
+// Portable fallback sends queued datagrams one at a time.
+
 package main
 
 import "net"

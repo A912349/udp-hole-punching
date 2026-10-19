@@ -1,5 +1,6 @@
 package protocol
 
+// These tests cover open validation behavior and regression cases.
 import (
 	"errors"
 	"fmt"

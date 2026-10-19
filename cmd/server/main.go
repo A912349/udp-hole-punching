@@ -187,6 +187,8 @@ func envInt(name string, fallback int) int {
 	}
 	return fallback
 }
+
+// main initializes persistence, registers HTTP routes, and serves the coordinator API.
 func main() {
 	pprofListen := flag.String("pprof-listen", "", "local pprof listener, e.g. 127.0.0.1:6061")
 	if len(os.Args) > 1 && (os.Args[1] == "--add-autostart" || os.Args[1] == "--del-autostart") {
@@ -443,6 +445,7 @@ func (w *controlResponseWriter) Write(p []byte) (int, error) {
 	return w.body.Write(p)
 }
 
+// controlWS handles the long-lived control connection used for node updates.
 func (s *server) controlWS(ws *websocket.Conn) {
 	credential := ws.Request().Header.Get("X-Mesh-Token")
 	if credential == "" {
@@ -661,6 +664,7 @@ func (c *controlClient) send(frame controlFrame) error {
 
 // pushTopologies sends only to connected nodes, so a topology change becomes
 // visible immediately instead of waiting for a node's periodic refresh.
+// pushTopologies sends refreshed network views to connected nodes.
 func (s *server) pushTopologies() {
 	s.controlMu.Lock()
 	clients := make(map[*controlClient]string, len(s.controls))
@@ -761,6 +765,7 @@ func value(k, d string) string {
 	}
 	return d
 }
+// init opens the database, applies schema setup, and loads server settings.
 func (s *server) init() error {
 	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);`)
 	if err != nil {
@@ -1145,6 +1150,7 @@ func (s *server) adminAuth(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
+// accountRegister creates an account using an authorized one-time invite.
 func (s *server) accountRegister(w http.ResponseWriter, r *http.Request) {
 	if !s.allowAccountAttempt(r) {
 		reply(w, http.StatusTooManyRequests, map[string]string{"error": "too many account attempts; try again later"})
@@ -1242,6 +1248,7 @@ func (s *server) accountRegister(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusCreated, map[string]any{"status": "created", "username": d.Username, "network_token": networkToken})
 }
 
+// accountLogin verifies credentials and starts an authenticated web session.
 func (s *server) accountLogin(w http.ResponseWriter, r *http.Request) {
 	if !s.allowAccountAttempt(r) {
 		reply(w, http.StatusTooManyRequests, map[string]string{"error": "too many account attempts; try again later"})
@@ -1696,6 +1703,7 @@ func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	return nil
 }
 
+// adminTopology returns the authenticated account’s view of its mesh.
 func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAuth(w, r) {
 		return
@@ -2177,6 +2185,7 @@ func allocateVirtual(bits int, used []netip.Prefix) string {
 }
 
 func metricKey(from, to string) string { return from + "\x00" + to }
+// telemetry records link health reported by registered nodes.
 func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
@@ -2561,6 +2570,7 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]string{"status": "ok", "role": input.Role})
 }
 
+// adminGraph validates and saves manually managed mesh links.
 func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAuth(w, r) {
 		return
@@ -2873,6 +2883,7 @@ func (s *server) registeredNode(id string) (*node, sql.NullInt64, sql.NullString
 	return &n, owner, override, nil
 }
 
+// register authenticates a node, assigns its mesh address, and renews its lease.
 func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
@@ -3073,6 +3084,7 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// rendezvousRegister coordinates peer discovery for NAT traversal.
 func (s *server) rendezvousRegister(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Session  string `json:"session"`
@@ -3140,6 +3152,7 @@ func (s *server) rendezvousRegister(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// rendezvousWait holds a request until the matching peer is ready.
 func (s *server) rendezvousWait(w http.ResponseWriter, r *http.Request) {
 	session, id := r.URL.Query().Get("session"), r.URL.Query().Get("id")
 	timeout, err := strconv.Atoi(r.URL.Query().Get("timeout"))
@@ -3258,6 +3271,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 	})
 	return rank
 }
+// links builds the forwarding graph from policy and observed link metrics.
 func (s *server) links(nodes []node) []link {
 	if manual := s.manualLinksForNodes(nodes); len(manual) > 0 {
 		return s.decorateLinks(s.filterBlockedLinks(s.addAutomaticClientLinks(manual, nodes), nodes), nodes)
@@ -3454,6 +3468,7 @@ func max(a, b int) int {
 	}
 	return b
 }
+// bootstrap returns the topology and connection details a node needs to join.
 func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
 		return
@@ -3543,6 +3558,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
 }
 
+// adminForwards lists the service-forwarding rules visible to this account.
 func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
 	// This endpoint is used by the admin UI, so account sessions must be
 	// accepted in addition to the legacy network token. Mutating requests are

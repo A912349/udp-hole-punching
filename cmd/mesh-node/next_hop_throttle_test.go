@@ -1,5 +1,6 @@
 package main
 
+// These tests cover next hop throttle behavior and regression cases.
 import (
 	"encoding/hex"
 	"testing"

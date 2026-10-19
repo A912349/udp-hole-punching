@@ -1,5 +1,7 @@
 //go:build linux || android
 
+// Linux sendmmsg reduces system-call overhead when sending queued datagrams.
+
 package main
 
 import (

@@ -1,5 +1,6 @@
 package main
 
+// These tests cover symmetric behavior and regression cases.
 import "testing"
 
 func TestValidSymmetricSessionID(t *testing.T) {

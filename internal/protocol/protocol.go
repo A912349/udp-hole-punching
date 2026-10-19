@@ -38,7 +38,9 @@ type LinkMeasurement struct {
 	Up     bool    `json:"up"`
 }
 
+// B64Encode encodes bytes using the URL-safe, unpadded format used on the wire.
 func B64Encode(b []byte) string          { return base64.RawURLEncoding.EncodeToString(b) }
+// B64Decode decodes the URL-safe, unpadded representation used by B64Encode.
 func B64Decode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
 // CanonicalJSON is deliberately compatible with Python json.dumps(sort_keys=True,
@@ -53,11 +55,13 @@ func CanonicalJSON(v any) ([]byte, error) {
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n")), nil
 }
 
+// NodeID derives a stable identifier from a serialized public key.
 func NodeID(publicDER []byte) string {
 	s := sha256.Sum256(publicDER)
 	return hex.EncodeToString(s[:16])
 }
 
+// Identity holds a node key pair and its public, shareable representation.
 type Identity struct {
 	Private   *ecdh.PrivateKey
 	PublicDER []byte
@@ -65,6 +69,7 @@ type Identity struct {
 	ID        string
 }
 
+// NewIdentity creates a fresh X25519 identity for a mesh node.
 func NewIdentity() (*Identity, error) {
 	p, err := ecdh.X25519().GenerateKey(rand.Reader)
 	if err != nil {
@@ -72,6 +77,7 @@ func NewIdentity() (*Identity, error) {
 	}
 	return IdentityFromPrivate(p)
 }
+// IdentityFromPrivate derives the public identity fields from an existing key.
 func IdentityFromPrivate(p *ecdh.PrivateKey) (*Identity, error) {
 	pub, err := x509.MarshalPKIXPublicKey(p.PublicKey())
 	if err != nil {
@@ -79,6 +85,7 @@ func IdentityFromPrivate(p *ecdh.PrivateKey) (*Identity, error) {
 	}
 	return &Identity{Private: p, PublicDER: pub, Public: B64Encode(pub), ID: NodeID(pub)}, nil
 }
+// ParsePrivateDER loads and validates a serialized X25519 private key.
 func ParsePrivateDER(b []byte) (*Identity, error) {
 	v, err := x509.ParsePKCS8PrivateKey(b)
 	if err != nil {
@@ -92,6 +99,7 @@ func ParsePrivateDER(b []byte) (*Identity, error) {
 }
 func MarshalPrivateDER(i *Identity) ([]byte, error) { return x509.MarshalPKCS8PrivateKey(i.Private) }
 
+// SharedKey derives the symmetric peer key from the local and remote X25519 keys.
 func SharedKey(private *ecdh.PrivateKey, peerPublic string) ([]byte, error) {
 	b, err := B64Decode(peerPublic)
 	if err != nil {
@@ -115,6 +123,7 @@ func SharedKey(private *ecdh.PrivateKey, peerPublic string) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
+// Seal encrypts data and returns its nonce, ciphertext, and authentication tag.
 func Seal(key, plaintext, aad []byte) (map[string]string, error) {
 	a, err := chacha20poly1305.New(key)
 	if err != nil {
@@ -128,6 +137,7 @@ func Seal(key, plaintext, aad []byte) (map[string]string, error) {
 	tagAt := len(out) - a.Overhead()
 	return map[string]string{"nonce": B64Encode(nonce), "ciphertext": B64Encode(out[:tagAt]), "tag": B64Encode(out[tagAt:])}, nil
 }
+// Open validates and decrypts the fields produced by Seal.
 func Open(key []byte, sealed map[string]string, aad []byte) ([]byte, error) {
 	n, e1 := B64Decode(sealed["nonce"])
 	c, e2 := B64Decode(sealed["ciphertext"])
@@ -249,6 +259,7 @@ func OpenBytesWithAEAD(a cipher.AEAD, sealed, aad []byte) ([]byte, error) {
 
 func NewAEAD(key []byte) (cipher.AEAD, error) { return chacha20poly1305.New(key) }
 
+// Packet is the common control-message representation used by the overlay.
 type Packet struct {
 	Type        string         `json:"type"`
 	Source      string         `json:"src"`
@@ -259,6 +270,7 @@ type Packet struct {
 	Timestamp   int64          `json:"ts"`
 }
 
+// NewPacket creates a packet with a random ID, default hop limit, and timestamp.
 func NewPacket(typ, src, dst string, payload map[string]any) Packet {
 	b := make([]byte, 12)
 	rand.Read(b)
@@ -289,6 +301,7 @@ func EncodePacket(p Packet, networkKey []byte) ([]byte, error) {
 	}
 	return out, err
 }
+// DecodePacket verifies the network MAC and validates a JSON packet envelope.
 func DecodePacket(data, networkKey []byte) (Packet, error) {
 	if len(data) > MaxDatagramSize {
 		return Packet{}, fmt.Errorf("%w: packet exceeds limit", ErrProtocol)

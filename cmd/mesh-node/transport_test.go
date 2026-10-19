@@ -1,5 +1,6 @@
 package main
 
+// These tests cover transport behavior and regression cases.
 import (
 	"context"
 	"net"

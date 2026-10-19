@@ -2,6 +2,7 @@
 
 package main
 
+// These tests cover tun linux behavior and regression cases.
 import (
 	"bytes"
 	"os"

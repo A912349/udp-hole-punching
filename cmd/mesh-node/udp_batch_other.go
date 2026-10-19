@@ -1,5 +1,7 @@
 //go:build !linux && !android
 
+// Other platforms use the same reader interface with one datagram per call.
+
 package main
 
 import (

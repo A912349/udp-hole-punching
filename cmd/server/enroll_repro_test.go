@@ -1,5 +1,6 @@
 package main
 
+// These tests cover enroll repro behavior and regression cases.
 import (
 	"encoding/json"
 	"net/http"

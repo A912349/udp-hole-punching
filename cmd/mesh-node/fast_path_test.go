@@ -1,5 +1,6 @@
 package main
 
+// These tests cover fast path behavior and regression cases.
 import (
 	"bytes"
 	"encoding/binary"

@@ -1,5 +1,6 @@
 package main
 
+// These tests cover hardening behavior and regression cases.
 import (
 	"encoding/json"
 	"net/http"

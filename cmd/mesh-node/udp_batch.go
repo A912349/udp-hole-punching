@@ -1,3 +1,5 @@
+// Package main uses these shared datagram types to batch UDP I/O where the platform supports it.
+
 package main
 
 import "net"

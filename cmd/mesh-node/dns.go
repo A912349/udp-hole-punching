@@ -1,3 +1,5 @@
+// This file serves mesh DNS records and forwards other queries to the host resolver.
+
 package main
 
 import (

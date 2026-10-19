@@ -1,3 +1,5 @@
+// This file queues outgoing datagrams and sends them through a single bounded worker.
+
 package main
 
 import (

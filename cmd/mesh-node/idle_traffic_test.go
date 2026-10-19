@@ -1,5 +1,6 @@
 package main
 
+// These tests cover idle traffic behavior and regression cases.
 import (
 	"net"
 	"net/netip"

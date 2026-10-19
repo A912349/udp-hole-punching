@@ -1,3 +1,5 @@
+// This file defines the small TUN interface shared by platform backends.
+
 package main
 
 import "io"

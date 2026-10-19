@@ -319,6 +319,7 @@ type node struct {
 	edgeRetries         map[string]bool
 }
 
+// main loads configuration, connects to the coordinator, and runs the mesh node.
 func main() {
 	for _, arg := range os.Args[1:] {
 		if arg == "--add-autostart" || arg == "--del-autostart" {
@@ -422,6 +423,7 @@ func (n *node) debugStartupNetwork() {
 		}
 	}
 }
+// parse reads command-line options and returns the node configuration.
 func parse() config {
 	var c config
 	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
@@ -643,6 +645,7 @@ func askInteractiveConfig() config {
 	c.role = ask("Role (auto/client/superpeer)", "auto")
 	return c
 }
+// loadIdentity loads the persistent node key, creating one on first use.
 func loadIdentity(dir string) (*protocol.Identity, error) {
 	if b, e := os.ReadFile(dir); e == nil {
 		var x struct {
@@ -720,6 +723,7 @@ func createUnifiedIdentity(path string) (*protocol.Identity, error) {
 	}
 	return i, os.WriteFile(path, encoded, 0600)
 }
+// newNode initializes runtime state and network resources from configuration.
 func newNode(c config) (*node, error) {
 	id, e := loadIdentity(c.state)
 	if e != nil {
@@ -831,6 +835,7 @@ type controlFrame struct {
 	Event  string          `json:"event,omitempty"`
 }
 
+// connectControl opens the persistent WebSocket used for coordinator events.
 func (n *node) connectControl() (bool, error) {
 	if n.control != nil {
 		return false, nil
@@ -1222,6 +1227,7 @@ func endpointIPChanged(previous, next string) bool {
 	return previous == "" || endpointIP(previous) != endpointIP(next)
 }
 
+// register announces this node and refreshes its coordinator lease.
 func (n *node) register() error {
 	r := map[string]any{"node_id": n.id.ID, "public_key": n.id.Public, "nat_type": n.c.nat, "role": n.requestedRole, "relay_capable": !n.c.noRelay, "endpoint": n.c.endpoint, "capacity": n.c.capacity, "mesh_ip": n.c.meshIP}
 	// Piggyback link measurements on the heartbeat so the coordinator keeps
@@ -1288,6 +1294,7 @@ func (n *node) register() error {
 	}
 	return nil
 }
+// bootstrap fetches the current peer list and forwarding topology.
 func (n *node) bootstrap() error {
 	n.mu.RLock()
 	version := n.topologyVersion
@@ -1319,6 +1326,7 @@ func (n *node) bootstrap() error {
 	n.applyTopology(t)
 	return nil
 }
+// applyTopology updates peer state and routes from a coordinator snapshot.
 func (n *node) applyTopology(t topology) {
 	n.mu.RLock()
 	// A push may have installed a newer view while a conditional request
@@ -1599,6 +1607,7 @@ func (p pq) Less(i, j int) bool { return p[i].cost < p[j].cost }
 func (p pq) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 func (p *pq) Push(x any)        { *p = append(*p, x.(qitem)) }
 func (p *pq) Pop() any          { x := (*p)[len(*p)-1]; *p = (*p)[:len(*p)-1]; return x }
+// buildRoutes computes the lowest-cost next hop to each reachable node.
 func (n *node) buildRoutes() map[string]string {
 	adj := map[string][]qitem{}
 	for _, e := range n.links {
@@ -1645,6 +1654,7 @@ func (n *node) buildRoutes() map[string]string {
 	}
 	return out
 }
+// start brings up transports, discovery, packet workers, and health loops.
 func (n *node) start() error {
 	if n.c.endpoint == "" {
 		n.logf("detecting public UDP endpoint via STUN")
@@ -1773,6 +1783,7 @@ func (n *node) start() error {
 // establishSymmetricTransport establishes one UDP mapping per superpeer. A
 // symmetric NAT allocates a mapping per destination, so a single selected
 // socket cannot serve all superpeers.
+// establishSymmetricTransport opens per-relay UDP mappings for symmetric NAT.
 func (n *node) establishSymmetricTransport() bool {
 	// Cone (and open) NATs use the normal UDP socket.  They must not enter the
 	// symmetric scan below: it intentionally creates per-superpeer sockets.
@@ -2164,6 +2175,7 @@ func (n *node) startSymmetricScan(peerID, endpoint, sessionID string, force bool
 	go n.scanSymmetricNeighbor(peerID, endpoint, sessionID, cancel)
 }
 
+// scanSymmetricNeighbor probes likely external ports until the peer responds.
 func (n *node) scanSymmetricNeighbor(peerID, endpoint, sessionID string, cancel chan struct{}) {
 	// A full symmetric-NAT port scan is intentionally broad. Bound concurrent
 	// scans so several newly discovered peers cannot monopolize CPU and UDP
@@ -2278,7 +2290,7 @@ func (n *node) completeSymmetricScan(peerID, sessionID string) {
 
 	cancel := n.symmetricScans[peerID]
 	if cancel == nil || n.symmetricSessions[peerID] != sessionID {
-		// Обычный HELLO_ACK не доказывает успешный symmetric scan.
+		// A normal HELLO_ACK does not prove that the symmetric scan succeeded.
 		return
 	}
 
@@ -2434,6 +2446,7 @@ func (n *node) periodic(ctx context.Context, d time.Duration, f func()) {
 // endpoint candidate. Public STUN endpoints are not guaranteed to support
 // NAT hairpinning, so two machines on one LAN must not be forced through the
 // public address of their router.
+// startLANDiscovery listens for nearby peers that can use a direct LAN path.
 func (n *node) startLANDiscovery(ctx context.Context) error {
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: lanDiscoveryPort})
 	if err != nil {
@@ -2714,6 +2727,7 @@ func (n *node) deferRecovery(err error, action string) {
 	n.logf("%s: %v; retrying in %s", action, err, backoff)
 }
 
+// recoverNetwork rebuilds local connectivity after all neighbor paths go stale.
 func (n *node) recoverNetwork() {
 	n.mu.RLock()
 	stale := len(n.neighbors) > 0
@@ -2928,6 +2942,7 @@ func (n *node) currentLinks() []protocol.LinkMeasurement {
 // any change is still reported within one telemetryInterval, so monitoring
 // responsiveness is unchanged. Fresh RTT for every link also arrives with
 // each register heartbeat.
+// reportTelemetry sends current link health to the coordinator when needed.
 func (n *node) reportTelemetry() error {
 	links := n.currentLinks()
 	n.telemetryMu.Lock()
@@ -2999,6 +3014,7 @@ func (n *node) send(p protocol.Packet) bool {
 	return e == nil
 }
 
+// nextHop selects a cached or newly computed route for a destination.
 func (n *node) nextHop(destination string) (string, *peer) {
 	n.mu.RLock()
 	hop := n.routes[destination]
@@ -3279,6 +3295,7 @@ func (n *node) enqueueFast(data []byte, addr *net.UDPAddr) {
 	}
 }
 
+// receive starts readers for every active UDP socket.
 func (n *node) receive(ctx context.Context) {
 	n.receiveMu.Lock()
 	n.receiveCtx = ctx
@@ -3377,6 +3394,7 @@ func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
 	}
 }
 
+// handleDatagram authenticates and dispatches one received UDP packet.
 func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
 		n.enqueueFast(datagram, address)
@@ -4102,6 +4120,7 @@ func fastAAD(dst, peerAAD, packetID []byte) []byte {
 // nonce | ciphertext | AEAD tag. Destinations authenticate the packet ID
 // before modifying their duplicate cache. Relays cannot verify this tag:
 // forwarding and mutable TTL are NOT authenticated by this envelope.
+// fast handles the compact encrypted data-plane frame.
 func (n *node) fast(data []byte, a *net.UDPAddr) {
 	if len(data) < fastHeader+28 || len(data) > maxFastFrame {
 		n.debugf("drop fast frame from %s: invalid size (%d bytes)", a, len(data))
@@ -4172,6 +4191,7 @@ func (n *node) sendFastMode(dst string, data []byte, wait bool) bool {
 	copy(owned, data)
 	return n.enqueueUDP(outboundDatagram{conn: conn, data: owned, address: address}, wait)
 }
+// tunLoop reads IP packets from the host and injects received packets back.
 func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
 	// Read a complete native packet before applying the overlay MTU policy.
@@ -4278,6 +4298,7 @@ func (n *node) isTUNBroadcast(addr netip.Addr) bool {
 	}
 	return true
 }
+// sendIP encrypts a TUN packet and forwards it toward its mesh destination.
 func (n *node) sendIP(dst string, p []byte) bool {
 	if len(p) > maxTUN {
 		return false
@@ -4513,6 +4534,7 @@ func min(a, b int) int {
 	}
 	return b
 }
+// stunEndpoint queries available STUN servers to discover the public UDP mapping.
 func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr), bootstrap ...string) (string, string, error) {
 	// STUN shares the node's UDP socket with the receive loop. Always restore
 	// the socket deadline so a probe cannot leave the data plane with a stale

@@ -1,5 +1,6 @@
 package main
 
+// These tests cover control rebind behavior and regression cases.
 import (
 	"encoding/json"
 	"net/http"

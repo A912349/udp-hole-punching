@@ -1,5 +1,6 @@
 package main
 
+// These tests cover udp backpressure behavior and regression cases.
 import (
 	"context"
 	"testing"

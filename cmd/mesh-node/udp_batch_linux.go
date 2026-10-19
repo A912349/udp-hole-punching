@@ -1,5 +1,7 @@
 //go:build linux || android
 
+// Linux uses recvmmsg to receive several datagrams per system call.
+
 package main
 
 import (

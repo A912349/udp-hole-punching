@@ -1,5 +1,6 @@
 package main
 
+// These tests cover fast security behavior and regression cases.
 import (
 	"context"
 	"encoding/binary"

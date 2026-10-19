@@ -1,5 +1,6 @@
 package main
 
+// These tests cover auth behavior and regression cases.
 import (
 	"database/sql"
 	"encoding/json"

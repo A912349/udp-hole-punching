@@ -1,5 +1,6 @@
 package main
 
+// These tests cover hotpath bench behavior and regression cases.
 import (
 	"crypto/hmac"
 	"crypto/sha256"
