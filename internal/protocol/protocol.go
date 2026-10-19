@@ -130,6 +130,11 @@ func Open(key []byte, sealed map[string]string, aad []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	// AEAD.Open panics on a wrong nonce length; malformed wire input must
+	// return an error instead. Require the separately encoded tag as well.
+	if len(n) != a.NonceSize() || len(t) != a.Overhead() {
+		return nil, fmt.Errorf("%w: invalid nonce or tag length", ErrProtocol)
+	}
 	return a.Open(nil, n, append(c, t...), aad)
 }
 func SealBytes(key, plaintext, aad []byte) ([]byte, error) {

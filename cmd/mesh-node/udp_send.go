@@ -2,11 +2,33 @@ package main
 
 import (
 	"context"
+	"io"
 	"net"
 )
 
 type udpBatchWriter interface {
 	write([]outboundDatagram) (int, error)
+}
+
+// writeUDPBatch retries a successful short batch write (sendmmsg can send
+// fewer datagrams than requested). Do not retry errors or zero progress:
+// either could otherwise pin the single sender in an unbounded loop.
+func writeUDPBatch(writer udpBatchWriter, batch []outboundDatagram) (int, error) {
+	total := 0
+	for total < len(batch) {
+		sent, err := writer.write(batch[total:])
+		if sent < 0 || sent > len(batch)-total {
+			return total, io.ErrShortWrite
+		}
+		total += sent
+		if err != nil {
+			return total, err
+		}
+		if sent == 0 {
+			return total, io.ErrNoProgress
+		}
+	}
+	return total, nil
 }
 
 func (n *node) startUDPSender(ctx context.Context) {
@@ -54,7 +76,7 @@ func (n *node) startUDPSender(ctx context.Context) {
 					writer = newUDPBatchWriter(conn)
 					writers[conn] = writer
 				}
-				sent, err := writer.write(frames)
+				sent, err := writeUDPBatch(writer, frames)
 				for i := 0; i < sent; i++ {
 					n.stats.sentPackets.Add(1)
 					n.stats.sentBytes.Add(uint64(len(frames[i].data)))
