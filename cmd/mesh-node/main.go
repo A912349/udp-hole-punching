@@ -59,6 +59,12 @@ const (
 	// STUN take the exclusive udpReadMu lock (see receiveSocket).
 	udpReadWindow      = 1 * time.Second
 	linkGrace          = 20 * time.Second
+	// Bounded retries for the post-reconnect endpoint check: right after a
+	// radio transition (LTE <-> Wi-Fi, doze resume) DNS and STUN often need a
+	// few seconds to become usable, and a single failed check used to leave
+	// the node advertising a stale endpoint until the next disconnect.
+	endpointRefreshRetries    = 4
+	endpointRefreshRetryDelay = 5 * time.Second
 	recoveryMinBackoff = 10 * time.Second
 	recoveryMaxBackoff = 5 * time.Minute
 	stunProbeTimeout   = 2 * time.Second
@@ -1150,17 +1156,33 @@ func (n *node) request(method, path string, in, out any) error {
 // UDP socket is used because Android may keep the old socket on Wi-Fi after a
 // switch to LTE.
 func (n *node) refreshEndpointAfterControlReconnect() {
+	n.refreshEndpointAttempt(1)
+}
+
+// refreshEndpointAttempt re-checks the public UDP endpoint after a control
+// reconnect. Failures are retried with a fixed delay up to
+// endpointRefreshRetries times; recoveryMu.TryLock keeps overlapping
+// attempts (late retries vs. a newer reconnect) mutually exclusive.
+func (n *node) refreshEndpointAttempt(attempt int) {
 	if !n.recoveryMu.TryLock() {
 		return
 	}
 	defer n.recoveryMu.Unlock()
+	retry := func(stage string, err error) {
+		n.logf("control reconnect: %s: %v", stage, err)
+		if attempt < endpointRefreshRetries {
+			time.AfterFunc(endpointRefreshRetryDelay, func() {
+				n.refreshEndpointAttempt(attempt + 1)
+			})
+		}
+	}
 	if err := n.rebindUDPConn(); err != nil {
-		n.logf("control reconnect: UDP rebind failed: %v", err)
+		retry("UDP rebind failed", err)
 		return
 	}
 	endpoint, nat, err := n.detectEndpoint()
 	if err != nil {
-		n.logf("control reconnect: STUN check failed: %v", err)
+		retry("STUN check failed", err)
 		return
 	}
 	previousEndpoint := n.c.endpoint
@@ -1180,7 +1202,13 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 		if n.requestedNAT == "auto" {
 			n.c.nat = nat
 		}
+		// helloAll deliberately skips peers that still look usable, but a NAT
+		// rebind invalidated exactly those paths: they point at the dead
+		// mapping. A ping round through the new socket lets every peer
+		// relearn the source port at once instead of waiting up to a whole
+		// keepalive interval (mobile NAT mappings are short-lived).
 		n.helloAll()
+		n.pingAll()
 		return
 	}
 	// The old UDP mapping is tied to the previous network. Clear all cached
