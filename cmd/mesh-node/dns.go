@@ -40,6 +40,9 @@ func dnsAnswer(query []byte, questionEnd int, ip net.IP) []byte {
 	out := append([]byte(nil), query[:questionEnd]...)
 	binary.BigEndian.PutUint16(out[2:4], 0x8180)
 	binary.BigEndian.PutUint16(out[6:8], 1)
+	// Only the question was copied. Authority/additional records (including
+	// EDNS OPT) are not present in this response, so their counts must be zero.
+	clear(out[8:12])
 	out = append(out, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 30, 0, 4)
 	out = append(out, ip.To4()...)
 	return out
@@ -107,11 +110,6 @@ func (n *node) serveDNS(ctx context.Context) {
 		n.logf("DNS disabled: %v", err)
 		return
 	}
-	defer listener.Close()
-	go func() {
-		<-ctx.Done()
-		listener.Close()
-	}()
 	n.mu.RLock()
 	upstream := n.dnsUpstream
 	n.mu.RUnlock()
@@ -122,10 +120,32 @@ func (n *node) serveDNS(ctx context.Context) {
 		upstream = systemResolver()
 	}
 	n.logf("DNS listening on %s, upstream %s", listener.LocalAddr(), upstream)
-	go n.serveDNSListener(ctx, listener)
-	if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget, n.tunLUID); err != nil {
-		n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, dnsTarget)
-	}
+	n.runDNSListener(ctx, listener, func() {
+		if err := configureSystemDNS(n.c.tun, n.c.meshIP, dnsTarget, n.tunLUID); err != nil {
+			n.logf("automatic DNS integration unavailable: %v (configure resolver to use %s)", err, dnsTarget)
+		}
+	})
+}
+
+// Keep the socket alive after setup, and close it on cancellation to unblock
+// ReadFrom. Setup runs while queries can already be served, since installing
+// the system resolver may itself trigger DNS traffic.
+func (n *node) runDNSListener(ctx context.Context, listener net.PacketConn, setup func()) {
+	defer listener.Close()
+	stopped := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+		case <-stopped:
+		}
+	}()
+	go func() {
+		defer close(stopped)
+		n.serveDNSListener(ctx, listener)
+	}()
+	setup()
+	<-stopped
 }
 
 // openDNSListener prefers the node's unique mesh address. The old design also

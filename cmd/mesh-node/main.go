@@ -171,6 +171,7 @@ type cachedKey struct {
 	sealAAD []byte
 }
 type reassembly struct {
+	totalBytes int
 	count      uint16
 	chunks     map[uint16][]byte
 	receivedAt time.Time
@@ -3572,7 +3573,7 @@ func (n *node) acceptIPFragment(source string, plain []byte) {
 }
 
 func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
-	if len(plain) < 12 {
+	if len(plain) < 12 || len(plain)-12 > maxTUN {
 		return
 	}
 	fragmentID := plain[:8]
@@ -3605,12 +3606,22 @@ func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 		delete(n.reassembly, stateID)
 		return
 	}
+	if _, exists := state.chunks[index]; exists {
+		// First authenticated fragment wins. Duplicates neither allocate nor
+		// keep an incomplete assembly alive indefinitely.
+		return
+	}
+	if len(plain)-12 > maxTUN-state.totalBytes {
+		delete(n.reassembly, stateID)
+		return
+	}
 	state.chunks[index] = append([]byte(nil), plain[12:]...)
+	state.totalBytes += len(plain) - 12
 	state.receivedAt = now
 	if len(state.chunks) != int(count) {
 		return
 	}
-	packet := make([]byte, 0)
+	packet := make([]byte, 0, state.totalBytes)
 	for part := uint16(0); part < count; part++ {
 		chunk, ok := state.chunks[part]
 		if !ok {
