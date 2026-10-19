@@ -58,10 +58,8 @@ func newBenchNode(id *protocol.Identity, tun *benchTUN, meshIP netip.Addr, conn 
 func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 	key, _ := protocol.SharedKey(a.id.Private, b.id.Public)
 	aead, _ := protocol.NewAEAD(key)
-	aNonces, _ := protocol.NewNonceSequence()
-	bNonces, _ := protocol.NewNonceSequence()
 
-	wire := func(self, other *node, otherAddr *net.UDPAddr, nonces *protocol.NonceSequence) {
+	wire := func(self, other *node, otherAddr *net.UDPAddr) {
 		var peerID [16]byte
 		decoded, _ := hex.DecodeString(other.id.ID)
 		copy(peerID[:], decoded)
@@ -74,7 +72,6 @@ func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 			public:  other.id.Public,
 			key:     key,
 			aead:    aead,
-			nonces:  nonces,
 			peerID:  peerID,
 			sealAAD: []byte(self.id.ID + ":" + other.id.ID),
 			openAAD: []byte(other.id.ID + ":" + self.id.ID),
@@ -82,8 +79,8 @@ func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 		self.startFastWorkers(ctx)
 		self.startDeliverWorker(ctx)
 	}
-	wire(a, b, addrB, aNonces)
-	wire(b, a, addrA, bNonces)
+	wire(a, b, addrB)
+	wire(b, a, addrA)
 }
 
 // BenchmarkTwoNodeDataPlane pumps fixed-size IP packets from node A through
