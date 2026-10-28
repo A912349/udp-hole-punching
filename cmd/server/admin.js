@@ -9,11 +9,11 @@
   if (access) {
     const tokenCard = document.createElement('article');
     tokenCard.className = 'card';
-    tokenCard.innerHTML = '<h2>Your network token</h2><p class="muted">Use this separate token with <code>mesh-node --network-token</code>. It is shown after registration or rotation.</p><button id="rotateAccountToken">Rotate token</button><div id="accountNetworkToken" class="inviteCode">—</div>';
+    tokenCard.innerHTML = '<h2>Your network token</h2><p class="muted">Use this separate token with <code>mesh-node --network-token</code>. It is shown after registration or rotation.</p><button id="rotateAccountToken">Rotate token</button><div id="accountNetworkToken" class="inviteCode long">—</div><button class="ghost copyBtn" data-copy-target="accountNetworkToken">Copy token</button>';
     access.appendChild(tokenCard);
     const card = document.createElement('article');
     card.className = 'card';
-    card.innerHTML = '<h2>Invite another account</h2><p class="muted">One-use invitation, valid for 24 hours. The raw token is shown once.</p><button id="createAccountInvite">Generate account invite</button><div id="newAccountInvite" class="inviteCode">—</div>';
+    card.innerHTML = '<h2>Invite another account</h2><p class="muted">One-use invitation, valid for 24 hours. The raw token is shown once.</p><button id="createAccountInvite">Generate account invite</button><div id="newAccountInvite" class="inviteCode long">—</div><button class="ghost copyBtn" data-copy-target="newAccountInvite">Copy invite</button>';
     access.appendChild(card);
     const list = document.createElement('article');
     list.className = 'card';
@@ -50,10 +50,20 @@ let graphUI = {
   positions: {},
   source: null,
   selectedNode: null,
-  selectedEdge: null
+  selectedEdge: null,
+  view: null,
+  lastSig: null,
+  dragging: null,
+  viewSaveTimer: null
 };
 const graphPositionsCookie = 'mesh_graph_positions',
-  graphPositionsStorage = 'meshGraphPositions';
+  graphPositionsStorage = 'meshGraphPositions',
+  VIEW_W = 1100,
+  VIEW_H = 600,
+  GRID_STEP = 28,
+  viewStorage = 'meshGraphView',
+  MIN_ZOOM = 0.15,
+  MAX_ZOOM = 4;
 
 function loadGraphPositions() {
   let raw = cookieValue(graphPositionsCookie);
@@ -69,8 +79,8 @@ function loadGraphPositions() {
       let x = Number(p?.x),
         y = Number(p?.y);
       if (Number.isFinite(x) && Number.isFinite(y)) graphUI.positions[id] = {
-        x: Math.max(30, Math.min(1070, x)),
-        y: Math.max(30, Math.min(570, y))
+        x,
+        y
       };
     });
   } catch (e) {}
@@ -92,6 +102,101 @@ function saveGraphPositions() {
   } catch (e) {}
 }
 loadGraphPositions();
+
+function loadView() {
+  try {
+    let v = JSON.parse(localStorage.getItem(viewStorage) || 'null');
+    if (v && Number.isFinite(v.k) && Number.isFinite(v.x) && Number.isFinite(v.y) && v.k >= MIN_ZOOM && v.k <= MAX_ZOOM) return {
+      k: v.k,
+      x: v.x,
+      y: v.y
+    };
+  } catch (e) {}
+  return null;
+}
+
+function saveView() {
+  if (!graphUI.view) return;
+  try {
+    localStorage.setItem(viewStorage, JSON.stringify(graphUI.view))
+  } catch (e) {}
+}
+
+// applyView mirrors the viewport transform onto the dot grid backdrop so the
+// canvas feels infinite: the grid moves and scales with pan/zoom.
+function applyView() {
+  let v = graphUI.view;
+  if (!v) return;
+  let g = document.querySelector('#graphViewport');
+  if (g) g.setAttribute('transform', `translate(${v.x} ${v.y}) scale(${v.k})`);
+  let svg = $('topologyGraph');
+  if (svg && svg.clientWidth > 0 && svg.clientHeight > 0) {
+    let s = Math.min(svg.clientWidth / VIEW_W, svg.clientHeight / VIEW_H),
+      ox = (svg.clientWidth - VIEW_W * s) / 2,
+      oy = (svg.clientHeight - VIEW_H * s) / 2;
+    svg.style.backgroundSize = `${GRID_STEP * v.k * s}px ${GRID_STEP * v.k * s}px, 100% 100%`;
+    svg.style.backgroundPosition = `${ox + v.x * s}px ${oy + v.y * s}px, 0 0`;
+  }
+  let level = $('zoomLevel');
+  if (level) level.textContent = Math.round(v.k * 100) + '%';
+  clearTimeout(graphUI.viewSaveTimer);
+  graphUI.viewSaveTimer = setTimeout(saveView, 300);
+}
+
+// fitView centers and scales the viewport so every current peer is visible.
+function fitView() {
+  let pts = (state.topology.nodes || []).map(n => graphUI.positions[n.node_id]).filter(Boolean);
+  if (!pts.length) {
+    graphUI.view = {
+      k: 1,
+      x: 0,
+      y: 0
+    };
+  } else {
+    let minX = Math.min(...pts.map(p => p.x)),
+      maxX = Math.max(...pts.map(p => p.x)),
+      minY = Math.min(...pts.map(p => p.y)),
+      maxY = Math.max(...pts.map(p => p.y));
+    let k = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.min(VIEW_W / (maxX - minX + 180), VIEW_H / (maxY - minY + 160), 1.5)));
+    graphUI.view = {
+      k,
+      x: VIEW_W / 2 - (minX + maxX) / 2 * k,
+      y: VIEW_H / 2 - (minY + maxY) / 2 * k
+    };
+  }
+  applyView();
+}
+
+// zoomAt scales the view while keeping the point (px,py) under the cursor.
+function zoomAt(px, py, factor) {
+  let v = graphUI.view || (graphUI.view = {
+    k: 1,
+    x: 0,
+    y: 0
+  });
+  let k = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, v.k * factor));
+  if (k === v.k) return;
+  v.x = px - (px - v.x) * k / v.k;
+  v.y = py - (py - v.y) * k / v.k;
+  v.k = k;
+  applyView();
+}
+
+// worldPoint converts a pointer event to graph coordinates: screen → viewBox →
+// viewport transform. Peer dragging and background panning both work at any
+// zoom level through this.
+function worldPoint(svg, e) {
+  let p = svgPoint(svg, e);
+  let v = graphUI.view || {
+    k: 1,
+    x: 0,
+    y: 0
+  };
+  return {
+    x: (p.x - v.x) / v.k,
+    y: (p.y - v.y) / v.k
+  };
+}
 const titles = {
   overview: ['Network overview', 'Health and connectivity at a glance'],
   peers: ['Peers', 'Inventory, roles and endpoints'],
@@ -107,6 +212,8 @@ const esc = value => {
   x.textContent = value ?? '';
   return x.innerHTML
 };
+// esc() does not escape quotes; attribute values need this.
+const escAttr = value => esc(value).replace(/"/g, '&quot;');
 const peerLabel = n => n.name || n.node_id.slice(0, 8);
 const peerID = n => n.node_id.slice(0, 8);
 const peerSub = n => duration(n.uptime_seconds) + ' up';
@@ -124,6 +231,25 @@ function toast(text) {
   x.textContent = text;
   x.classList.add('show');
   setTimeout(() => x.classList.remove('show'), 2500)
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+  } catch (e) {
+    // The clipboard API needs a secure context; fall back for plain HTTP.
+    let x = document.createElement('textarea');
+    x.value = text;
+    x.style.position = 'fixed';
+    x.style.opacity = '0';
+    document.body.appendChild(x);
+    x.select();
+    try {
+      document.execCommand('copy')
+    } catch (e2) {}
+    x.remove()
+  }
+  toast('Copied to clipboard')
 }
 async function api(path, options = {}) {
   options.headers = {
@@ -160,9 +286,15 @@ function page(name) {
 document.querySelectorAll('nav button').forEach(x => x.onclick = () => page(x.dataset.page));
 
 function layout(force = false) {
-  let nodes = state.topology.nodes || [],
-    cx = 550,
-    cy = 300,
+  let nodes = state.topology.nodes || [];
+  // New peers join on a ring around the current cloud instead of a fixed
+  // center, so an unbounded canvas keeps the graph compact as it grows.
+  // Only currently registered peers count: stale positions of removed nodes
+  // must not pull the ring off-center.
+  let ids = new Set(nodes.map(n => n.node_id)),
+    placed = Object.entries(graphUI.positions).filter(([id]) => ids.has(id)).map(([, p]) => p),
+    cx = placed.length ? placed.reduce((s, p) => s + p.x, 0) / placed.length : 550,
+    cy = placed.length ? placed.reduce((s, p) => s + p.y, 0) / placed.length : 300,
     R = Math.min(225, 95 + nodes.length * 13);
   nodes.forEach((n, i) => {
     if (force || !graphUI.positions[n.node_id]) {
@@ -204,13 +336,37 @@ function overviewGraph() {
   })
 }
 
-function drawInteractive() {
+// graphSignature fingerprints everything drawInteractive renders. The live
+// refresh re-renders the admin UI every few seconds; skipping identical
+// rebuilds removes flicker and stops topology updates from interrupting
+// hover states or an in-progress peer drag.
+function graphSignature() {
+  let nodes = (state.topology.nodes || []).map(n => {
+      let p = graphUI.positions[n.node_id] || {};
+      return [n.node_id, Math.round((p.x || 0) * 10) / 10, Math.round((p.y || 0) * 10) / 10, n.role, n.nat_type, peerLabel(n), peerSub(n)].join('~');
+    }).sort().join(';'),
+    links = (state.topology.links || []).map(e => [edgeKey(e.a, e.b), e.status, e.via_lan ? 1 : 0, Math.round(e.rtt_ms || 0), Math.round((e.cost || 0) * 100)].join('~')).sort().join(';');
+  return [nodes, links, graphUI.source, graphUI.selectedNode, graphUI.selectedEdge].join('|');
+}
+
+function drawInteractive(force = false) {
   layout();
+  if (!graphUI.view && (state.topology.nodes || []).length) fitView();
+  if (graphUI.dragging) {
+    updateMode();
+    return
+  }
+  let sig = graphSignature();
+  if (!force && sig === graphUI.lastSig) {
+    updateMode();
+    return
+  }
+  graphUI.lastSig = sig;
   let svg = $('topologyGraph'),
     nodes = state.topology.nodes || [],
     links = state.topology.links || [],
     manual = new Map((state.manualLinks || []).map(e => [edgeKey(e.a, e.b), e]));
-  svg.innerHTML = links.map(e => {
+  let edges = links.map(e => {
     let a = graphUI.positions[e.a],
       b = graphUI.positions[e.b],
       key = edgeKey(e.a, e.b);
@@ -219,9 +375,13 @@ function drawInteractive() {
       cost = e.cost ? `cost ${Number(e.cost).toFixed(2)}` : 'cost —',
       rtt = e.rtt_ms ? `ping ${Math.round(e.rtt_ms)} ms` : 'ping —',
       path = e.via_lan ? 'LAN' : 'internet',
-      label = `${path} · ${rtt} · ${cost}`;
-    return `<g class="edgeGroup ${graphUI.selectedEdge===key?'selected':''}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
-  }).join('') + nodes.map(n => {
+      label = `${path} · ${rtt} · ${cost}`,
+      classes = ['edgeGroup'];
+    if (graphUI.selectedEdge === key) classes.push('selected');
+    if (graphUI.selectedNode && (e.a === graphUI.selectedNode || e.b === graphUI.selectedNode)) classes.push('adjacent');
+    return `<g class="${classes.join(' ')}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
+  }).join('');
+  let peerMarkup = nodes.map(n => {
     let q = graphUI.positions[n.node_id],
       classes = ['peerGroup'];
     if (graphUI.selectedNode === n.node_id) classes.push('selected');
@@ -229,12 +389,13 @@ function drawInteractive() {
     let ring = n.nat_type === 'symmetric' ? '<circle class="sym" r="26"/>' : '';
     return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" y="53">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="66">${esc(peerSub(n))}</text></g>`
   }).join('');
+  svg.innerHTML = `<g id="graphViewport">${edges}${peerMarkup}</g>`;
   svg.querySelectorAll('[data-edge]').forEach(g => g.onclick = e => {
     e.stopPropagation();
     selectEdge(g.dataset.edge)
   });
   svg.querySelectorAll('[data-peer]').forEach(bindPeerDrag);
-  svg.onclick = () => cancelSelection();
+  applyView();
   updateMode()
 }
 
@@ -249,14 +410,15 @@ function bindPeerDrag(g) {
   g.onclick = e => e.stopPropagation();
   g.onpointerdown = e => {
     e.stopPropagation();
-    start = last = svgPoint(svg, e);
+    start = last = worldPoint(svg, e);
     moved = false;
+    graphUI.dragging = g.dataset.peer;
     g.setPointerCapture(e.pointerId);
     g.classList.add('dragging')
   };
   g.onpointermove = e => {
     if (!start) return;
-    last = svgPoint(svg, e);
+    last = worldPoint(svg, e);
     let dx = last.x - start.x,
       dy = last.y - start.y;
     if (Math.hypot(dx, dy) > 4) moved = true;
@@ -266,10 +428,12 @@ function bindPeerDrag(g) {
   g.onpointerup = e => {
     if (!start) return;
     g.classList.remove('dragging');
+    graphUI.dragging = null;
     if (moved) {
+      // The canvas is unbounded: peers may live anywhere on the plane.
       let q = graphUI.positions[g.dataset.peer];
-      q.x = Math.max(30, Math.min(1070, q.x + last.x - start.x));
-      q.y = Math.max(30, Math.min(570, q.y + last.y - start.y));
+      q.x += last.x - start.x;
+      q.y += last.y - start.y;
       saveGraphPositions();
       drawInteractive()
     } else selectNode(g.dataset.peer);
@@ -315,7 +479,7 @@ function renderNodeInspector(n) {
   let box = $('nodeDetail'),
     routes = n.routes || [],
     records = n.dns_records || [];
-  box.innerHTML = `<b>${esc(n.node_id.slice(0,12))}</b><span>${esc(n.mesh_ip)} · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><button id="directRemove" class="dangerButton">Remove peer</button>`;
+  box.innerHTML = `<b class="copyable" data-copy="${escAttr(n.node_id)}" title="Click to copy the full node ID">${esc(n.node_id.slice(0,12))}</b><span><code class="copyable" data-copy="${escAttr(n.mesh_ip)}" title="Click to copy">${esc(n.mesh_ip)}</code> · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><button id="directRemove" class="dangerButton">Remove peer</button>`;
   $('directRole').value = n.requested_role || 'auto';
   $('directRoleSave').onclick = () => setRole(n.node_id, $('directRole').value);
   $('directNetworkSave').onclick = () => setNetwork(n.node_id);
@@ -557,7 +721,7 @@ function render() {
   $('eventPreview').innerHTML = state.audit.slice(0, 5).map(x => `<p><b>${esc(x.event)}</b><br><span class="muted">${new Date(x.created_at*1000).toLocaleString()}</span></p>`).join('');
   renderPeers();
   renderEditor();
-  $('auditRows').innerHTML = state.audit.map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('') || '<tr><td colspan="3" class="muted">No events recorded yet.</td></tr>';
+  renderAudit();
   $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
   for (let k in state.config) {
     let f = $('settingsForm').elements[k];
@@ -566,19 +730,10 @@ function render() {
   $('removePeer').innerHTML = n.map(x => `<option value="${esc(x.node_id)}">${esc(x.node_id.slice(0,12))} · ${esc(x.mesh_ip)}</option>`).join('')
 }
 
-function renderPeers() {
-  // The scoped/live loader refreshes the table directly without calling the
-  // full render(), so keep the navigation badge in sync with the same data.
-  $('peerBadge').textContent = (state.topology.nodes || []).length;
-  let q = $('peerSearch').value.toLowerCase(),
-    role = $('roleFilter').value,
-    nat = $('natFilter').value,
-    n = (state.topology.nodes || []).filter(x => (!role || x.role === role) && (!nat || x.nat_type === nat) && (!q || JSON.stringify(x).toLowerCase().includes(q)));
-  $('peerRows').innerHTML = n.map(x => `<tr><td><span class="statusDot"></span> online</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`).join('');
-  $('peerRows').querySelectorAll('[data-inspect]').forEach(b => b.onclick = () => {
-    page('topology');
-    selectNode(b.dataset.inspect)
-  })
+function renderAudit() {
+  let q = ($('eventSearch').value || '').toLowerCase(),
+    items = state.audit.filter(x => !q || ((x.event || '') + ' ' + (x.detail || '')).toLowerCase().includes(q));
+  $('auditRows').innerHTML = items.map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('') || `<tr><td colspan="3" class="muted">${state.audit.length ? 'Nothing matches the filter.' : 'No events recorded yet.'}</td></tr>`
 }
 
 function renderEditor() {
@@ -630,10 +785,12 @@ async function deleteEdge(i) {
 $('peerSearch').oninput = renderPeers;
 $('roleFilter').onchange = renderPeers;
 $('natFilter').onchange = renderPeers;
+$('eventSearch').oninput = renderAudit;
 $('fitGraph').onclick = () => {
   layout(true);
   saveGraphPositions();
-  drawInteractive()
+  drawInteractive(true);
+  fitView()
 };
 $('cancelGraph').onclick = () => cancelSelection();
 $('settingsForm').onsubmit = async e => {
@@ -808,15 +965,134 @@ $('topologyScope').onchange = e => {
   setScope(e.target.value)
 };
 
+// One delegated listener powers every copy affordance: explicit [data-copy]
+// values, buttons pointing at a [data-copy-target] box, and the one-time codes
+// shown in .inviteCode boxes (setup key lives only 60 seconds — copying must
+// be one click).
+document.body.addEventListener('click', e => {
+  let box = e.target.closest('[data-copy-target]');
+  if (box) {
+    let el = $(box.dataset.copyTarget),
+      v = el ? el.textContent.trim() : '';
+    if (!v || v === '—') return toast('Generate a code first');
+    return copyText(v)
+  }
+  let c = e.target.closest('[data-copy]');
+  if (c) return copyText(c.dataset.copy);
+  let code = e.target.closest('.inviteCode');
+  if (code) {
+    let v = code.textContent.trim();
+    if (v && v !== '—') copyText(v)
+  }
+});
+
+// Keyboard: Enter submits the bare inputs that are not wrapped in a form
+// (network token, account login), Escape leaves graph linking/selection mode.
+$('token').addEventListener('keydown', e => {
+  if (e.key === 'Enter') $('connect').click()
+});
+$('accountUsername').addEventListener('keydown', e => {
+  if (e.key === 'Enter') accountLogin()
+});
+$('accountPassword').addEventListener('keydown', e => {
+  if (e.key === 'Enter') accountLogin()
+});
+$('accountRegistrationInvite').addEventListener('keydown', e => {
+  if (e.key === 'Enter') accountRegister()
+});
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (graphUI.source || graphUI.selectedNode || graphUI.selectedEdge) cancelSelection()
+});
+
+// Infinite graph canvas: wheel zooms around the cursor, dragging the
+// background pans, double-click fits the graph, and the floating controls
+// offer zoom in/out/fit/reset. View state persists across sessions.
+(function bindGraphCanvas() {
+  graphUI.view = loadView();
+  let svg = $('topologyGraph');
+  if (!svg) return;
+  svg.addEventListener('wheel', e => {
+    e.preventDefault();
+    let p = svgPoint(svg, e);
+    zoomAt(p.x, p.y, e.deltaY < 0 ? 1.12 : 1 / 1.12)
+  }, {
+    passive: false
+  });
+  let pan = null;
+  svg.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (e.target.closest('.peerGroup, .edgeGroup')) return;
+    pan = {
+      start: svgPoint(svg, e),
+      view: {
+        ...(graphUI.view || {
+          k: 1,
+          x: 0,
+          y: 0
+        })
+      },
+      moved: false
+    };
+    svg.setPointerCapture(e.pointerId);
+    svg.classList.add('panning')
+  });
+  svg.addEventListener('pointermove', e => {
+    if (!pan) return;
+    let p = svgPoint(svg, e),
+      dx = p.x - pan.start.x,
+      dy = p.y - pan.start.y;
+    if (Math.hypot(dx, dy) > 4) pan.moved = true;
+    graphUI.view = {
+      k: pan.view.k,
+      x: pan.view.x + dx,
+      y: pan.view.y + dy
+    };
+    applyView()
+  });
+  svg.addEventListener('pointerup', () => {
+    if (!pan) return;
+    let moved = pan.moved;
+    pan = null;
+    svg.classList.remove('panning');
+    // A click without movement on empty space clears the selection.
+    if (!moved) cancelSelection()
+  });
+  svg.addEventListener('pointercancel', () => {
+    pan = null;
+    svg.classList.remove('panning')
+  });
+  svg.addEventListener('dblclick', e => {
+    if (e.target.closest('.peerGroup, .edgeGroup')) return;
+    fitView()
+  });
+  $('zoomIn').onclick = () => zoomAt(VIEW_W / 2, VIEW_H / 2, 1.25);
+  $('zoomOut').onclick = () => zoomAt(VIEW_W / 2, VIEW_H / 2, 1 / 1.25);
+  $('zoomFit').onclick = () => fitView();
+  $('zoomReset').onclick = () => {
+    graphUI.view = {
+      k: 1,
+      x: 0,
+      y: 0
+    };
+    applyView()
+  }
+})();
+
 function renderPeers() {
+  // The scoped/live loader refreshes the table directly without calling the
+  // full render(), so keep the navigation badge in sync with the same data.
   $('peerBadge').textContent = (state.topology.nodes || []).length;
   let q = $('peerSearch').value.toLowerCase(),
     role = $('roleFilter').value,
     nat = $('natFilter').value,
     n = (state.topology.nodes || []).filter(x => (!role || x.role === role) && (!nat || x.nat_type === nat) && (!q || JSON.stringify(x).toLowerCase().includes(q)));
+  // Online peers first so offline devices cannot bury the live fleet;
+  // alphabetical inside each group.
+  n = [...n].sort((a, b) => (a.online === false) - (b.online === false) || String(a.name || a.node_id).localeCompare(String(b.name || b.node_id)));
   $('peerRows').innerHTML = n.map(x => {
     let online = x.online !== false;
-    return `<tr><td><span class="statusDot ${online?'online':'offline'}"></span> ${online?'online':'offline'}</td><td><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td>${esc(x.mesh_ip)}</td><td>${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}">Inspect</button></td></tr>`
+    return `<tr${online ? '' : ' class="offlineRow"'}><td><span class="statusDot ${online?'online':'offline'}"></span> ${online?'online':'offline'} · ${esc(peerSub(x))}</td><td title="${escAttr(x.node_id)}"><b>${esc(x.name||x.node_id.slice(0,12))}</b><br><small>${esc((x.routes||[]).map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</small></td><td><span class="chip">${esc(x.role)}</span></td><td>${esc(x.nat_type)}</td><td><code class="copyable" data-copy="${escAttr(x.mesh_ip)}" title="Click to copy">${esc(x.mesh_ip)}</code></td><td title="${escAttr(x.endpoint)}">${esc(x.endpoint)}</td><td>${x.capacity}</td><td><button class="ghost" data-inspect="${esc(x.node_id)}" title="${escAttr(x.node_id)}">Inspect</button></td></tr>`
   }).join('');
   $('peerRows').querySelectorAll('[data-inspect]').forEach(b => b.onclick = () => {
     page('topology');
