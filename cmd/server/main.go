@@ -2738,10 +2738,20 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 			links[i].Status = "unknown"
 			links[i].Cost *= 2
 		}
-		// A LAN path is confirmed per direction by fresh telemetry: traffic
-		// was recently received from the peer's LAN address. One confirmed
-		// direction is enough to draw the edge as a LAN link.
-		links[i].ViaLAN = (freshForward && forward.ViaLAN) || (freshReverse && reverse.ViaLAN)
+		// The edge is drawn as a LAN link only when traffic in BOTH fresh
+		// directions arrived from local addresses. One confirmed direction
+		// decides when the other side has no fresh telemetry; without fresh
+		// telemetry the edge is shown as an internet link.
+		switch {
+		case freshForward && freshReverse:
+			links[i].ViaLAN = forward.ViaLAN && reverse.ViaLAN
+		case freshForward:
+			links[i].ViaLAN = forward.ViaLAN
+		case freshReverse:
+			links[i].ViaLAN = reverse.ViaLAN
+		default:
+			links[i].ViaLAN = false
+		}
 	}
 	return links
 }

@@ -13,26 +13,56 @@ func TestCurrentLinksReportsTrafficConfirmedLAN(t *testing.T) {
 	now := time.Now()
 	lanAddr := &net.UDPAddr{IP: net.IPv4(192, 168, 1, 20), Port: 40000}
 	n := &node{neighbors: map[string]*peer{
-		// Fresh traffic from the peer's LAN address: measured LAN path.
-		"lan-peer": {ID: "lan-peer", lastRX: now, lastLAN: lanAddr, lastLANRX: now},
+		// The most recent datagram arrived from a private address: LAN.
+		"lan-peer": {ID: "lan-peer", lastRX: now, lastLAN: lanAddr, lastLANRX: now, lastPathLAN: true},
 		// Only public-endpoint traffic observed: internet path even if the
 		// peer happens to sit in the same subnet.
 		"wan-peer": {ID: "wan-peer", lastRX: now},
-		// LAN address went stale: the LAN path can no longer be confirmed.
-		"stale-lan": {ID: "stale-lan", lastRX: now, lastLAN: lanAddr, lastLANRX: now.Add(-2 * lanHoldTimeout)},
+		// The peer used to talk over the LAN, but its last packets now come
+		// from public addresses (LAN path died): internet.
+		"roamed-wan": {ID: "roamed-wan", lastRX: now, lastLAN: lanAddr, lastLANRX: now.Add(-2 * lanHoldTimeout)},
 	}}
 	byID := map[string]protocol.LinkMeasurement{}
 	for _, l := range n.currentLinks() {
 		byID[l.PeerID] = l
 	}
 	if !byID["lan-peer"].ViaLAN || !byID["lan-peer"].Up {
-		t.Fatal("fresh LAN traffic must be reported as an up LAN link")
+		t.Fatal("traffic from a private source must be reported as an up LAN link")
 	}
 	if byID["wan-peer"].ViaLAN {
-		t.Fatal("public-endpoint traffic must not be reported as LAN")
+		t.Fatal("public-source traffic must not be reported as LAN")
 	}
-	if byID["stale-lan"].ViaLAN {
-		t.Fatal("stale LAN observation must not be reported as LAN")
+	if byID["roamed-wan"].ViaLAN {
+		t.Fatal("stale LAN observation must not hold the LAN label: the last packets came from public addresses")
+	}
+}
+
+func TestTouchClassifiesByPacketSource(t *testing.T) {
+	n := &node{neighbors: map[string]*peer{
+		"peer": {ID: "peer"},
+	}}
+	// Private source: traffic stayed inside the LAN.
+	n.touch("peer", &net.UDPAddr{IP: net.IPv4(192, 168, 5, 7), Port: 40000})
+	if p := n.neighbors["peer"]; !p.lastPathLAN || p.lastLAN == nil {
+		t.Fatalf("private source must mark the path as LAN: %+v", p)
+	}
+	// Public source: the traffic left the network, label flips immediately.
+	n.touch("peer", &net.UDPAddr{IP: net.IPv4(93, 184, 216, 34), Port: 51000})
+	if p := n.neighbors["peer"]; p.lastPathLAN {
+		t.Fatalf("public source must flip the path to internet: %+v", p)
+	}
+	// CGNAT is the provider network, not the LAN.
+	n2 := &node{neighbors: map[string]*peer{"peer": {ID: "peer"}}}
+	n2.touch("peer", &net.UDPAddr{IP: net.IPv4(100, 64, 1, 2), Port: 40000})
+	if p := n2.neighbors["peer"]; p.lastPathLAN {
+		t.Fatal("CGNAT source must be classified as internet")
+	}
+	// Another private subnet of the same physical LAN counts as LAN even
+	// though the interface subnets do not cover it.
+	n3 := &node{neighbors: map[string]*peer{"peer": {ID: "peer"}}}
+	n3.touch("peer", &net.UDPAddr{IP: net.IPv4(10, 200, 1, 2), Port: 40000})
+	if p := n3.neighbors["peer"]; !p.lastPathLAN {
+		t.Fatal("RFC1918 source from another subnet must be classified as LAN")
 	}
 }
 

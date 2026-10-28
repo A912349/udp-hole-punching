@@ -141,6 +141,7 @@ type peer struct {
 	lastRX     time.Time
 	lastLAN    *net.UDPAddr
 	lastLANRX  time.Time
+	lastPathLAN bool // the most recent datagram arrived from a local address
 	discovered time.Time
 	up         bool
 	rttMS      float64
@@ -1477,6 +1478,7 @@ func (n *node) applyTopology(t topology) {
 			p.discovered = q.discovered
 			p.lastLAN = q.lastLAN
 			p.lastLANRX = q.lastLANRX
+			p.lastPathLAN = q.lastPathLAN
 		}
 		if candidate := n.pendingLAN[p.ID]; candidate != nil {
 			delete(n.pendingLAN, p.ID)
@@ -2681,6 +2683,7 @@ func (n *node) resetTransportState() {
 		peer.lastRX = time.Time{}
 		peer.lastLAN = nil
 		peer.lastLANRX = time.Time{}
+		peer.lastPathLAN = false
 		peer.up = false
 	}
 	n.pendingLAN = map[string]*net.UDPAddr{}
@@ -3253,16 +3256,16 @@ func prunePings(pings map[string]pingProbe, before time.Time) {
 const telemetryKeepalive = 40 * time.Second
 
 // currentLinks snapshots the neighbor observations reported to the coordinator.
-// ViaLAN is the measured result (fresh traffic seen from the peer's LAN
-// address), not a subnet comparison: two nodes can share a subnet and still
-// only be reachable over the WAN, and NAT hairpin traffic arrives from the
-// public address even between same-subnet peers.
+// ViaLAN reflects where the most recent datagram from the peer actually came
+// from: a private/local source address means the traffic stayed inside the
+// LAN, a public source means it crossed the internet (or NAT hairpin, which
+// also leaves the LAN segment through the NAT device). No holdover: the last
+// packet decides.
 func (n *node) currentLinks() []protocol.LinkMeasurement {
-	now := time.Now()
 	n.mu.RLock()
 	links := make([]protocol.LinkMeasurement, 0, len(n.neighbors))
 	for id, p := range n.neighbors {
-		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout, ViaLAN: freshLAN(p, now)})
+		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout, ViaLAN: p.lastPathLAN})
 	}
 	n.mu.RUnlock()
 	return links
@@ -3963,8 +3966,13 @@ func (n *node) localSubnets() []netip.Prefix {
 	return subnets
 }
 
-// isLANAddr reports whether ip belongs to a subnet of a local interface.
-func (n *node) isLANAddr(ip net.IP) bool {
+// localSource reports whether a received datagram's source address means the
+// traffic did not cross the internet: the address is private/link-local (NAT
+// rewrites the source to a public address on any path that leaves the LAN)
+// or belongs to a subnet of a local interface (exotic public ranges used as
+// an unNATted LAN). CGNAT (100.64.0.0/10) and everything else is the
+// internet: the packet came through the provider's network.
+func (n *node) localSource(ip net.IP) bool {
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return false
@@ -3972,6 +3980,9 @@ func (n *node) isLANAddr(ip net.IP) bool {
 	addr = addr.Unmap()
 	if !addr.Is4() {
 		return false
+	}
+	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() {
+		return true
 	}
 	for _, subnet := range n.localSubnets() {
 		if subnet.Contains(addr) {
@@ -4009,28 +4020,32 @@ func (n *node) touch(id string, a net.Addr) {
 	lanSource := false
 	address, isUDP := a.(*net.UDPAddr)
 	if isUDP {
-		lanSource = n.isLANAddr(address.IP)
+		lanSource = n.localSource(address.IP)
 	}
 	now := time.Now()
 	n.mu.Lock()
 	if p := n.neighbors[id]; p != nil {
 		if isUDP {
 			if lanSource {
-				// A LAN address always wins: same-subnet traffic does not
-				// traverse the NAT device at all.
+				// A LAN address always wins for sending: same-segment traffic
+				// does not traverse the NAT device at all.
 				p.lastLAN = copyUDPAddr(address)
 				p.lastLANRX = now
 				p.last = p.lastLAN
 			} else if !freshLAN(p, now) || p.last != net.Addr(p.lastLAN) {
-				// Public source: either a real WAN path or NAT hairpin. Do not
-				// downgrade a current, fresh LAN path because one hairpin
-				// packet happened to arrive; if the LAN path dies, lastLANRX
-				// goes stale and the public address takes over again.
+				// Public source: either a real WAN path or NAT hairpin. The
+				// send target keeps a small hysteresis (below) so one hairpin
+				// datagram does not flip where the next probes are sent.
 				p.last = copyUDPAddr(address)
 			}
 		} else {
 			p.last = a
 		}
+		// Classification is strictly per-packet: the source of the most
+		// recent datagram decides LAN vs internet, with no holdover. NAT
+		// rewrites the source to a public address on any path that leaves
+		// the LAN, so a private source means the traffic stayed local.
+		p.lastPathLAN = lanSource
 		p.lastRX = now
 		p.up = true
 	}
