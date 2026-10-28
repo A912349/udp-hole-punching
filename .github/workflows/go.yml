@@ -98,6 +98,23 @@ jobs:
             -o bin/mesh-node-linux-arm64 \
             ./cmd/mesh-node
 
+      # OpenWrt on MediaTek MT7621 (ramips/mt7621, e.g. Xiaomi CR6608):
+      # MIPS32r2, little-endian, no FPU -> mipsle + softfloat.
+      # The coordinator (server) is not built for mipsle because
+      # modernc.org/sqlite does not support that platform.
+      - name: Build mesh-node (linux mipsle, OpenWrt)
+        run: |
+          CGO_ENABLED=0 \
+          GOOS=linux \
+          GOARCH=mipsle \
+          GOMIPS=softfloat \
+          go build \
+            -trimpath \
+            -buildvcs=false \
+            -ldflags="-s -w -buildid=" \
+            -o bin/mesh-node-linux-mipsle \
+            ./cmd/mesh-node
+
       - name: Compress binaries
         run: |
           for binary in bin/*; do
