@@ -20,6 +20,31 @@ The commands are built as `server`, `mesh-node`, and `punch-client` (their
 source is under `cmd/`). `modernc.org/sqlite` is a pure-Go SQLite driver, so a
 C compiler is not required.
 
+### OpenWrt routers (MIPS)
+
+CI (`.github/workflows/go.yml`) publishes a ready `mesh-node-linux-mipsle`
+artifact on every push to `main`. It targets `mipsel_24kc` devices such as
+MediaTek MT7621 routers (Xiaomi CR6606/CR6608, and similar): MIPS32r2,
+little-endian, no FPU, so the build is `mipsle` with `GOMIPS=softfloat`.
+
+To cross-compile by hand:
+
+```bash
+CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+  go build -trimpath -ldflags="-s -w" -o mesh-node-linux-mipsle ./cmd/mesh-node
+```
+
+Notes for routers:
+
+- The binary is fully static, so it runs on any OpenWrt userland. Install the
+  TUN kernel module first: `opkg install kmod-tun` (the node creates
+  `/dev/net/tun` itself).
+- The coordinator (`server`) is not available for `mipsle` because
+  `modernc.org/sqlite` does not support that platform; run the coordinator on
+  a regular host and point the router node at it.
+- On devices with 128–256 MB of RAM, cap the Go heap, e.g. add
+  `GOGC=40 GOMEMLIMIT=48MiB` to the service environment.
+
 ## Run the coordinator
 
 ```bash

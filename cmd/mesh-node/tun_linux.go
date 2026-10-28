@@ -16,9 +16,8 @@ import (
 )
 
 const (
-	tunSetIFF = 0x400454ca
-	iffTUN    = 0x0001
-	iffNoPI   = 0x1000
+	iffTUN  = 0x0001
+	iffNoPI = 0x1000
 )
 
 // Cache Fd once: os.File.Fd can call SetBlocking (fcntl) on every call,
