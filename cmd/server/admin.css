@@ -207,6 +207,10 @@ header p,
   background: #71819a
 }
 
+.cyan {
+  background: #22d3ee
+}
+
 input,
 select,
 textarea,
@@ -259,6 +263,17 @@ svg {
 .edge.unknown {
   stroke: #71819a;
   stroke-dasharray: 3 5
+}
+
+/* Telemetry-confirmed LAN path: traffic recently seen from the peer's LAN
+   address. Drawn in cyan so LAN edges stay distinguishable from internet
+   edges, which keep the up (green) / down (red) / unknown (gray) colors. */
+.edge.lan {
+  stroke: #22d3ee
+}
+
+.edge.lan.down {
+  stroke-dasharray: 8 6
 }
 
 .node {

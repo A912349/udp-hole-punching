@@ -82,6 +82,10 @@ type link struct {
 	Cost   float64 `json:"cost"`
 	RTTMS  float64 `json:"rtt_ms,omitempty"`
 	Status string  `json:"status,omitempty"`
+	// ViaLAN is true when node telemetry observed traffic on a LAN path for
+	// this edge. It is a measurement, so an edge between same-subnet peers
+	// that actually flows over the internet stays false.
+	ViaLAN bool `json:"via_lan,omitempty"`
 }
 type server struct {
 	db                                          *sql.DB
@@ -129,9 +133,10 @@ type cachedLinks struct {
 	links []link
 }
 type linkMetric struct {
-	RTTMS float64
-	Up    bool
-	Seen  time.Time
+	RTTMS  float64
+	Up     bool
+	ViaLAN bool
+	Seen   time.Time
 }
 
 type controlClient struct {
@@ -2227,10 +2232,11 @@ func (s *server) updateLinkMetrics(nodeID string, links []protocol.LinkMeasureme
 				old.RTTMS = old.RTTMS*.7 + x.RTTMS*.3
 			}
 		}
-		if old.Seen.IsZero() || old.Up != x.Up {
+		if old.Seen.IsZero() || old.Up != x.Up || old.ViaLAN != x.ViaLAN {
 			stateChanged = true
 		}
 		old.Up = x.Up
+		old.ViaLAN = x.ViaLAN
 		old.Seen = now
 		s.metrics[k] = old
 	}
@@ -2321,6 +2327,10 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 			links[i].Status = "unknown"
 			links[i].Cost *= 2
 		}
+		// A LAN path is confirmed per direction by fresh telemetry: traffic
+		// was recently received from the peer's LAN address. One confirmed
+		// direction is enough to draw the edge as a LAN link.
+		links[i].ViaLAN = (freshForward && forward.ViaLAN) || (freshReverse && reverse.ViaLAN)
 	}
 	return links
 }

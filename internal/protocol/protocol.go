@@ -36,6 +36,11 @@ type LinkMeasurement struct {
 	PeerID string  `json:"peer_id"`
 	RTTMS  float64 `json:"rtt_ms"`
 	Up     bool    `json:"up"`
+	// ViaLAN reports that traffic was recently received from the peer's LAN
+	// address, i.e. the path is confirmed to stay inside the local network.
+	// It is an observation, not an IP-subnet guess. Optional: older nodes
+	// omit it and older coordinators ignore it.
+	ViaLAN bool `json:"via_lan,omitempty"`
 }
 
 // B64Encode encodes bytes using the URL-safe, unpadded format used on the wire.

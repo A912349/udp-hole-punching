@@ -3226,11 +3226,16 @@ func prunePings(pings map[string]pingProbe, before time.Time) {
 const telemetryKeepalive = 40 * time.Second
 
 // currentLinks snapshots the neighbor observations reported to the coordinator.
+// ViaLAN is the measured result (fresh traffic seen from the peer's LAN
+// address), not a subnet comparison: two nodes can share a subnet and still
+// only be reachable over the WAN, and NAT hairpin traffic arrives from the
+// public address even between same-subnet peers.
 func (n *node) currentLinks() []protocol.LinkMeasurement {
+	now := time.Now()
 	n.mu.RLock()
 	links := make([]protocol.LinkMeasurement, 0, len(n.neighbors))
 	for id, p := range n.neighbors {
-		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout})
+		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout, ViaLAN: freshLAN(p, now)})
 	}
 	n.mu.RUnlock()
 	return links
@@ -3272,7 +3277,7 @@ func telemetryChanged(sent, links []protocol.LinkMeasurement) bool {
 	}
 	for _, l := range links {
 		old, ok := previous[l.PeerID]
-		if !ok || old.Up != l.Up || rttDrifted(old.RTTMS, l.RTTMS) {
+		if !ok || old.Up != l.Up || old.ViaLAN != l.ViaLAN || rttDrifted(old.RTTMS, l.RTTMS) {
 			return true
 		}
 	}

@@ -193,7 +193,7 @@ function overviewGraph() {
   svg.innerHTML = links.map(e => {
     let a = p[e.a],
       b = p[e.b];
-    return a && b ? `<line class="edge ${e.status||'unknown'}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>` : ''
+    return a && b ? `<line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>` : ''
   }).join('') + nodes.map(n => {
     let q = p[n.node_id];
     return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" x="${q.x}" y="${q.y+51}">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" x="${q.x}" y="${q.y+64}">${esc(peerSub(n))}</text></g>`
@@ -218,8 +218,9 @@ function drawInteractive() {
     let m = manual.get(key),
       cost = e.cost ? `cost ${Number(e.cost).toFixed(2)}` : 'cost —',
       rtt = e.rtt_ms ? `ping ${Math.round(e.rtt_ms)} ms` : 'ping —',
-      label = `${rtt} · ${cost}`;
-    return `<g class="edgeGroup ${graphUI.selectedEdge===key?'selected':''}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
+      path = e.via_lan ? 'LAN' : 'internet',
+      label = `${path} · ${rtt} · ${cost}`;
+    return `<g class="edgeGroup ${graphUI.selectedEdge===key?'selected':''}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
   }).join('') + nodes.map(n => {
     let q = graphUI.positions[n.node_id],
       classes = ['peerGroup'];
@@ -333,7 +334,7 @@ function selectEdge(key) {
     manual = (state.manualLinks || []).find(e => edgeKey(e.a, e.b) === key);
   if (!live) return;
   let box = $('nodeDetail');
-  box.innerHTML = `<b>${esc(live.a.slice(0,8))} ↔ ${esc(live.b.slice(0,8))}</b><span>${live.rtt_ms?Math.round(live.rtt_ms)+' ms':'No RTT'} · ${esc(live.status||'unknown')}</span><span class="spacer"></span><label>Route cost <input id="directCost" type="number" min="0.1" max="1000" step="0.1" value="${manual?.cost||live.cost||1}"></label><button id="directCostSave">Save cost</button><button id="directEdgeRemove" class="dangerButton">Remove link</button>`;
+  box.innerHTML = `<b>${esc(live.a.slice(0,8))} ↔ ${esc(live.b.slice(0,8))}</b><span>${live.rtt_ms?Math.round(live.rtt_ms)+' ms':'No RTT'} · ${esc(live.status||'unknown')} · ${live.via_lan?'LAN path':'internet path'}</span><span class="spacer"></span><label>Route cost <input id="directCost" type="number" min="0.1" max="1000" step="0.1" value="${manual?.cost||live.cost||1}"></label><button id="directCostSave">Save cost</button><button id="directEdgeRemove" class="dangerButton">Remove link</button>`;
   $('directCostSave').onclick = () => saveDirectEdge(live.a, live.b, Number($('directCost').value));
   $('directEdgeRemove').onclick = e => {
     e.preventDefault();
