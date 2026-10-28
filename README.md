@@ -45,6 +45,38 @@ Notes for routers:
 - On devices with 128–256 MB of RAM, cap the Go heap, e.g. add
   `GOGC=40 GOMEMLIMIT=48MiB` to the service environment.
 
+#### Remote peers and the OpenWrt firewall
+
+Remote (non-LAN) peers reach a relay/superpeer node by sending UDP to its
+public endpoint. OpenWrt's default `wan` input policy is `REJECT`, which
+silently kills hole punching, while LAN peers keep working through broadcast
+discovery — a symptom that "everything works except remote nodes". Two steps
+fix it:
+
+1. Pin the node's UDP port (without the flag it is ephemeral and changes on
+   every restart):
+
+   ```sh
+   mesh-node -udp-port 41820
+   ```
+
+2. Allow that port on the WAN:
+
+   ```sh
+   uci -q delete firewall.mesh_udp
+   uci set firewall.mesh_udp=rule
+   uci set firewall.mesh_udp.name='mesh-node-udp'
+   uci set firewall.mesh_udp.src='wan'
+   uci set firewall.mesh_udp.proto='udp'
+   uci set firewall.mesh_udp.dest_port='41820'
+   uci set firewall.mesh_udp.target='ACCEPT'
+   uci commit firewall
+   /etc/init.d/firewall restart
+   ```
+
+`openwrt/mesh-node.init` is a ready procd init script that pins the port,
+remembers the state file across restarts and starts the node at boot.
+
 ## Run the coordinator
 
 ```bash

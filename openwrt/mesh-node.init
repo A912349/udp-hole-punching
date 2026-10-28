@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+
+# OpenWrt procd init script for mesh-node.
+#
+# Install:
+#   cp mesh-node-linux-mipsle /usr/bin/mesh-node && chmod +x /usr/bin/mesh-node
+#   cp mesh-node.init /etc/init.d/mesh-node && chmod +x /etc/init.d/mesh-node
+#   /etc/init.d/mesh-node enable && /etc/init.d/mesh-node start
+#
+# The node state (identity, credentials) is read from STATE below. Point it at
+# the JSON file created during the first interactive run, e.g.
+#   cp /root/mesh/mesh-node.json /etc/mesh-node.json
+
+START=99
+STOP=10
+USE_PROCD=1
+
+# Adjust to your setup:
+PROG=/usr/bin/mesh-node
+STATE=/root/mesh/mesh-node.json
+PORT=41820
+
+start_service() {
+	procd_open_instance mesh-node
+	procd_set_param command "$PROG" -udp-port "$PORT" -state-dir "$STATE"
+	procd_set_param env GOGC=40 GOMEMLIMIT=48MiB
+	procd_set_param respawn 3600 5 0
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/mesh-node.pid
+	procd_close_instance
+}
+
+stop_service() {
+	service_stop "$PROG"
+}

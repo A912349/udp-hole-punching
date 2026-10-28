@@ -1844,17 +1844,23 @@ func (n *node) establishSymmetricTransport() bool {
 	defer func() { close(leaseStop); <-leaseDone }()
 	for attempt := 1; attempt <= symmetricBurstRetries; attempt++ {
 		relays := n.symmetricRelays()
-		allReady := len(relays) > 0
+		ready := 0
 		for _, relay := range relays {
-			if n.symmetricTransportReady(relay.id) {
+			if n.symmetricTransportReady(relay.id) || n.relayLANLive(relay.id) {
+				// A traffic-confirmed LAN path already serves the relay through
+				// the regular socket. Probing its public endpoint from the same
+				// LAN hairpins through the NAT (often unsupported) and each
+				// attempt burns hundreds of source ports in the router's
+				// conntrack table.
+				ready++
 				continue
 			}
-			allReady = false
 			if n.establishSymmetricTransportOnce(relay.id, &relay.peer, attempt) {
+				ready++
 				n.logf("symmetric NAT connected to superpeer %s", relay.id[:8])
 			}
 		}
-		if allReady || (len(relays) > 0 && n.symmetricTransportCount() == len(relays)) {
+		if len(relays) > 0 && ready == len(relays) {
 			return true
 		}
 		if attempt < symmetricBurstRetries {
@@ -1865,7 +1871,29 @@ func (n *node) establishSymmetricTransport() bool {
 			time.Sleep(symmetricRetryDelay)
 		}
 	}
-	return n.symmetricTransportCount() > 0
+	return n.symmetricTransportCount() > 0 || n.someRelayLANLive()
+}
+
+// relayLANLive reports whether the relay currently has a traffic-confirmed
+// LAN path, which makes a symmetric probe burst unnecessary: LAN traffic
+// flows through the regular socket without traversing the NAT device.
+func (n *node) relayLANLive(relayID string) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return freshLAN(n.neighbors[relayID], time.Now())
+}
+
+// someRelayLANLive reports whether at least one superpeer has a live LAN path.
+func (n *node) someRelayLANLive() bool {
+	now := time.Now()
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	for _, candidate := range n.neighbors {
+		if candidate.Role == "superpeer" && freshLAN(candidate, now) {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, attempt int) bool {
@@ -1873,6 +1901,10 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 		return true
 	}
 	if n.symmetricTransportReady(relayID) {
+		return true
+	}
+	if n.relayLANLive(relayID) {
+		n.logf("symmetric NAT: superpeer %s is reachable via LAN; skipping probe burst", relayID[:8])
 		return true
 	}
 	endpoint, err := net.ResolveUDPAddr("udp", relay.Endpoint)
@@ -2691,6 +2723,11 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 		}()
 
 		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
+			if n.relayLANLive(id) {
+				// The LAN path keeps the edge alive; a public probe burst would
+				// only hairpin through the NAT and flood conntrack again.
+				return
+			}
 			n.resetSymmetricRelay(id)
 			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
 				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
