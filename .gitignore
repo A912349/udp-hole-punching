@@ -3,6 +3,7 @@ __pycache__/
 .agents/
 *.zip
 mesh.db
+mesh.db*
 mesh-state/
 state-*/
 /server
