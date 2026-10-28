@@ -104,6 +104,9 @@ const (
 	lanDiscoveryInterval     = time.Minute
 	lanDiscoveryBurstCount   = 5
 	lanHoldTimeout           = 30 * time.Second
+	lanProbeInterval         = 30 * time.Second // min spacing of unicast HELLO probes per peer
+	lanProbeMaxAddrs         = 4                // candidates tried per peer per probe round
+	lanAdvertiseMax          = 8                // LAN addresses reported to the coordinator
 	localSubnetsRefresh      = 30 * time.Second
 	initialTelemetryDelay    = 3 * time.Second
 	aeadTag                  = 16
@@ -127,24 +130,26 @@ func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 
 type peer struct {
-	ID         string               `json:"node_id"`
-	Public     string               `json:"public_key"`
-	NAT        string               `json:"nat_type"`
-	Role       string               `json:"role"`
-	Endpoint   string               `json:"endpoint"`
-	Capacity   int                  `json:"capacity"`
-	MeshIP     string               `json:"mesh_ip"`
-	Name       string               `json:"name,omitempty"`
-	Routes     []routeAdvertisement `json:"routes,omitempty"`
-	DNSRecords []dnsRecord          `json:"dns_records,omitempty"`
-	last       net.Addr
-	lastRX     time.Time
-	lastLAN    *net.UDPAddr
-	lastLANRX  time.Time
-	lastPathLAN bool // the most recent datagram arrived from a local address
-	discovered time.Time
-	up         bool
-	rttMS      float64
+	ID           string               `json:"node_id"`
+	Public       string               `json:"public_key"`
+	NAT          string               `json:"nat_type"`
+	Role         string               `json:"role"`
+	Endpoint     string               `json:"endpoint"`
+	Capacity     int                  `json:"capacity"`
+	MeshIP       string               `json:"mesh_ip"`
+	Name         string               `json:"name,omitempty"`
+	Routes       []routeAdvertisement `json:"routes,omitempty"`
+	DNSRecords   []dnsRecord          `json:"dns_records,omitempty"`
+	last         net.Addr
+	lastRX       time.Time
+	lastLAN      *net.UDPAddr
+	lastLANRX    time.Time
+	lastPathLAN  bool      // the most recent datagram arrived from a local address
+	lastLANProbe time.Time // last unicast HELLO probe round to the LAN candidates
+	LANAddrs     []string  `json:"lan_addrs,omitempty"` // coordinator-advertised local addresses
+	discovered   time.Time
+	up           bool
+	rttMS        float64
 }
 type routeAdvertisement struct {
 	LAN     string `json:"lan_cidr"`
@@ -282,6 +287,7 @@ type node struct {
 	pings              map[string]pingProbe
 	linksRejected      atomic.Bool // coordinator cannot accept piggybacked link reports
 	goarchRejected     atomic.Bool // coordinator cannot accept the goarch report
+	lanAddrsRejected   atomic.Bool // coordinator cannot accept the lan_addrs report
 	updating           atomic.Bool // a self-update download/swap is in progress
 	telemetryMu        sync.Mutex
 	lastTelemetrySent  time.Time
@@ -1306,6 +1312,14 @@ func (n *node) register() error {
 	if !n.goarchRejected.Load() {
 		r["goarch"] = runtime.GOOS + "/" + runtime.GOARCH
 	}
+	// lan_addrs lets peers in adjacent subnets of the same physical network
+	// (cascaded routers) probe this node with unicast HELLOs; broadcast LAN
+	// discovery cannot cross a router. Same compatibility rule as above.
+	if !n.lanAddrsRejected.Load() {
+		if addrs := n.advertisedLanAddrs(); len(addrs) > 0 {
+			r["lan_addrs"] = addrs
+		}
+	}
 	var out struct {
 		MeshIP string `json:"mesh_ip"`
 		Role   string `json:"assigned_role"`
@@ -1322,6 +1336,10 @@ func (n *node) register() error {
 			if !n.goarchRejected.Load() {
 				n.goarchRejected.Store(true)
 				delete(r, "goarch")
+			}
+			if !n.lanAddrsRejected.Load() {
+				n.lanAddrsRejected.Store(true)
+				delete(r, "lan_addrs")
 			}
 			if e = n.request("POST", "/v1/register", r, &out); e != nil {
 				return e
@@ -1468,6 +1486,7 @@ func (n *node) applyTopology(t topology) {
 		addr *net.UDPAddr
 	}
 	lanHellos := make([]lanHello, 0, 2)
+	lanHellosBase := len(lanHellos) // probe budget below counts only new candidates
 	for _, v := range t.Neighbors {
 		p := v
 		p.discovered = time.Now()
@@ -1479,6 +1498,35 @@ func (n *node) applyTopology(t topology) {
 			p.lastLAN = q.lastLAN
 			p.lastLANRX = q.lastLANRX
 			p.lastPathLAN = q.lastPathLAN
+			p.lastLANProbe = q.lastLANProbe
+		}
+		// Coordinator-assisted LAN discovery: broadcasts cannot cross a
+		// router, so a peer in an adjacent subnet of the same physical
+		// network (cascaded routers) is probed by unicasting HELLO to the
+		// LAN addresses it advertised. touch() flips the path to LAN only
+		// when a reply actually arrives from a local address; a silent
+		// candidate (segmentation, AP isolation, non-routable subnet) never
+		// disturbs the working WAN path.
+		if len(v.LANAddrs) > 0 {
+			probedAt := time.Now()
+			if probedAt.Sub(p.lastLANProbe) >= lanProbeInterval && !freshLAN(&p, probedAt) {
+				p.lastLANProbe = probedAt
+				for _, raw := range v.LANAddrs {
+					if len(lanHellos)-lanHellosBase >= lanProbeMaxAddrs {
+						break
+					}
+					addr, err := net.ResolveUDPAddr("udp4", raw)
+					if err != nil || addr.IP == nil {
+						continue
+					}
+					// Candidates equal to lastLAN are re-probed deliberately:
+					// a peer that moved away and came back on the same address
+					// must be re-found, and the interval above keeps the
+					// retry cost at one small datagram per candidate.
+					p.lastLAN = copyUDPAddr(addr)
+					lanHellos = append(lanHellos, lanHello{id: p.ID, addr: copyUDPAddr(addr)})
+				}
+			}
 		}
 		if candidate := n.pendingLAN[p.ID]; candidate != nil {
 			delete(n.pendingLAN, p.ID)
@@ -2579,6 +2627,7 @@ func (n *node) startLANDiscovery(ctx context.Context) error {
 	n.broadcastLANDiscovery()
 	go n.lanDiscoveryBurst(ctx)
 	go n.periodic(ctx, lanDiscoveryInterval, n.broadcastLANDiscovery)
+	go n.periodic(ctx, lanProbeInterval, n.probeLanCandidates)
 	return nil
 }
 
@@ -2598,6 +2647,45 @@ func (n *node) lanDiscoveryBurst(ctx context.Context) {
 		}
 		n.broadcastLANDiscovery()
 		delay *= 2
+	}
+}
+
+// probeLanCandidates unicasts HELLO probes to the LAN addresses peers
+// advertised through the coordinator. Broadcast discovery cannot cross a
+// router, so this is the only way to find neighbors in an adjacent subnet of
+// the same physical network (cascaded routers). The per-peer interval and
+// fresh-LAN checks keep the cost at a few small datagrams per tick; the
+// candidate set is re-checked on a fixed schedule instead of waiting for a
+// topology push, so candidates also work in a fully stable network.
+func (n *node) probeLanCandidates() {
+	type probe struct {
+		id   string
+		addr *net.UDPAddr
+	}
+	now := time.Now()
+	n.mu.Lock()
+	probes := make([]probe, 0, 4)
+	for id, p := range n.neighbors {
+		if len(p.LANAddrs) == 0 || now.Sub(p.lastLANProbe) < lanProbeInterval || freshLAN(p, now) {
+			continue
+		}
+		p.lastLANProbe = now
+		for _, raw := range p.LANAddrs {
+			if len(probes) >= lanProbeMaxAddrs {
+				break
+			}
+			addr, err := net.ResolveUDPAddr("udp4", raw)
+			if err != nil || addr.IP == nil {
+				continue
+			}
+			p.lastLAN = copyUDPAddr(addr)
+			probes = append(probes, probe{id: id, addr: copyUDPAddr(addr)})
+		}
+	}
+	n.mu.Unlock()
+	for _, pr := range probes {
+		n.debugf("LAN probe to %s at %s", pr.id[:8], pr.addr)
+		n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, pr.id, map[string]any{"public_key": n.id.Public}), pr.addr)
 	}
 }
 
@@ -2684,6 +2772,7 @@ func (n *node) resetTransportState() {
 		peer.lastLAN = nil
 		peer.lastLANRX = time.Time{}
 		peer.lastPathLAN = false
+		peer.lastLANProbe = time.Time{}
 		peer.up = false
 	}
 	n.pendingLAN = map[string]*net.UDPAddr{}
@@ -3964,6 +4053,28 @@ func (n *node) localSubnets() []netip.Prefix {
 	n.subnets = subnets
 	n.subnetsAt = now
 	return subnets
+}
+
+// advertisedLanAddrs lists this node's local UDP endpoint candidates
+// ("ip:port") to publish through the coordinator: the IPv4 addresses of the
+// up interfaces combined with the port of the main UDP socket. Peers unicast
+// HELLO probes to them, which finds neighbors across cascaded routers where
+// broadcast LAN discovery cannot reach.
+func (n *node) advertisedLanAddrs() []string {
+	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	add := func(ip netip.Addr) {
+		if len(out) >= lanAdvertiseMax || seen[ip.String()] {
+			return
+		}
+		seen[ip.String()] = true
+		out = append(out, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
+	}
+	for _, prefix := range n.localSubnets() {
+		add(prefix.Addr())
+	}
+	return out
 }
 
 // localSource reports whether a received datagram's source address means the

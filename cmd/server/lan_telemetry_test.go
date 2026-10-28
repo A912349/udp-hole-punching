@@ -83,3 +83,25 @@ func TestTopologyJSONExposesViaLAN(t *testing.T) {
 		t.Fatal("internet edges must not emit via_lan")
 	}
 }
+
+func TestSanitizeLanAddrsDropsInvalidEntries(t *testing.T) {
+	out := sanitizeLanAddrs([]string{
+		"192.168.1.20:40000",
+		" 10.0.0.5:33  ",
+		"999.1.1.1:1",
+		"192.168.1.3",
+		"192.168.1.4:0",
+		"192.168.1.5:70000",
+		"fe80::1:40000",
+		"127.0.0.1:5000",
+	})
+	want := []string{"192.168.1.20:40000", "10.0.0.5:33"}
+	if len(out) != len(want) {
+		t.Fatalf("sanitizeLanAddrs = %v, want %v", out, want)
+	}
+	for i := range want {
+		if out[i] != want[i] {
+			t.Fatalf("sanitizeLanAddrs[%d] = %q, want %q", i, out[i], want[i])
+		}
+	}
+}

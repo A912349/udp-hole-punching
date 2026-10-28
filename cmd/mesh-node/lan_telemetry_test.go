@@ -66,6 +66,47 @@ func TestTouchClassifiesByPacketSource(t *testing.T) {
 	}
 }
 
+func TestApplyTopologyProbesAdvertisedLanAddrs(t *testing.T) {
+	id := "0123456789abcdef0123456789abcdef"
+	n := &node{id: &protocol.Identity{ID: "fedcba9876543210fedcba9876543210"}, neighbors: map[string]*peer{}}
+	// applyTopology installs a fresh peer struct on every push, so the test
+	// must re-read the map instead of holding a stale pointer.
+	cur := func() *peer { return n.neighbors[id] }
+	n.applyTopology(topology{Version: "v1", Neighbors: []peer{{ID: id, LANAddrs: []string{"192.168.77.20:40000"}}}})
+	if p := cur(); p == nil || p.lastLAN == nil || p.lastLAN.String() != "192.168.77.20:40000" {
+		t.Fatalf("topology LAN candidate was not queued for a unicast probe: %+v", p)
+	}
+	// A silent candidate must never fake a confirmed LAN path: the label is
+	// set by touch() only when traffic really arrives from a local address.
+	if p := cur(); p.lastPathLAN || !p.lastRX.IsZero() {
+		t.Fatal("probe candidate must not fake a confirmed LAN path")
+	}
+	// A confirmed fresh LAN path suppresses further probing.
+	n.mu.Lock()
+	cur().lastLANRX = time.Now()
+	n.mu.Unlock()
+	n.applyTopology(topology{Version: "v2", Neighbors: []peer{{ID: id, LANAddrs: []string{"192.168.77.21:40000"}}}})
+	if p := cur(); p.lastLAN.String() != "192.168.77.20:40000" {
+		t.Fatalf("fresh LAN path must not be re-probed: %v", p.lastLAN)
+	}
+	// The probe rate limit must hold even with no working LAN path.
+	n.mu.Lock()
+	cur().lastLANRX = time.Time{}
+	n.mu.Unlock()
+	n.applyTopology(topology{Version: "v3", Neighbors: []peer{{ID: id, LANAddrs: []string{"192.168.77.22:40000"}}}})
+	if p := cur(); p.lastLAN.String() != "192.168.77.20:40000" {
+		t.Fatalf("probe rate limit violated: %v", p.lastLAN)
+	}
+	// Once the interval elapses, the next candidate is probed.
+	n.mu.Lock()
+	cur().lastLANProbe = time.Now().Add(-2 * lanProbeInterval)
+	n.mu.Unlock()
+	n.applyTopology(topology{Version: "v4", Neighbors: []peer{{ID: id, LANAddrs: []string{"192.168.77.22:40000"}}}})
+	if p := cur(); p.lastLAN.String() != "192.168.77.22:40000" {
+		t.Fatalf("candidate after the probe interval was not probed: %v", p.lastLAN)
+	}
+}
+
 func TestTelemetryChangedDetectsViaLANFlip(t *testing.T) {
 	sent := []protocol.LinkMeasurement{{PeerID: "peer", Up: true, RTTMS: 10}}
 	next := []protocol.LinkMeasurement{{PeerID: "peer", Up: true, RTTMS: 10, ViaLAN: true}}

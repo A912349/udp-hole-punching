@@ -58,6 +58,12 @@ type node struct {
 	Name          string               `json:"name,omitempty"`
 	Routes        []routeAdvertisement `json:"routes,omitempty"`
 	DNSRecords    []dnsRecord          `json:"dns_records,omitempty"`
+	// LANAddrs are the node's local UDP addresses ("ip:port") as seen on its
+	// own interfaces. Peers unicast HELLO probes to them: broadcast discovery
+	// cannot cross routers, but unicast reaches adjacent subnets of the same
+	// physical network (cascaded routers) and lets touch() confirm a real
+	// LAN path.
+	LANAddrs []string `json:"lan_addrs,omitempty"`
 }
 type routeAdvertisement struct {
 	LAN     string `json:"lan_cidr"`
@@ -936,6 +942,11 @@ func (s *server) init() error {
 			return err
 		}
 	}
+	if !columns["lan_addrs"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN lan_addrs TEXT NOT NULL DEFAULT '[]'"); err != nil {
+			return err
+		}
+	}
 	if err = s.loadSettings(); err != nil {
 		return err
 	}
@@ -956,13 +967,13 @@ func (s *server) prepareRegisterStatements() error {
 		accountTokenUser.Close()
 		return err
 	}
-	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
 		return err
 	}
-	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,connected_at=CASE WHEN last_seen < ? THEN ? ELSE connected_at END,mesh_ip=?,goarch=COALESCE(NULLIF(?,''),goarch),owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
+	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,connected_at=CASE WHEN last_seen < ? THEN ? ELSE connected_at END,mesh_ip=?,goarch=COALESCE(NULLIF(?,''),goarch),lan_addrs=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
@@ -2060,7 +2071,7 @@ func (s *server) rebalanceRoles() error {
 
 func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	c := s.settings()
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(c.TTL)}
 	if ownerID != nil {
 		query += " AND owner_id=?"
@@ -2129,10 +2140,10 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	scope := r.URL.Query().Get("scope")
 	all := scope == "all"
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes WHERE last_seen>=?"
 	args := []any{now - int64(ttl)}
 	if all {
-		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes"
+		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes"
 		args = nil
 	}
 	if scoped {
@@ -3186,10 +3197,14 @@ func (s *server) rows(query string, args ...any) ([]node, error) {
 	for rs.Next() {
 		var n node
 		var relay int
-		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &n.GoArch); e != nil {
+		var lanAddrs string
+		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &n.GoArch, &lanAddrs); e != nil {
 			return nil, e
 		}
 		n.Relay = relay != 0
+		if lanAddrs != "" {
+			_ = json.Unmarshal([]byte(lanAddrs), &n.LANAddrs)
+		}
 		a = append(a, n)
 	}
 	return a, rs.Err()
@@ -3232,7 +3247,7 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 	if requested == "client" || nat != "cone" || !relay {
 		return "client", nil
 	}
-	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
+	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
 	if e != nil {
 		return "", e
 	}
@@ -3338,6 +3353,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Relay    *bool                      `json:"relay_capable"`
 		Links    []protocol.LinkMeasurement `json:"links"`
 		GoArch   string                     `json:"goarch"`
+		LANAddrs []string                   `json:"lan_addrs"`
 	}
 	if decodeJSON(w, r, &d) != nil || d.ID == "" || len(d.ID) > 128 || d.Public == "" || len(d.Public) > 256 || d.Endpoint == "" || len(d.Endpoint) > 256 || !(d.NAT == "cone" || d.NAT == "symmetric") || !(d.Role == "auto" || d.Role == "client" || d.Role == "superpeer") {
 		reply(w, 400, map[string]any{"error": "missing or invalid required fields"})
@@ -3439,10 +3455,12 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if accountScoped {
 		ownerValue = accountID
 	}
+	lanAddrs := sanitizeLanAddrs(d.LANAddrs)
+	lanAddrsJSON, _ := json.Marshal(lanAddrs)
 	if previous == nil {
-		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, now, ip, d.GoArch, ownerValue)
+		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, now, ip, d.GoArch, string(lanAddrsJSON), ownerValue)
 	} else {
-		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, d.GoArch, ownerValue, d.ID)
+		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, d.GoArch, string(lanAddrsJSON), ownerValue, d.ID)
 	}
 	s.registerMu.Unlock()
 	if e != nil {
@@ -3517,6 +3535,32 @@ func boolInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// sanitizeLanAddrs keeps only well-formed IPv4 "ip:port" entries (max 8) from
+// a node's reported LAN address list. Invalid entries are dropped instead of
+// rejecting the whole registration: a node must never fail its heartbeat
+// because of an odd interface configuration.
+func sanitizeLanAddrs(addrs []string) []string {
+	out := make([]string, 0, len(addrs))
+	for _, raw := range addrs {
+		host, port, err := net.SplitHostPort(strings.TrimSpace(raw))
+		if err != nil {
+			continue
+		}
+		ip := net.ParseIP(host)
+		if ip == nil || ip.To4() == nil || ip.IsLoopback() {
+			continue
+		}
+		if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+			continue
+		}
+		out = append(out, net.JoinHostPort(ip.String(), port))
+		if len(out) >= 8 {
+			break
+		}
+	}
+	return out
 }
 
 // rendezvousRegister coordinates peer discovery for NAT traversal.
@@ -3911,7 +3955,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("node_id")
 	ttl := s.settings().TTL
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(ttl)}
 	if scoped {
 		query += " AND owner_id=?"

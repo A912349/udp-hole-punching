@@ -77,6 +77,26 @@ fix it:
 `openwrt/mesh-node.init` is a ready procd init script that pins the port,
 remembers the state file across restarts and starts the node at boot.
 
+#### LAN paths across cascaded routers
+
+Nodes find each other on the local network in two complementary ways:
+
+- **Broadcast discovery** (UDP port 37777) reaches every host in the same
+  broadcast domain.
+- **Coordinator-assisted unicast probing**: every node publishes the local
+  UDP addresses of its interfaces (`lan_addrs`) to the coordinator, and
+  peers send unicast HELLO probes to those addresses. Unlike broadcasts,
+  unicast packets traverse routers, so a direct LAN path is also found when
+  two networks are chained (e.g. `192.168.1.x` behind `192.168.2.x`) and
+  broadcast does not cross the intermediate router.
+
+A path is labelled "LAN" only when traffic actually arrives from a local
+(private/link-local) source address — never merely because a candidate
+exists. A silent probe candidate (separate ISPs, AP isolation, filtered
+inter-router traffic) never disturbs the working internet path, and probing
+retries every 30 seconds, so a peer that moves or returns is re-found
+automatically.
+
 ## Run the coordinator
 
 ```bash
