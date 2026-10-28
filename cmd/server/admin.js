@@ -1282,8 +1282,12 @@ $('createAccountInvite').onclick = async () => {
       seen = new Set();
     nodes = nodes.filter(n => n?.node_id && !seen.has(n.node_id) && seen.add(n.node_id));
     let text = nodes.map(n => `<option value="${esc(n.node_id)}">${esc(n.name||n.node_id.slice(0,12))} · ${esc(n.mesh_ip)}</option>`).join('');
-    $('forwardSource').innerHTML = text;
-    $('forwardTarget').innerHTML = text
+    // Preserve the in-progress selection across the 10s auto-refresh.
+    for (const sel of [$('forwardSource'), $('forwardTarget')]) {
+      const current = sel.value;
+      sel.innerHTML = text;
+      if ([...sel.options].some(o => o.value === current)) sel.value = current;
+    }
   }
   async function forwards() {
     try {
@@ -1372,22 +1376,34 @@ function fmtUpdateSize(n) {
 function renderUpdates() {
   let u = state.updates || {urls: {}, binaries: [], results: {}};
   let urls = u.urls || {};
-  let binByArch = {};
-  for (let b of u.binaries || []) binByArch[b.arch] = b;
-  // Known architectures first, then anything the server reports beyond them.
-  let archs = updateArchs.map(a => a.arch);
-  for (let b of u.binaries || []) if (!archs.includes(b.arch)) archs.push(b.arch);
-  for (let a of Object.keys(urls)) if (urls[a] && !archs.includes(a)) archs.push(a);
-  $('updateRows').innerHTML = archs.map(arch => {
-    let known = updateArchs.find(x => x.arch === arch);
-    let b = binByArch[arch];
-    let stored = b
-      ? `<span class="chip">stored</span> ${esc(fmtUpdateSize(b.size))} · ${new Date(b.updated_at * 1000).toLocaleString()} <button class="ghost" data-del-binary="${esc(arch)}">Remove</button>`
-      : '<input type="file" data-upload="' + esc(arch) + '" />';
-    return `<tr><td>${esc(known ? known.label : 'Custom')}<br><code>${esc(arch)}</code></td>` +
-      `<td><input type="text" data-url-arch="${esc(arch)}" value="${esc(urls[arch] || '')}" placeholder="https://github.com/owner/repo/releases/.."/></td>` +
-      `<td>${stored}</td></tr>`;
-  }).join('');
+  // Unsaved drafts must survive the 10s auto-refresh: remember what the
+  // admin typed (anything differing from the server value) and skip the
+  // rebuild entirely while an input inside the table has focus.
+  let drafts = {};
+  document.querySelectorAll('#updateRows [data-url-arch]').forEach(x => {
+    if (x.value.trim() !== (urls[x.dataset.urlArch] || '')) drafts[x.dataset.urlArch] = x.value;
+  });
+  let focused = document.activeElement && $('updateRows').contains(document.activeElement);
+  if (!focused) {
+    let binByArch = {};
+    for (let b of u.binaries || []) binByArch[b.arch] = b;
+    // Known architectures first, then anything the server reports beyond them.
+    let archs = updateArchs.map(a => a.arch);
+    for (let b of u.binaries || []) if (!archs.includes(b.arch)) archs.push(b.arch);
+    for (let a of Object.keys(urls)) if (urls[a] && !archs.includes(a)) archs.push(a);
+    for (let a of Object.keys(drafts)) if (!archs.includes(a)) archs.push(a);
+    $('updateRows').innerHTML = archs.map(arch => {
+      let known = updateArchs.find(x => x.arch === arch);
+      let b = binByArch[arch];
+      let stored = b
+        ? `<span class="chip">stored</span> ${esc(fmtUpdateSize(b.size))} · ${new Date(b.updated_at * 1000).toLocaleString()} <button class="ghost" data-del-binary="${esc(arch)}">Remove</button>`
+        : '<input type="file" data-upload="' + esc(arch) + '" />';
+      let value = drafts.hasOwnProperty(arch) ? drafts[arch] : (urls[arch] || '');
+      return `<tr><td>${esc(known ? known.label : 'Custom')}<br><code>${esc(arch)}</code></td>` +
+        `<td><input type="text" data-url-arch="${esc(arch)}" value="${esc(value)}" placeholder="https://github.com/owner/repo/releases/.."/></td>` +
+        `<td>${stored}</td></tr>`;
+    }).join('');
+  }
   let nodes = (state.topologies ? (state.topologies.online?.nodes || state.topologies.all?.nodes) : state.topology.nodes) || [];
   let current = $('updateTarget').value;
   $('updateTarget').innerHTML = '<option value="">All connected nodes</option>' + nodes
@@ -1403,7 +1419,7 @@ function renderUpdates() {
   ).join('') || '<tr><td colspan="5" class="muted">No update attempts yet.</td></tr>';
 }
 
-$('saveUpdateLinks').onclick = async () => {
+async function saveUpdateLinks() {
   try {
     let urls = {};
     document.querySelectorAll('[data-url-arch]').forEach(x => {
@@ -1415,6 +1431,13 @@ $('saveUpdateLinks').onclick = async () => {
   } catch (e) {
     toast(e.message)
   }
+}
+
+// The button and the Enter key both submit this form; without
+// preventDefault the browser reloads the page and the edit is lost.
+$('updateLinksForm').onsubmit = e => {
+  e.preventDefault();
+  saveUpdateLinks();
 };
 
 $('updateDispatchForm').onsubmit = async e => {
