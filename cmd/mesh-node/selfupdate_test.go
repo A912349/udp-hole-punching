@@ -85,8 +85,19 @@ func TestDownloadUpdateVerifiesAndReplaces(t *testing.T) {
 	// The temp file must be a sibling of the executable so the later rename
 	// stays within one filesystem.
 	exe, _ := os.Executable()
-	if filepath.Dir(tmp) != filepath.Dir(exe) {
-		t.Fatalf("temp dir = %s, want %s", filepath.Dir(tmp), filepath.Dir(exe))
+	// Windows may return a short (8.3) path from os.Executable while
+	// executablePath() already resolved it; normalize both sides.
+	exeDir, err := filepath.EvalSymlinks(filepath.Dir(exe))
+	if err != nil {
+		exeDir = filepath.Dir(exe)
+	}
+	tmpDir := filepath.Dir(tmp)
+	if runtime.GOOS == "windows" {
+		if !strings.EqualFold(tmpDir, exeDir) {
+			t.Fatalf("temp dir = %s, want %s", tmpDir, exeDir)
+		}
+	} else if tmpDir != exeDir {
+		t.Fatalf("temp dir = %s, want %s", tmpDir, exeDir)
 	}
 }
 
