@@ -65,12 +65,25 @@ const (
 	// the node advertising a stale endpoint until the next disconnect.
 	endpointRefreshRetries    = 4
 	endpointRefreshRetryDelay = 5 * time.Second
-	recoveryMinBackoff = 10 * time.Second
-	recoveryMaxBackoff = 5 * time.Minute
-	stunProbeTimeout   = 2 * time.Second
-	maxRequest         = 32000
-	maxResponse        = 48000
-	maxUDPPort         = 65535
+	// Mobile devices switch networks (Wi-Fi <-> LTE) without asking. Polling
+	// the interface table is the only portable way to notice such a switch
+	// within seconds; reacting to traffic failures alone takes 30-90 s because
+	// half-open TCP and pinned UDP sockets keep pretending everything works.
+	networkCheckInterval = 2 * time.Second
+	roamRefreshMinGap    = 3 * time.Second
+	// Interface flapping coalescing for the control channel watchdog.
+	controlCheckInterval = 5 * time.Second
+	// A healthy control WebSocket always sees traffic within this window: the
+	// heartbeat request/reply cycle runs every heartbeat interval and the
+	// coordinator pushes topology events. Anything quieter than that means the
+	// TCP connection is half-open on a previous network.
+	controlStaleTimeout = 45 * time.Second
+	recoveryMinBackoff  = 10 * time.Second
+	recoveryMaxBackoff  = 5 * time.Minute
+	stunProbeTimeout    = 2 * time.Second
+	maxRequest          = 32000
+	maxResponse         = 48000
+	maxUDPPort          = 65535
 
 	symmetricBurstSize       = 500
 	symmetricBurstTimeout    = 45 * time.Second
@@ -260,6 +273,7 @@ type node struct {
 	controlConnected   bool
 	controlMu          sync.Mutex
 	controlRxAt        atomic.Int64
+	roamRefreshAt      atomic.Int64
 	closing            atomic.Bool
 	controlCall        sync.Mutex
 	controlReply       chan controlFrame
@@ -1165,6 +1179,12 @@ func (n *node) refreshEndpointAfterControlReconnect() {
 // attempts (late retries vs. a newer reconnect) mutually exclusive.
 func (n *node) refreshEndpointAttempt(attempt int) {
 	if !n.recoveryMu.TryLock() {
+		// A full recovery pass is in flight. Returning silently here used to
+		// discard the fastest path to a fresh endpoint whenever recoverNetwork
+		// happened to hold the lock; schedule a short bounded retry instead.
+		if attempt < endpointRefreshRetries {
+			time.AfterFunc(time.Second, func() { n.refreshEndpointAttempt(attempt) })
+		}
 		return
 	}
 	defer n.recoveryMu.Unlock()
@@ -1223,23 +1243,22 @@ func (n *node) refreshEndpointAttempt(attempt int) {
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
 	}
-	if ipChanged {
-		if err := n.register(); err != nil {
-			n.logf("control reconnect: re-register failed: %v", err)
-			return
-		}
-		if err := n.bootstrap(); err != nil {
-			n.logf("control reconnect: topology refresh failed: %v", err)
-			return
-		}
+	if err := n.register(); err != nil {
+		n.logf("control reconnect: re-register failed: %v", err)
+		return
+	}
+	if err := n.bootstrap(); err != nil {
+		n.logf("control reconnect: topology refresh failed: %v", err)
+		return
 	}
 	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
 		n.logf("control reconnect: symmetric handshake did not complete")
-	} else if !ipChanged {
-		// The heartbeat will publish the new port. Rebuild direct paths locally
-		// without causing a registration/topology churn for a port-only change.
-		n.helloAll()
 	}
+	// After an IP change every peer still points at the dead mapping. HELLO
+	// and PING through the new socket let every peer relearn the fresh source
+	// address immediately instead of waiting for the next keepalive tick.
+	n.helloAll()
+	n.pingAll()
 }
 
 func endpointIP(endpoint string) string {
@@ -1321,6 +1340,16 @@ func (n *node) register() error {
 	n.mu.Unlock()
 	if changed {
 		n.logf("mesh IP %s; assigned role %s", out.MeshIP, out.Role)
+	}
+	// The control plane just proved the network path works. If earlier
+	// recovery attempts collected backoff (for example STUN failures while a
+	// mobile network was still settling), reset it: the next genuine outage
+	// must be handled immediately, not after minutes of exponential delay.
+	// TryLock: callers that already hold recoveryMu reset nothing here.
+	if n.recoveryMu.TryLock() {
+		n.recoveryFails = 0
+		n.recoveryNext = time.Time{}
+		n.recoveryMu.Unlock()
 	}
 	return nil
 }
@@ -1755,6 +1784,8 @@ func (n *node) start() error {
 	n.startFastWorkers(ctx)
 	n.startDeliverWorker(ctx)
 	go n.receive(ctx)
+	go n.monitorNetwork(ctx)
+	go n.monitorControl(ctx)
 	go n.periodic(ctx, helloInterval, n.helloAll)
 	go n.periodic(ctx, pingInterval, n.pingAll)
 	go n.periodic(ctx, heartbeat, func() {
@@ -2855,6 +2886,208 @@ func (n *node) recoverNetwork() {
 	n.recoveryFails = 0
 	n.recoveryNext = time.Time{}
 	n.helloAll()
+	n.pingAll()
+}
+
+// networkFingerprint summarizes the currently up IPv4 interface configuration.
+// It deliberately excludes the mesh TUN: configuring the TUN during recovery
+// must not look like a roaming event and trigger another recovery.
+func (n *node) networkFingerprint() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		n.debugf("network fingerprint unavailable: %v", err)
+		return ""
+	}
+	return fingerprintInterfaces(ifaces, func(iface net.Interface) ([]net.Addr, error) { return iface.Addrs() }, n.c.tun)
+}
+
+// fingerprintInterfaces joins per-interface address lists into one string.
+// Sorting makes the result independent of enumeration order, loopback and
+// interfaces without an IPv4 address are skipped, so plain carrier-grade NAT
+// rebinds that keep the interface set stable do not spam recovery.
+func fingerprintInterfaces(ifaces []net.Interface, addrs func(net.Interface) ([]net.Addr, error), skip string) string {
+	parts := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Name == skip {
+			continue
+		}
+		list, err := addrs(iface)
+		if err != nil {
+			continue
+		}
+		addresses := make([]string, 0, len(list))
+		for _, address := range list {
+			prefix, ok := address.(*net.IPNet)
+			if !ok || prefix.IP.To4() == nil {
+				continue
+			}
+			ones, _ := prefix.Mask.Size()
+			addresses = append(addresses, prefix.IP.String()+"/"+strconv.Itoa(ones))
+		}
+		if len(addresses) == 0 {
+			continue
+		}
+		sort.Strings(addresses)
+		parts = append(parts, iface.Name+"="+strings.Join(addresses, ","))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "|")
+}
+
+// monitorNetwork polls the interface table and reacts to Wi-Fi <-> LTE style
+// switches within a few seconds. Waiting for traffic failures instead leaves a
+// mobile node blind for 30-90 s: half-open control connections and UDP sockets
+// pinned to the previous network keep looking alive far too long.
+func (n *node) monitorNetwork(ctx context.Context) {
+	previous := n.networkFingerprint()
+	ticker := time.NewTicker(networkCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		current := n.networkFingerprint()
+		// An empty fingerprint means "cannot tell" (total loss, enumeration
+		// failure); only a real observed change triggers roaming recovery.
+		if current == "" || current == previous {
+			continue
+		}
+		previous = current
+		n.logf("network change detected: %s", current)
+		n.handleNetworkChange()
+	}
+}
+
+// handleNetworkChange starts a roaming refresh: a new network invalidates the
+// UDP socket, all cached peer paths and often the control connection.
+func (n *node) handleNetworkChange() {
+	// A fresh network event restarts recovery from scratch. Backoff collected
+	// while the old network was settling must not delay recovery now that the
+	// new network is up. TryLock: when a recovery pass is already running it
+	// will pick the new network up on its own.
+	if n.recoveryMu.TryLock() {
+		n.recoveryFails = 0
+		n.recoveryNext = time.Time{}
+		n.recoveryMu.Unlock()
+	}
+	// The control WebSocket rides on the previous network and may stay
+	// half-open for minutes. Close it so the next heartbeat reconnects over
+	// the new network immediately; readControl will also notice and poke.
+	n.controlMu.Lock()
+	if n.control != nil {
+		_ = n.control.Close()
+		n.control = nil
+	}
+	n.controlMu.Unlock()
+	// Coalesce interface flapping into one refresh.
+	now := time.Now().Unix()
+	last := n.roamRefreshAt.Load()
+	if last != 0 && time.Since(time.Unix(last, 0)) < roamRefreshMinGap {
+		return
+	}
+	if !n.roamRefreshAt.CompareAndSwap(last, now) {
+		return
+	}
+	go n.roamRefresh(1)
+}
+
+// roamRefresh rebuilds the whole transport after a network switch. Unlike the
+// post-reconnect endpoint check it never trusts "the external endpoint looks
+// the same": on Android the old socket can stay pinned to the dead Wi-Fi
+// network while STUN still answers through it. The socket is always rebound
+// and every cached peer path is dropped.
+func (n *node) roamRefresh(attempt int) {
+	if !n.recoveryMu.TryLock() {
+		// recoverNetwork or a newer roam pass is in flight; that pass already
+		// observes the new network.
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	retry := func(stage string, err error) {
+		n.logf("network change: %s: %v", stage, err)
+		if attempt < endpointRefreshRetries {
+			time.AfterFunc(endpointRefreshRetryDelay, func() { n.roamRefresh(attempt + 1) })
+			return
+		}
+		n.logf("network change: giving up for now; keepalive recovery stays armed")
+	}
+	if err := n.rebindUDPConn(); err != nil {
+		retry("UDP rebind failed", err)
+		return
+	}
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		// DNS and STUN are often unusable for the first seconds after a radio
+		// transition; the retries below ride them out.
+		retry("STUN check failed", err)
+		return
+	}
+	if endpoint != n.c.endpoint {
+		n.logf("network change: UDP endpoint changed %s -> %s", n.c.endpoint, endpoint)
+		n.c.endpoint = endpoint
+	}
+	if n.requestedNAT == "auto" {
+		n.c.nat = nat
+	}
+	// Every peer.last entry and every per-superpeer socket belongs to the old
+	// NAT mapping. Drop them before rebuilding; keeping them made a Wi-Fi ->
+	// LTE transition keep stale symmetric state and never start a new scan.
+	n.resetTransportState()
+	if err := n.restoreTUNNetwork(); err != nil {
+		n.logf("network change: TUN network restore failed: %v", err)
+	}
+	// The heartbeat also publishes the fresh endpoint to the coordinator.
+	if err := n.register(); err != nil {
+		retry("re-register failed", err)
+		return
+	}
+	if err := n.bootstrap(); err != nil {
+		retry("topology refresh failed", err)
+		return
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.logf("network change: symmetric handshake did not complete; link health will retry")
+	}
+	n.helloAll()
+	n.pingAll()
+}
+
+// monitorControl force-closes a control WebSocket that stopped receiving.
+// A network switch usually leaves the old TCP connection half-open instead of
+// sending a RST: writes appear to succeed, no reply ever arrives, and without
+// this watchdog the node waits for a request timeout before even trying to
+// reconnect. Topology pushes and symmetric-scan events are lost meanwhile.
+func (n *node) monitorControl(ctx context.Context) {
+	ticker := time.NewTicker(controlCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		n.controlMu.Lock()
+		connected := n.control != nil
+		n.controlMu.Unlock()
+		if !connected {
+			continue
+		}
+		if time.Since(time.Unix(0, n.controlRxAt.Load())) < controlStaleTimeout {
+			continue
+		}
+		n.logf("control channel silent for %s; forcing reconnect", controlStaleTimeout)
+		n.controlMu.Lock()
+		if n.control != nil {
+			_ = n.control.Close()
+			n.control = nil
+		}
+		n.controlMu.Unlock()
+	}
 }
 
 func (n *node) detectEndpoint() (string, string, error) {
