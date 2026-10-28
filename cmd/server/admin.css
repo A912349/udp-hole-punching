@@ -494,3 +494,20 @@ code.copyable:hover,
   flex-wrap: wrap;
   justify-content: flex-end
 }
+/* Client updates card */
+#updateRows input[type="text"] {
+  width: 100%;
+  min-width: 210px
+}
+
+#updateRows input[type="file"] {
+  max-width: 230px
+}
+
+#updateRows button.ghost {
+  margin-left: 6px
+}
+
+#updateDispatchForm {
+  margin-bottom: 14px
+}

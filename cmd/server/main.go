@@ -47,6 +47,7 @@ type node struct {
 	Endpoint      string               `json:"endpoint"`
 	Capacity      int                  `json:"capacity"`
 	MeshIP        string               `json:"mesh_ip"`
+	GoArch        string               `json:"goarch,omitempty"`
 	RequestedRole string               `json:"requested_role"`
 	Relay         bool                 `json:"relay_capable"`
 	LastSeen      int64                `json:"last_seen"`
@@ -116,6 +117,8 @@ type server struct {
 	symmetricRendezvous map[string]symmetricRendezvous
 	metricsMu           sync.RWMutex
 	metrics             map[string]linkMetric
+	updateMu            sync.Mutex
+	updateResults       map[string]updateResult
 	topologyMu          sync.Mutex
 	linkCache           map[string]cachedLinks
 	cacheEpoch          uint64
@@ -138,6 +141,39 @@ type linkMetric struct {
 	ViaLAN bool
 	Seen   time.Time
 }
+
+// updateResult is the last self-update report a node delivered. Kept in
+// memory only: the node re-registers after a successful restart, and failed
+// attempts stay visible until the coordinator restarts.
+type updateResult struct {
+	Status string `json:"status"`
+	Detail string `json:"detail,omitempty"`
+	GoArch string `json:"goarch,omitempty"`
+	At     int64  `json:"at"`
+}
+
+// updateBinaryInfo describes one binary stored on the coordinator. Path is
+// resolved by the node against its own configured coordinator URL, so the
+// update works behind reverse proxies and NAT without extra configuration.
+type updateBinaryInfo struct {
+	Arch      string `json:"arch"`
+	SHA256    string `json:"sha256"`
+	Size      int64  `json:"size"`
+	UpdatedAt int64  `json:"updated_at"`
+	Path      string `json:"path"`
+}
+
+// updateSources is the payload of the "update" control event. A node picks
+// the entry matching runtime.GOOS/GOARCH; uploaded binaries win over links.
+type updateSources struct {
+	Binaries map[string]updateBinaryInfo `json:"binaries,omitempty"`
+	URLs     map[string]string           `json:"urls,omitempty"`
+}
+
+// updateMaxBinaryBytes bounds one uploaded client binary. UPX-compressed
+// mesh-node builds are a few megabytes; the cap leaves headroom for
+// uncompressed builds without letting an admin fill the disk by accident.
+const updateMaxBinaryBytes = 128 << 20
 
 type controlClient struct {
 	ws         sync.Mutex
@@ -258,6 +294,7 @@ func main() {
 		symmetricRendezvous: map[string]symmetricRendezvous{},
 		metrics:             map[string]linkMetric{},
 		linkCache:           map[string]cachedLinks{},
+		updateResults:       map[string]updateResult{},
 		inviteAttempts:      map[string][]time.Time{},
 		accountAttempts:     map[string][]time.Time{},
 	}
@@ -326,6 +363,12 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/forwards", s.adminForwards)
 	mux.HandleFunc("POST /v1/admin/forwards", s.adminForwards)
 	mux.HandleFunc("DELETE /v1/admin/forwards/{id}", s.adminForward)
+	mux.HandleFunc("GET /v1/admin/updates", s.adminUpdates)
+	mux.HandleFunc("PUT /v1/admin/updates", s.adminUpdates)
+	mux.HandleFunc("POST /v1/admin/updates/dispatch", s.adminUpdateDispatch)
+	mux.HandleFunc("PUT /v1/admin/updates/binaries/{arch}", s.adminUpdateBinary)
+	mux.HandleFunc("DELETE /v1/admin/updates/binaries/{arch}", s.adminUpdateBinary)
+	mux.HandleFunc("GET /v1/update/binaries/{arch}", s.nodeUpdateBinary)
 	// Legacy endpoints intentionally stay unauthenticated: the experimental
 	// punch client predates the mesh network token and can use this coordinator.
 	mux.HandleFunc("POST /register", s.rendezvousRegister)
@@ -739,6 +782,8 @@ func (s *server) controlRequestWithAuth(in controlFrame, credential, invite stri
 		s.service(w, r)
 	case in.Method == http.MethodPost && in.Path == "/v1/telemetry":
 		s.telemetry(w, r)
+	case in.Method == http.MethodPost && in.Path == "/v1/update-status":
+		s.nodeUpdateStatus(w, r)
 	case in.Method == http.MethodGet && strings.HasPrefix(in.Path, "/v1/bootstrap/"):
 		r.SetPathValue("node_id", strings.TrimPrefix(in.Path, "/v1/bootstrap/"))
 		s.bootstrap(w, r)
@@ -771,7 +816,7 @@ func value(k, d string) string {
 }
 // init opens the database, applies schema setup, and loads server settings.
 func (s *server) init() error {
-	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);`)
+	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);`)
 	if err != nil {
 		return err
 	}
@@ -886,6 +931,11 @@ func (s *server) init() error {
 			return err
 		}
 	}
+	if !columns["goarch"] {
+		if _, err = s.db.Exec("ALTER TABLE nodes ADD COLUMN goarch TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
+	}
 	if err = s.loadSettings(); err != nil {
 		return err
 	}
@@ -900,19 +950,19 @@ func (s *server) prepareRegisterStatements() error {
 	if err != nil {
 		return err
 	}
-	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.connected_at,n.mesh_ip,n.owner_id,o.role
+	lookup, err := s.db.Prepare(`SELECT n.node_id,n.public_key,n.nat_type,n.role,n.endpoint,n.requested_role,n.relay_capable,n.capacity,n.last_seen,n.created_at,n.connected_at,n.mesh_ip,n.goarch,n.owner_id,o.role
 		FROM nodes n LEFT JOIN role_overrides o ON o.node_id=n.node_id WHERE n.node_id=?`)
 	if err != nil {
 		accountTokenUser.Close()
 		return err
 	}
-	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+	insert, err := s.db.Prepare(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,owner_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
 		return err
 	}
-	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,connected_at=CASE WHEN last_seen < ? THEN ? ELSE connected_at END,mesh_ip=?,owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
+	update, err := s.db.Prepare(`UPDATE nodes SET public_key=?,nat_type=?,role=?,endpoint=?,requested_role=?,relay_capable=?,capacity=?,last_seen=?,connected_at=CASE WHEN last_seen < ? THEN ? ELSE connected_at END,mesh_ip=?,goarch=COALESCE(NULLIF(?,''),goarch),owner_id=COALESCE(owner_id,?) WHERE node_id=?`)
 	if err != nil {
 		accountTokenUser.Close()
 		lookup.Close()
@@ -1641,6 +1691,367 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	reply(w, http.StatusOK, next)
 }
 
+// validGoArch accepts an empty value (old clients) or a "goos/goarch" pair
+// such as "linux/mipsle". The charset matches what the Go runtime reports.
+func validGoArch(v string) bool {
+	if v == "" {
+		return true
+	}
+	if len(v) > 32 {
+		return false
+	}
+	goos, goarch, ok := strings.Cut(v, "/")
+	if !ok || goos == "" || goarch == "" {
+		return false
+	}
+	return isLowerAlnum(goos) && isLowerAlnum(goarch)
+}
+
+func isLowerAlnum(v string) bool {
+	for _, r := range v {
+		if !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *server) updateURLs() map[string]string {
+	urls := map[string]string{}
+	rows, err := s.db.Query("SELECT arch,url FROM update_settings")
+	if err != nil {
+		return urls
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var arch, raw string
+		if rows.Scan(&arch, &raw) == nil && strings.TrimSpace(raw) != "" {
+			urls[arch] = strings.TrimSpace(raw)
+		}
+	}
+	return urls
+}
+
+func (s *server) updateBinaries() []updateBinaryInfo {
+	list := []updateBinaryInfo{}
+	rows, err := s.db.Query("SELECT arch,sha256,size,updated_at FROM update_binaries")
+	if err != nil {
+		return list
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b updateBinaryInfo
+		if rows.Scan(&b.Arch, &b.SHA256, &b.Size, &b.UpdatedAt) == nil {
+			// %2F keeps "linux/arm64" inside one wildcard segment; the mux
+			// decodes it back in the handler.
+			b.Path = "/v1/update/binaries/" + url.PathEscape(b.Arch)
+			list = append(list, b)
+		}
+	}
+	return list
+}
+
+// buildUpdateSources collects everything an update command can reference.
+// Uploaded binaries take precedence on the node; links are the fallback.
+func (s *server) buildUpdateSources() updateSources {
+	sources := updateSources{Binaries: map[string]updateBinaryInfo{}, URLs: map[string]string{}}
+	for arch, u := range s.updateURLs() {
+		sources.URLs[arch] = u
+	}
+	for _, b := range s.updateBinaries() {
+		sources.Binaries[b.Arch] = b
+	}
+	return sources
+}
+
+// adminUpdates serves the update configuration. GET returns the configured
+// links, stored binaries and last per-node update reports; PUT replaces the
+// link set. Binary payloads are managed by adminUpdateBinary.
+func (s *server) adminUpdates(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	if r.Method == http.MethodGet {
+		reply(w, http.StatusOK, map[string]any{"urls": s.updateURLs(), "binaries": s.updateBinaries(), "results": s.updateStatusSnapshot()})
+		return
+	}
+	var next struct {
+		URLs map[string]string `json:"urls"`
+	}
+	if err := decodeJSON(w, r, &next); err != nil || next.URLs == nil {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "body must be {\"urls\": {\"goos/goarch\": \"https://...\"}}"})
+		return
+	}
+	for arch, raw := range next.URLs {
+		if arch == "" || !validGoArch(arch) {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid architecture key " + arch})
+			return
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || len(raw) > 512 {
+			reply(w, http.StatusBadRequest, map[string]string{"error": "invalid download link for " + arch})
+			return
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if _, err = tx.Exec("DELETE FROM update_settings"); err != nil {
+		_ = tx.Rollback()
+		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	for arch, raw := range next.URLs {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if _, err = tx.Exec("INSERT INTO update_settings(arch,url) VALUES(?,?)", arch, raw); err != nil {
+			_ = tx.Rollback()
+			reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+	}
+	if err = tx.Commit(); err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_links_saved", fmt.Sprintf("archs=%d", len(next.URLs)))
+	reply(w, http.StatusOK, map[string]any{"urls": s.updateURLs()})
+}
+
+// adminUpdateBinary stores or removes one architecture binary on the
+// coordinator. Uploads are raw bodies (application/octet-stream); the node
+// later downloads from /v1/update/binaries/{arch} with its network token.
+func (s *server) adminUpdateBinary(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	arch := r.PathValue("arch")
+	if arch == "" || !validGoArch(arch) {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid architecture"})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if _, err := s.db.Exec("DELETE FROM update_binaries WHERE arch=?", arch); err != nil {
+			reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_binary_removed", arch)
+		reply(w, http.StatusOK, map[string]string{"status": "removed"})
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, updateMaxBinaryBytes))
+	if err != nil {
+		reply(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "binary too large or unreadable"})
+		return
+	}
+	if len(body) < 1024 {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "file is too small to be a mesh-node binary"})
+		return
+	}
+	sum := sha256.Sum256(body)
+	_, err = s.db.Exec(`INSERT INTO update_binaries(arch,data,sha256,size,updated_at) VALUES(?,?,?,?,?)
+		ON CONFLICT(arch) DO UPDATE SET data=excluded.data,sha256=excluded.sha256,size=excluded.size,updated_at=excluded.updated_at`,
+		arch, body, hex.EncodeToString(sum[:]), len(body), time.Now().Unix())
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_binary_stored", fmt.Sprintf("%s size=%d", arch, len(body)))
+	reply(w, http.StatusOK, map[string]any{"arch": arch, "size": len(body), "sha256": hex.EncodeToString(sum[:])})
+}
+
+// nodeUpdateBinary serves a stored client binary to an authenticated node.
+func (s *server) nodeUpdateBinary(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	arch := r.PathValue("arch")
+	if arch == "" || !validGoArch(arch) {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid architecture"})
+		return
+	}
+	var data []byte
+	err := s.db.QueryRow("SELECT data FROM update_binaries WHERE arch=?", arch).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		reply(w, http.StatusNotFound, map[string]string{"error": "no stored binary for " + arch})
+		return
+	}
+	if err != nil {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	_, _ = w.Write(data)
+}
+
+func (s *server) connectedNodeIDs() []string {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	seen := map[string]bool{}
+	ids := []string{}
+	for _, id := range s.controls {
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func (s *server) nodeArch(nodeID string) string {
+	var arch string
+	_ = s.db.QueryRow("SELECT goarch FROM nodes WHERE node_id=?", nodeID).Scan(&arch)
+	return arch
+}
+
+// adminUpdateDispatch pushes the "update" control event to one node or to
+// every connected node. Nodes whose architecture has no configured source are
+// reported back instead of receiving a command they cannot act on.
+func (s *server) adminUpdateDispatch(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	var input struct {
+		NodeID string `json:"node_id"`
+		All    bool   `json:"all"`
+	}
+	if err := decodeJSON(w, r, &input); err != nil || (!input.All && input.NodeID == "") {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "provide node_id or all=true"})
+		return
+	}
+	if input.NodeID != "" && !s.requireNodeAccess(w, r, input.NodeID) {
+		return
+	}
+	sources := s.buildUpdateSources()
+	if len(sources.Binaries) == 0 && len(sources.URLs) == 0 {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "no download links or stored binaries configured"})
+		return
+	}
+	targets := []string{input.NodeID}
+	scope := "node=" + input.NodeID
+	if input.All {
+		targets = s.connectedNodeIDs()
+		scope = "all"
+		if accountID, scoped := s.accountIDForRequest(r); scoped {
+			own := targets[:0]
+			for _, id := range targets {
+				if s.nodeOwnedByAccount(id, accountID) {
+					own = append(own, id)
+				}
+			}
+			targets = own
+		}
+		if len(targets) == 0 {
+			reply(w, http.StatusConflict, map[string]string{"error": "no connected nodes in your scope"})
+			return
+		}
+	}
+	body, _ := json.Marshal(sources)
+	type dispatchResult struct {
+		NodeID string `json:"node_id"`
+		OK     bool   `json:"ok"`
+		Detail string `json:"detail,omitempty"`
+	}
+	results := make([]dispatchResult, 0, len(targets))
+	sent := 0
+	for _, id := range targets {
+		arch := s.nodeArch(id)
+		if arch != "" {
+			if _, hasBinary := sources.Binaries[arch]; !hasBinary {
+				if u := sources.URLs[arch]; u == "" {
+					results = append(results, dispatchResult{NodeID: id, Detail: "no update source for " + arch})
+					continue
+				}
+			}
+		}
+		if s.sendControlEvent(id, controlFrame{Event: "update", Body: body}) {
+			sent++
+			detail := "update sent"
+			if arch != "" {
+				detail += " for " + arch
+			}
+			results = append(results, dispatchResult{NodeID: id, OK: true, Detail: detail})
+		} else {
+			results = append(results, dispatchResult{NodeID: id, Detail: "node is not connected"})
+		}
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_dispatched", fmt.Sprintf("%s sent=%d", scope, sent))
+	reply(w, http.StatusOK, map[string]any{"results": results})
+}
+
+var updateStatusValues = map[string]bool{"updating": true, "restarting": true, "done": true, "failed": true}
+
+// nodeUpdateStatus receives the node's self-update progress report. It goes
+// over the same control WebSocket as registration, so no extra port or
+// authentication channel is needed.
+func (s *server) nodeUpdateStatus(w http.ResponseWriter, r *http.Request) {
+	if !s.auth(w, r) {
+		return
+	}
+	var report struct {
+		NodeID string `json:"node_id"`
+		GoArch string `json:"goarch"`
+		Status string `json:"status"`
+		Detail string `json:"detail"`
+	}
+	if err := decodeJSON(w, r, &report); err != nil || report.NodeID == "" || len(report.NodeID) > 128 {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid update status report"})
+		return
+	}
+	if !updateStatusValues[report.Status] {
+		reply(w, http.StatusBadRequest, map[string]string{"error": "invalid update status"})
+		return
+	}
+	if len(report.Detail) > 512 {
+		report.Detail = report.Detail[:512]
+	}
+	if !validGoArch(report.GoArch) {
+		report.GoArch = ""
+	}
+	if !s.requireNodeAccess(w, r, report.NodeID) {
+		return
+	}
+	s.updateMu.Lock()
+	if s.updateResults == nil {
+		s.updateResults = map[string]updateResult{}
+	}
+	if len(s.updateResults) >= 2048 {
+		cutoff := time.Now().Add(-24 * time.Hour).Unix()
+		for id, res := range s.updateResults {
+			if res.At < cutoff {
+				delete(s.updateResults, id)
+			}
+		}
+	}
+	s.updateResults[report.NodeID] = updateResult{Status: report.Status, Detail: report.Detail, GoArch: report.GoArch, At: time.Now().Unix()}
+	s.updateMu.Unlock()
+	reply(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) updateStatusSnapshot() map[string]updateResult {
+	s.updateMu.Lock()
+	defer s.updateMu.Unlock()
+	out := make(map[string]updateResult, len(s.updateResults))
+	cutoff := time.Now().Add(-24 * time.Hour).Unix()
+	for id, res := range s.updateResults {
+		if res.At < cutoff {
+			delete(s.updateResults, id)
+			continue
+		}
+		out[id] = res
+	}
+	return out
+}
+
 // rebalanceRoles makes an auto-superpeer setting take effect immediately for
 // already registered nodes, not only when their next heartbeat arrives.
 func (s *server) rebalanceRoles() error {
@@ -1649,7 +2060,7 @@ func (s *server) rebalanceRoles() error {
 
 func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	c := s.settings()
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(c.TTL)}
 	if ownerID != nil {
 		query += " AND owner_id=?"
@@ -1718,10 +2129,10 @@ func (s *server) adminTopology(w http.ResponseWriter, r *http.Request) {
 	scope := r.URL.Query().Get("scope")
 	all := scope == "all"
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
 	args := []any{now - int64(ttl)}
 	if all {
-		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes"
+		query = "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes"
 		args = nil
 	}
 	if scoped {
@@ -2765,7 +3176,7 @@ func (s *server) rows(query string, args ...any) ([]node, error) {
 	for rs.Next() {
 		var n node
 		var relay int
-		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP); e != nil {
+		if e = rs.Scan(&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole, &relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &n.GoArch); e != nil {
 			return nil, e
 		}
 		n.Relay = relay != 0
@@ -2811,7 +3222,7 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 	if requested == "client" || nat != "cone" || !relay {
 		return "client", nil
 	}
-	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
+	all, e := s.rows("SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=? AND node_id!=?", now-ttl, id)
 	if e != nil {
 		return "", e
 	}
@@ -2880,7 +3291,7 @@ func (s *server) registeredNode(id string) (*node, sql.NullInt64, sql.NullString
 	var override sql.NullString
 	err := s.registerLookupStmt.QueryRow(id).Scan(
 		&n.ID, &n.PublicKey, &n.NAT, &n.Role, &n.Endpoint, &n.RequestedRole,
-		&relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &owner, &override,
+		&relay, &n.Capacity, &n.LastSeen, &n.CreatedAt, &n.ConnectedAt, &n.MeshIP, &n.GoArch, &owner, &override,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, owner, override, nil
@@ -2916,9 +3327,14 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		Capacity int                        `json:"capacity"`
 		Relay    *bool                      `json:"relay_capable"`
 		Links    []protocol.LinkMeasurement `json:"links"`
+		GoArch   string                     `json:"goarch"`
 	}
 	if decodeJSON(w, r, &d) != nil || d.ID == "" || len(d.ID) > 128 || d.Public == "" || len(d.Public) > 256 || d.Endpoint == "" || len(d.Endpoint) > 256 || !(d.NAT == "cone" || d.NAT == "symmetric") || !(d.Role == "auto" || d.Role == "client" || d.Role == "superpeer") {
 		reply(w, 400, map[string]any{"error": "missing or invalid required fields"})
+		return
+	}
+	if !validGoArch(d.GoArch) {
+		reply(w, 400, map[string]any{"error": "invalid goarch"})
 		return
 	}
 	if _, _, err := net.SplitHostPort(d.Endpoint); err != nil {
@@ -3014,9 +3430,9 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		ownerValue = accountID
 	}
 	if previous == nil {
-		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, now, ip, ownerValue)
+		_, e = s.registerInsertStmt.Exec(d.ID, d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now, now, ip, d.GoArch, ownerValue)
 	} else {
-		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, ownerValue, d.ID)
+		_, e = s.registerUpdateStmt.Exec(d.Public, d.NAT, role, d.Endpoint, d.Role, boolInt(relay), d.Capacity, now, now-int64(ttl), now, ip, d.GoArch, ownerValue, d.ID)
 	}
 	s.registerMu.Unlock()
 	if e != nil {
@@ -3485,7 +3901,7 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("node_id")
 	ttl := s.settings().TTL
 	accountID, scoped := s.accountIDForRequest(r)
-	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip FROM nodes WHERE last_seen>=?"
+	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(ttl)}
 	if scoped {
 		query += " AND owner_id=?"

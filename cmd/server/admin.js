@@ -874,7 +874,7 @@ function renderAllRemoveList() {
 }
 async function loadScopes() {
   try {
-    let [config, online, all, audit, invites, graphData] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph')]);
+    let [config, online, all, audit, invites, graphData, updates] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph'), api('/v1/admin/updates')]);
     state = {
       config,
       topology: (state.scope === 'all' ? all : online),
@@ -886,7 +886,12 @@ async function loadScopes() {
       audit: audit || [],
       invites: invites || [],
       manualLinks: graphData.links || [],
-      blockedLinks: graphData.blocked_links || []
+      blockedLinks: graphData.blocked_links || [],
+      updates: updates || {
+        urls: {},
+        binaries: [],
+        results: {}
+      }
     };
     $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     applySettingsFromServer();
@@ -895,7 +900,8 @@ async function loadScopes() {
     $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
     // Refresh every view derived from the new scoped snapshot together.
     render();
-    renderAllRemoveList()
+    renderAllRemoveList();
+    renderUpdates()
   } catch (e) {
     $('liveDot').classList.remove('live');
     $('liveText').textContent = 'Disconnected';
@@ -1343,3 +1349,120 @@ $('dnsNodeChoice').onchange = e => {
   }
 };
 
+
+// ---------------------------------------------------------------------------
+// Client updates: per-architecture links / stored binaries, dispatch and
+// per-node status. Binaries live on the coordinator; links point anywhere
+// (GitHub releases, for example). Nodes pick the entry matching their
+// runtime.GOOS/GOARCH — binaries win over links — download in the
+// background, replace their executable at the same path and restart.
+// ---------------------------------------------------------------------------
+
+const updateArchs = [
+  {arch: 'linux/amd64', label: 'Linux x86_64 · mesh-node'},
+  {arch: 'linux/arm64', label: 'Linux ARM64 · mesh-node-linux-arm64'},
+  {arch: 'linux/mipsle', label: 'Linux MIPSle (OpenWrt) · mesh-node-linux-mipsle'},
+  {arch: 'windows/amd64', label: 'Windows x86_64 · mesh-node.exe'}
+];
+
+function fmtUpdateSize(n) {
+  return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.round(n / 1024) + ' KB';
+}
+
+function renderUpdates() {
+  let u = state.updates || {urls: {}, binaries: [], results: {}};
+  let urls = u.urls || {};
+  let binByArch = {};
+  for (let b of u.binaries || []) binByArch[b.arch] = b;
+  // Known architectures first, then anything the server reports beyond them.
+  let archs = updateArchs.map(a => a.arch);
+  for (let b of u.binaries || []) if (!archs.includes(b.arch)) archs.push(b.arch);
+  for (let a of Object.keys(urls)) if (urls[a] && !archs.includes(a)) archs.push(a);
+  $('updateRows').innerHTML = archs.map(arch => {
+    let known = updateArchs.find(x => x.arch === arch);
+    let b = binByArch[arch];
+    let stored = b
+      ? `<span class="chip">stored</span> ${esc(fmtUpdateSize(b.size))} · ${new Date(b.updated_at * 1000).toLocaleString()} <button class="ghost" data-del-binary="${esc(arch)}">Remove</button>`
+      : '<input type="file" data-upload="' + esc(arch) + '" />';
+    return `<tr><td>${esc(known ? known.label : 'Custom')}<br><code>${esc(arch)}</code></td>` +
+      `<td><input type="text" data-url-arch="${esc(arch)}" value="${esc(urls[arch] || '')}" placeholder="https://github.com/owner/repo/releases/.."/></td>` +
+      `<td>${stored}</td></tr>`;
+  }).join('');
+  let nodes = (state.topologies ? (state.topologies.online?.nodes || state.topologies.all?.nodes) : state.topology.nodes) || [];
+  let current = $('updateTarget').value;
+  $('updateTarget').innerHTML = '<option value="">All connected nodes</option>' + nodes
+    .filter(n => n.online !== false)
+    .map(n => `<option value="${esc(n.node_id)}">${esc(n.node_id.slice(0, 12))} · ${esc(n.mesh_ip || '?')}${n.goarch ? ' · ' + esc(n.goarch) : ''}</option>`)
+    .join('');
+  if ([...$('updateTarget').options].some(o => o.value === current)) $('updateTarget').value = current;
+  let entries = Object.entries(u.results || {}).sort((a, b) => (b[1].at || 0) - (a[1].at || 0));
+  $('updateStatusRows').innerHTML = entries.map(([id, r]) =>
+    `<tr><td><code>${esc(id.slice(0, 12))}</code></td><td>${esc(r.goarch || '')}</td>` +
+    `<td><span class="chip">${esc(r.status)}</span></td><td>${esc(r.detail || '')}</td>` +
+    `<td>${r.at ? new Date(r.at * 1000).toLocaleTimeString() : ''}</td></tr>`
+  ).join('') || '<tr><td colspan="5" class="muted">No update attempts yet.</td></tr>';
+}
+
+$('saveUpdateLinks').onclick = async () => {
+  try {
+    let urls = {};
+    document.querySelectorAll('[data-url-arch]').forEach(x => {
+      urls[x.dataset.urlArch] = x.value.trim();
+    });
+    await api('/v1/admin/updates', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({urls})});
+    toast('Update links saved');
+    load()
+  } catch (e) {
+    toast(e.message)
+  }
+};
+
+$('updateDispatchForm').onsubmit = async e => {
+  e.preventDefault();
+  let id = $('updateTarget').value;
+  let question = id
+    ? 'Send the update command to the selected node? It will download the new binary and restart itself.'
+    : 'Send the update command to ALL connected nodes? They will download the new binary and restart themselves.';
+  if (!confirm(question)) return;
+  try {
+    let body = id ? {node_id: id} : {all: true};
+    let x = await api('/v1/admin/updates/dispatch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+    let skipped = (x.results || []).filter(r => !r.ok);
+    toast(skipped.length ? `Update sent; ${skipped.length} node(s) skipped (${skipped[0].detail || 'no source'})` : 'Update command delivered');
+    load()
+  } catch (e2) {
+    toast(e2.message)
+  }
+};
+
+document.body.addEventListener('change', e => {
+  let input = e.target.closest('[data-upload]');
+  if (input && input.files && input.files[0]) uploadUpdateBinary(input.dataset.upload, input.files[0]);
+});
+
+document.body.addEventListener('click', e => {
+  let b = e.target.closest('[data-del-binary]');
+  if (b) removeUpdateBinary(b.dataset.delBinary);
+});
+
+async function uploadUpdateBinary(arch, file) {
+  if (!confirm(`Upload ${file.name} (${fmtUpdateSize(file.size)}) for ${arch}? Nodes on this architecture will update from the coordinator.`)) return;
+  try {
+    await api('/v1/admin/updates/binaries/' + encodeURIComponent(arch), {method: 'PUT', body: file});
+    toast('Binary stored on the coordinator');
+    load()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
+async function removeUpdateBinary(arch) {
+  if (!confirm(`Remove the stored ${arch} binary from the coordinator?`)) return;
+  try {
+    await api('/v1/admin/updates/binaries/' + encodeURIComponent(arch), {method: 'DELETE'});
+    toast('Stored binary removed');
+    load()
+  } catch (e) {
+    toast(e.message)
+  }
+}

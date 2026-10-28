@@ -155,6 +155,36 @@ cat request.bin | ./mesh-node --server https://SERVER_IP:8001 \
   --call NODE_ID:web > response.bin
 ```
 
+## Client self-update
+
+The admin panel (Settings → "Client updates") can distribute new `mesh-node`
+builds to the running fleet. Two sources per architecture are supported —
+`linux/amd64`, `linux/arm64`, `linux/mipsle` and `windows/amd64`:
+
+- **Stored binary** — upload the file in the admin panel; it is kept in the
+  coordinator's SQLite database and served to nodes at
+  `/v1/update/binaries/{arch}` (authenticated with the node's network token).
+- **Download link** — any HTTPS URL, for example a GitHub release artifact.
+
+"Send update" (for one selected node or all connected nodes) pushes an
+`update` event over the control WebSocket. The node downloads the binary for
+its `runtime.GOOS/GOARCH` in the background (stored binaries win over
+links), verifies the announced size and SHA-256, and replaces its own
+executable. The installed path never changes, so systemd units, OpenWrt
+init scripts and Windows `HKCU\...\Run` autostart entries keep working
+without re-registration:
+
+- On Linux/macOS/BSD the new file is renamed over the running executable
+  (atomic) and the process re-executes itself in place (`syscall.Exec`).
+- On Windows the running `.exe` is renamed to `mesh-node.exe.old`, the new
+  file takes the original name, and a new process starts; the leftover
+  `.old` file is removed on the next start.
+
+Per-node progress (`restarting` / `failed` with the reason) is reported back
+and shown in the admin panel; update actions are recorded in the audit log.
+Nodes report their architecture (`goarch`) during registration, so the panel
+knows which build each device would receive.
+
 ## Security and compatibility
 
 The data plane authenticates UDP envelopes with HMAC-SHA-256, uses X25519 key

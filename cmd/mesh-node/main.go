@@ -280,6 +280,8 @@ type node struct {
 	pingMu             sync.Mutex
 	pings              map[string]pingProbe
 	linksRejected      atomic.Bool // coordinator cannot accept piggybacked link reports
+	goarchRejected     atomic.Bool // coordinator cannot accept the goarch report
+	updating           atomic.Bool // a self-update download/swap is in progress
 	telemetryMu        sync.Mutex
 	lastTelemetrySent  time.Time
 	lastTelemetryLinks []protocol.LinkMeasurement
@@ -366,6 +368,10 @@ func main() {
 		}
 	}
 	log.Printf("[mesh-node] loading configuration; use --server and --network-token/--invite-token to skip interactive prompts")
+	// Remove the previous version left behind by a self-update (Windows only;
+	// no-op on other platforms). Runs before anything else so restarts are
+	// always clean.
+	cleanupUpdateBackup()
 	c := parse()
 	if c.token != "" && len(c.token) < 24 {
 		log.Fatal("--network-token must be at least 24 characters")
@@ -1038,6 +1044,13 @@ func (n *node) readControl(ws *websocket.Conn, replies chan<- controlFrame) {
 			}
 			continue
 		}
+		if frame.Event == "update" {
+			// The coordinator wants this node to download a new binary and
+			// restart into it. Handled in a goroutine so the control loop
+			// keeps servicing hole-punching traffic during the download.
+			go n.handleUpdateEvent(frame.Body)
+			continue
+		}
 		select {
 		case replies <- frame:
 		default:
@@ -1286,15 +1299,29 @@ func (n *node) register() error {
 	if !n.linksRejected.Load() {
 		r["links"] = n.currentLinks()
 	}
+	// goarch lets the coordinator target update commands at the right binary
+	// build. Same compatibility rule as links: drop the field and retry if an
+	// old coordinator rejects it.
+	if !n.goarchRejected.Load() {
+		r["goarch"] = runtime.GOOS + "/" + runtime.GOARCH
+	}
 	var out struct {
 		MeshIP string `json:"mesh_ip"`
 		Role   string `json:"assigned_role"`
 		Token  string `json:"network_token"`
 	}
 	if e := n.request("POST", "/v1/register", r, &out); e != nil {
-		if !n.linksRejected.Load() && strings.Contains(e.Error(), "status 400") {
-			n.linksRejected.Store(true)
-			delete(r, "links")
+		if strings.Contains(e.Error(), "status 400") {
+			// The strict decoder rejected at least one optional field. Drop
+			// them one at a time (newest first) and retry.
+			if !n.linksRejected.Load() {
+				n.linksRejected.Store(true)
+				delete(r, "links")
+			}
+			if !n.goarchRejected.Load() {
+				n.goarchRejected.Store(true)
+				delete(r, "goarch")
+			}
 			if e = n.request("POST", "/v1/register", r, &out); e != nil {
 				return e
 			}

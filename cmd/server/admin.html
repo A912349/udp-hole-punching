@@ -481,6 +481,73 @@
       </div>
      </form>
     </article>
+    <article class="card">
+     <h2>
+      Client updates
+     </h2>
+     <p class="muted">
+      Upload a mesh-node binary for an architecture or paste a download link (a GitHub release, for example). Nodes download in the background, replace their own executable at the same path and restart, so existing autostart entries keep working.
+     </p>
+     <table>
+      <thead>
+       <tr>
+        <th>
+         Architecture
+        </th>
+        <th>
+         Download link
+        </th>
+        <th>
+         Stored binary
+        </th>
+       </tr>
+      </thead>
+      <tbody id="updateRows">
+      </tbody>
+     </table>
+     <form class="settingGrid" id="updateLinksForm">
+      <div>
+       <button id="saveUpdateLinks">
+        Save links
+       </button>
+      </div>
+     </form>
+     <form class="settingGrid" id="updateDispatchForm">
+      <label>
+       Target
+       <select id="updateTarget">
+       </select>
+      </label>
+      <div>
+       <button>
+        Send update
+       </button>
+      </div>
+     </form>
+     <table>
+      <thead>
+       <tr>
+        <th>
+         Node
+        </th>
+        <th>
+         Architecture
+        </th>
+        <th>
+         Status
+        </th>
+        <th>
+         Detail
+        </th>
+        <th>
+         When
+        </th>
+       </tr>
+      </thead>
+      <tbody id="updateStatusRows">
+      </tbody>
+     </table>
+    </article>
     <article class="card danger">
      <h2>
       Device removal
