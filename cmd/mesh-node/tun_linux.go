@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -54,7 +56,9 @@ func openTUN(name string) (tunDevice, error) {
 	copy(req[:16], name)
 	*(*uint16)(unsafe.Pointer(&req[16])) = iffTUN | iffNoPI
 	fd := f.Fd()
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(tunSetIFF), uintptr(unsafe.Pointer(&req[0])))
+	// unix.TUNSETIFF is generated per-architecture from the kernel headers:
+	// 0x400454ca on x86/arm/..., 0x800454ca on MIPS (different ioctl encoding).
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, unix.TUNSETIFF, uintptr(unsafe.Pointer(&req[0])))
 	if errno != 0 {
 		f.Close()
 		return nil, errno
