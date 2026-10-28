@@ -1546,11 +1546,10 @@ func (n *node) applyTopology(t topology) {
 		n.logf("LAN endpoint candidate for %s: %s", hello.id[:8], hello.addr)
 		n.sendToAddress(protocol.NewPacket("HELLO", n.id.ID, hello.id, map[string]any{"public_key": n.id.Public}), hello.addr)
 	}
-	if n.sameNATPeerExists() {
-		// A same-NAT peer just appeared or the topology changed: broadcast once
-		// right away instead of waiting for the next burst/interval tick.
-		n.broadcastLANDiscovery()
-	}
+	// The topology just changed: a new peer may sit on this very LAN (its
+	// broadcasts may already have been missed while it was bootstrapping),
+	// so announce immediately instead of waiting for the next tick.
+	n.broadcastLANDiscovery()
 	n.syncPortForwards(t.Forwards)
 	n.cancelObsoleteSymmetricScans()
 	if n.c.debug {
@@ -2697,10 +2696,9 @@ func (n *node) broadcastLANDiscovery() {
 	}
 	conn := n.lanConn
 	n.mu.RUnlock()
-	if !n.sameNATPeerExists() {
-		// Every known node is behind a different NAT: nobody on this segment
-		// can hear the broadcast, so do not send it.
-		n.debugf("LAN discovery skipped: no peer shares this node's external IP")
+	if !n.meshHasOtherNodes() {
+		// A lone node has nobody to discover: the broadcast would be noise.
+		n.debugf("LAN discovery skipped: no other node in the mesh")
 		return
 	}
 	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
@@ -2709,9 +2707,53 @@ func (n *node) broadcastLANDiscovery() {
 	if err != nil {
 		return
 	}
-	if _, err = conn.WriteToUDP(b, &net.UDPAddr{IP: net.IPv4bcast, Port: lanDiscoveryPort}); err != nil {
-		n.debugf("LAN discovery broadcast failed: %v", err)
+	// The limited broadcast alone finds peers unreliably: multi-homed hosts
+	// send it out of the default-route interface only, and some Wi-Fi
+	// drivers or APs drop it entirely. Every local subnet therefore also
+	// receives a directed broadcast (192.168.1.255 style), which the routing
+	// table delivers through the interface that actually owns the subnet.
+	targets := append([]net.IP{net.IPv4bcast}, n.subnetBroadcastAddrs()...)
+	for _, ip := range targets {
+		if _, err = conn.WriteToUDP(b, &net.UDPAddr{IP: ip, Port: lanDiscoveryPort}); err != nil {
+			n.debugf("LAN discovery broadcast to %s failed: %v", ip, err)
+		}
 	}
+}
+
+// subnetBroadcastAddrs returns the directed broadcast address of every
+// physical local subnet. Unlike 255.255.255.255, a directed broadcast
+// follows the routing table and leaves through the interface that owns the
+// subnet, which makes LAN discovery work on routers and multi-NIC hosts.
+func (n *node) subnetBroadcastAddrs() []net.IP {
+	subnets := n.localSubnets()
+	out := make([]net.IP, 0, len(subnets))
+	seen := map[uint32]bool{}
+	for _, subnet := range subnets {
+		ip, ok := broadcastForPrefix(subnet)
+		if !ok {
+			continue
+		}
+		key := binary.BigEndian.Uint32(ip)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, ip)
+	}
+	return out
+}
+
+// broadcastForPrefix returns the directed broadcast address of a prefix:
+// the masked network address with all host bits set. /31 and /32 have no
+// broadcast address and /0 is the default route, so they report false.
+func broadcastForPrefix(subnet netip.Prefix) (net.IP, bool) {
+	if !subnet.Addr().Is4() || subnet.Bits() <= 0 || subnet.Bits() >= 31 {
+		return nil, false
+	}
+	raw := subnet.Masked().Addr().As4()
+	addr := binary.BigEndian.Uint32(raw[:])
+	addr |= 0xffffffff >> subnet.Bits()
+	return net.IPv4(byte(addr>>24), byte(addr>>16), byte(addr>>8), byte(addr)).To4(), true
 }
 
 func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
@@ -3256,6 +3298,7 @@ func (n *node) helloAll() {
 	}
 }
 func (n *node) pingAll() {
+	now := time.Now()
 	n.mu.RLock()
 	targets := make([]pingTarget, 0, len(n.neighbors))
 	for id, peer := range n.neighbors {
@@ -3263,15 +3306,25 @@ func (n *node) pingAll() {
 		if observed, ok := peer.last.(*net.UDPAddr); ok {
 			target.observed = &net.UDPAddr{IP: append(net.IP(nil), observed.IP...), Port: observed.Port, Zone: observed.Zone}
 		}
+		if lan := peer.lastLAN; lan != nil && !freshLAN(peer, now) {
+			// Unconfirmed LAN candidate: keepalives double as LAN probes so a
+			// lost broadcast or HELLO costs one keepalive interval instead of
+			// the full 30-second probe round. When the LAN path is already
+			// traffic-confirmed, observed is the LAN address and no duplicate
+			// datagram is sent.
+			target.lan = copyUDPAddr(lan)
+		}
 		targets = append(targets, target)
 	}
 	n.mu.RUnlock()
-	now := time.Now()
 	n.pingMu.Lock()
 	prunePings(n.pings, now.Add(-linkTimeout))
 	n.pingMu.Unlock()
 	for _, target := range targets {
 		p := protocol.NewPacket("PING", n.id.ID, target.id, map[string]any{})
+		if target.lan != nil && (target.observed == nil || target.lan.String() != target.observed.String()) {
+			n.sendDirect(p, "", target.lan)
+		}
 		if !n.sendDirect(p, target.endpoint, target.observed) {
 			// Do not wait for the next linkHealth tick when the socket cannot
 			// even send the probe. This used to leave a dead edge without any
@@ -3298,6 +3351,7 @@ type pingTarget struct {
 	id       string
 	endpoint string
 	observed *net.UDPAddr
+	lan      *net.UDPAddr // unconfirmed LAN candidate to re-probe
 }
 
 // sendDirect bypasses mesh routing. Keepalive RTT is a measurement of a
@@ -3985,21 +4039,22 @@ func (n *node) nextPacketID(dst []byte) bool {
 	}
 }
 
-// sameNATPeerExists reports whether any known node other than this one
-// publishes an external endpoint with the same IP — i.e., LAN discovery has a
-// plausible target on the local segment. Same external IP is a hint, not a
-// guarantee, but when no peer matches there is nobody to find on the LAN and
-// broadcasts are pure noise.
-func (n *node) sameNATPeerExists() bool {
+// meshHasOtherNodes reports whether the mesh currently knows at least one
+// node other than this one. This is the only broadcast gate: requiring a
+// same-NAT endpoint match before broadcasting used to disable LAN discovery
+// exactly when it matters — at startup before the first STUN result, on
+// multi-WAN routers where members of one physical LAN publish different
+// external IPs, and whenever the published endpoint is stale.
+func (n *node) meshHasOtherNodes() bool {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
-	for id, p := range n.dir {
-		if id != n.id.ID && n.sameNAT(p) {
+	for id := range n.neighbors {
+		if id != n.id.ID {
 			return true
 		}
 	}
-	for id, p := range n.neighbors {
-		if id != n.id.ID && n.sameNAT(p) {
+	for id := range n.dir {
+		if id != n.id.ID {
 			return true
 		}
 	}
@@ -4012,9 +4067,42 @@ func copyUDPAddr(a *net.UDPAddr) *net.UDPAddr {
 	return &net.UDPAddr{IP: append(net.IP(nil), a.IP...), Port: a.Port, Zone: a.Zone}
 }
 
-// localSubnets returns the IPv4 prefixes of the up local interfaces. The
+// virtualInterfaceName reports whether the interface is a well-known virtual
+// bridge or adapter (Docker, libvirt, VMware, Hyper-V/WSL, VPN overlays).
+// Addresses of such interfaces are unreachable for peers and would waste the
+// LAN probe budget of the real addresses. Name heuristics cover Linux
+// (docker0, veth*, virbr*, zt*, wg*, tun*, tap*), Windows (vEthernet (WSL),
+// VirtualBox Host-Only, VMware Network Adapter) and OpenWrt, whose real LAN
+// bridge br-lan must keep passing.
+func virtualInterfaceName(name string) bool {
+	lower := strings.ToLower(name)
+	if lower == "lo" || strings.HasPrefix(lower, "lo0") || strings.Contains(lower, "loopback") || strings.Contains(lower, "bluetooth") {
+		return true
+	}
+	// Docker user-defined bridges are br-<12 hex chars>; OpenWrt's real LAN
+	// bridge is br-lan / br-wan and must not be filtered.
+	if strings.HasPrefix(lower, "br-") && len(lower) > 6 {
+		return true
+	}
+	for _, prefix := range []string{"docker", "veth", "virbr", "vmnet", "vboxnet", "wsl", "tailscale", "zerotier", "zt", "tun", "tap", "utun", "wg", "ifb", "dummy"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	for _, part := range []string{"virtual", "vmware", "hyper-v"} {
+		if strings.Contains(lower, part) {
+			return true
+		}
+	}
+	return false
+}
+
+// localSubnets returns the IPv4 prefixes of the up physical interfaces. The
 // result is cached: enumerating interfaces on every keepalive would add
-// syscalls to the control path.
+// syscalls to the control path. Loopback, link-local (169.254/16, adapters
+// without DHCP on Windows), mesh-overlay and virtual-adapter addresses are
+// excluded: they are unusable as LAN endpoint candidates and would otherwise
+// crowd the real addresses out of the probe budget.
 func (n *node) localSubnets() []netip.Prefix {
 	n.subnetsMu.Lock()
 	defer n.subnetsMu.Unlock()
@@ -4025,7 +4113,7 @@ func (n *node) localSubnets() []netip.Prefix {
 	subnets := make([]netip.Prefix, 0, 4)
 	if interfaces, err := net.Interfaces(); err == nil {
 		for _, iface := range interfaces {
-			if iface.Flags&net.FlagUp == 0 {
+			if iface.Flags&net.FlagUp == 0 || virtualInterfaceName(iface.Name) || (n.c.tun != "" && iface.Name == n.c.tun) {
 				continue
 			}
 			addrs, err := iface.Addrs()
@@ -4042,7 +4130,7 @@ func (n *node) localSubnets() []netip.Prefix {
 					continue
 				}
 				ip = ip.Unmap()
-				if !ip.Is4() {
+				if !ip.Is4() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || n.isMeshAddr(ip) {
 					continue
 				}
 				bits, _ := net.IPMask(ipnet.Mask).Size()
@@ -4053,6 +4141,23 @@ func (n *node) localSubnets() []netip.Prefix {
 	n.subnets = subnets
 	n.subnetsAt = now
 	return subnets
+}
+
+// isMeshAddr reports whether ip belongs to the overlay (mesh) subnet of this
+// node, so the TUN address never leaks into the LAN candidates: probing an
+// overlay address over the physical network can never succeed.
+func (n *node) isMeshAddr(ip netip.Addr) bool {
+	mesh := n.meshIPv4.Load()
+	if mesh == 0 || n.c.prefix <= 0 || n.c.prefix > 32 {
+		return false
+	}
+	var raw [4]byte
+	binary.BigEndian.PutUint32(raw[:], mesh)
+	meshAddr, ok := netip.AddrFromSlice(raw[:])
+	if !ok {
+		return false
+	}
+	return netip.PrefixFrom(meshAddr, n.c.prefix).Contains(ip)
 }
 
 // advertisedLanAddrs lists this node's local UDP endpoint candidates
