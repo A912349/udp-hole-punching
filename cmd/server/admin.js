@@ -630,7 +630,7 @@ async function setNetwork(id) {
   }
 }
 async function clearNetwork(id) {
-  if (!confirm('Revoke all advertised subnets and LAN DNS records?')) return;
+  if (!(await confirmModal('Revoke all advertised subnets and LAN DNS records?', {ok: 'Revoke', danger: true}))) return;
   try {
     await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network', {
       method: 'PUT',
@@ -671,7 +671,7 @@ async function addRoute(id) {
   }
 }
 async function removeRoute(id, route) {
-  if (!confirm(`Revoke subnet ${route}?`)) return;
+  if (!(await confirmModal(`Revoke subnet ${route}?`, {ok: 'Revoke', danger: true}))) return;
   try {
     await api('/v1/admin/nodes/' + encodeURIComponent(id) + '/network/routes', {
       method: 'DELETE',
@@ -690,7 +690,7 @@ async function removeRoute(id, route) {
   }
 }
 async function removePeer(id) {
-  if (!confirm(`Remove peer ${id.slice(0,12)}?`)) return;
+  if (!(await confirmModal(`Remove peer ${id.slice(0,12)}? The device must be re-enrolled with a new setup key.`, {ok: 'Remove', danger: true}))) return;
   try {
     await api('/v1/admin/nodes/' + encodeURIComponent(id), {
       method: 'DELETE'
@@ -738,8 +738,51 @@ function render() {
 function renderAudit() {
   let q = ($('eventSearch').value || '').toLowerCase(),
     items = state.audit.filter(x => !q || ((x.event || '') + ' ' + (x.detail || '')).toLowerCase().includes(q));
-  $('auditRows').innerHTML = items.map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('') || `<tr><td colspan="3" class="muted">${state.audit.length ? 'Nothing matches the filter.' : 'No events recorded yet.'}</td></tr>`
+  $('auditRows').innerHTML = items.map(x => `<tr><td>${new Date(x.created_at*1000).toLocaleString()}</td><td>${esc(x.event)}</td><td>${esc(x.detail)}</td></tr>`).join('') || `<tr><td colspan="3" class="muted">${state.audit.length ? 'Nothing matches the filter.' : 'No events recorded yet.'}</td></tr>`;
+  $('auditMore').hidden = !state.auditHasMore;
+  $('auditCount').textContent = state.audit.length + (state.auditHasMore ? '+' : '') + ' loaded'
 }
+
+// Merge a fresh first page with previously loaded older rows so the periodic
+// refresh does not discard expanded history. Rows have no stable id, so the
+// created_at|event|detail tuple is the dedupe key; the list is capped to keep
+// the render bounded.
+function mergeAudit(fresh, hasMore) {
+  let seen = new Set(),
+    merged = [];
+  for (const x of [...fresh, ...state.audit]) {
+    let k = x.created_at + '|' + x.event + '|' + x.detail;
+    if (!seen.has(k)) {
+      seen.add(k);
+      merged.push(x)
+    }
+  }
+  state.audit = merged.slice(0, 500);
+  state.auditHasMore = hasMore
+}
+
+$('auditMore').onclick = async () => {
+  let last = state.audit[state.audit.length - 1];
+  if (!last || !state.auditHasMore) return;
+  $('auditMore').disabled = true;
+  try {
+    let x = await api('/v1/admin/audit?limit=100&before=' + encodeURIComponent(last.created_at));
+    let seen = new Set(state.audit.map(y => y.created_at + '|' + y.event + '|' + y.detail));
+    for (const ev of x.events || []) {
+      let k = ev.created_at + '|' + ev.event + '|' + ev.detail;
+      if (!seen.has(k)) {
+        seen.add(k);
+        state.audit.push(ev)
+      }
+    }
+    state.auditHasMore = !!x.has_more;
+    renderAudit()
+  } catch (e) {
+    toast(e.message)
+  } finally {
+    $('auditMore').disabled = false
+  }
+};
 
 function renderEditor() {
   let n = state.topology.nodes || [],
@@ -800,7 +843,7 @@ $('addEdge').onclick = () => {
 };
 $('edgeCost').oninput = () => $('quickCost').value = $('edgeCost').value;
 $('autoGraph').onclick = async () => {
-  if (confirm('Discard manual links and restore automatic topology?')) {
+  if (await confirmModal('Discard manual links and restore automatic topology?', {ok: 'Discard', danger: true})) {
     try {
       state.manualLinks = [];
       state.blockedLinks = [];
@@ -856,7 +899,7 @@ function renderAllRemoveList() {
 }
 async function loadScopes() {
   try {
-    let [config, online, all, audit, invites, graphData, updates] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph'), api('/v1/admin/updates')]);
+    let [config, online, all, auditResp, invites, graphData, updates] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit?limit=100'), api('/v1/admin/invites'), api('/v1/admin/graph'), api('/v1/admin/updates')]);
     state = {
       config,
       topology: (state.scope === 'all' ? all : online),
@@ -865,7 +908,8 @@ async function loadScopes() {
         all
       },
       scope: state.scope,
-      audit: audit || [],
+      audit: [],
+      auditHasMore: false,
       invites: invites || [],
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || [],
@@ -875,6 +919,7 @@ async function loadScopes() {
         results: {}
       }
     };
+    mergeAudit(auditResp?.events || [], !!(auditResp && auditResp.has_more));
     applySettingsFromServer();
     renderDNSNodeChoice(all.nodes || []);
     $('liveDot').classList.add('live');
@@ -1141,6 +1186,7 @@ async function accountLogin() {
     $('accountLogout').hidden = false;
     $('accountPassword').value = '';
     $('accountRegistrationInvite').value = '';
+    startStream();
     toast('Signed in');
     await loadScopes();
     startLiveRefresh()
@@ -1177,6 +1223,7 @@ async function accountLogout() {
       }
     })
   } catch (e) {}
+  stopStream();
   sessionStorage.removeItem('meshToken');
   location.reload()
 }
@@ -1201,7 +1248,7 @@ $('accountLogin').onclick = accountLogin;
 $('accountRegister').onclick = accountRegister;
 $('accountLogout').onclick = accountLogout;
 $('rotateAccountToken').onclick = async () => {
-  if (!confirm('Rotate the network token? All devices using the current token will lose access and must be updated.')) return;
+  if (!(await confirmModal('Rotate the network token? All devices using the current token will lose access and must be updated.', {ok: 'Rotate', danger: true}))) return;
   let button = $('rotateAccountToken');
   button.disabled = true;
   try {
@@ -1235,11 +1282,74 @@ $('createAccountInvite').onclick = async () => {
     accountError(e)
   }
 };
+// Modal replacement for window.confirm(): same boolean flow, but styled
+// consistently with the UI and explicit about the action being taken.
+function confirmModal(text, { ok = 'Confirm', danger = false } = {}) {
+  return new Promise(resolve => {
+    let dlg = $('confirmDialog'),
+      done = false,
+      finish = value => {
+        if (done) return;
+        done = true;
+        dlg.close();
+        resolve(value)
+      };
+    $('confirmText').textContent = text;
+    let okBtn = $('confirmOk');
+    okBtn.textContent = ok;
+    okBtn.classList.toggle('dangerButton', !!danger);
+    okBtn.onclick = () => finish(true);
+    $('confirmCancel').onclick = () => finish(false);
+    dlg.oncancel = () => finish(false);
+    dlg.showModal()
+  })
+}
+
+// Server-sent events: the coordinator pushes an "update" event when topology,
+// configuration or the audit trail changes, so the UI reacts immediately.
+// The 10-second polling cycle stays as a fallback and covers token-only
+// sessions — EventSource cannot send the X-Mesh-Token header, so the stream
+// relies on the account session cookie.
+let sse = null,
+  sseFailures = 0;
+
+function startStream() {
+  if (sse || !('EventSource' in window)) return;
+  sse = new EventSource('/v1/admin/stream');
+  sse.onopen = () => {
+    sseFailures = 0
+  };
+  sse.addEventListener('update', e => {
+    let topics = [];
+    try {
+      topics = JSON.parse(e.data).topics || []
+    } catch (_) {}
+    if (topics.includes('topology')) refreshGraph();
+    if (topics.some(t => t !== 'topology')) load()
+  });
+  sse.onerror = () => {
+    // EventSource reconnects on its own; give up after several consecutive
+    // failures (e.g. token-only admin or a proxy that breaks streaming).
+    if (++sseFailures >= 5) {
+      sse.close();
+      sse = null
+    }
+  }
+}
+
+function stopStream() {
+  if (sse) {
+    sse.close();
+    sse = null
+  }
+}
+
 (async () => {
   try {
     let me = await authJSON('/v1/auth/me');
     if (me.authenticated && me.auth_type !== 'network_token') {
       sessionCredential();
+      startStream();
       $('accountLogin').hidden = true;
       $('accountRegister').hidden = true;
       $('accountLogout').hidden = false;
@@ -1287,7 +1397,7 @@ $('createAccountInvite').onclick = async () => {
       let rows = await api('/v1/admin/forwards');
       $('forwardRows').innerHTML = rows.map(f => `<tr><td>${esc(f.source_node_id.slice(0,12))}</td><td><code>${esc(f.listen_host)}:${f.listen_port}</code></td><td>${esc(f.target_node_id.slice(0,12))} → <code>${esc(f.target_host)}:${f.target_port}</code></td><td><button class="ghost" data-forward-delete="${f.id}">Remove</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">No reverse ports configured.</td></tr>';
       $('forwardRows').querySelectorAll('[data-forward-delete]').forEach(b => b.onclick = async () => {
-        if (!confirm('Remove this forwarding?')) return;
+        if (!(await confirmModal('Remove this forwarding?', {ok: 'Remove', danger: true}))) return;
         try {
           await api('/v1/admin/forwards/' + b.dataset.forwardDelete, {
             method: 'DELETE'
@@ -1437,7 +1547,7 @@ $('updateDispatchForm').onsubmit = async e => {
   let question = id
     ? 'Send the update command to the selected node? It will download the new binary and restart itself.'
     : 'Send the update command to ALL connected nodes? They will download the new binary and restart themselves.';
-  if (!confirm(question)) return;
+  if (!(await confirmModal(question, {ok: 'Send', danger: true}))) return;
   try {
     let body = id ? {node_id: id} : {all: true};
     let x = await api('/v1/admin/updates/dispatch', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
@@ -1460,7 +1570,7 @@ document.body.addEventListener('click', e => {
 });
 
 async function uploadUpdateBinary(arch, file) {
-  if (!confirm(`Upload ${file.name} (${fmtUpdateSize(file.size)}) for ${arch}? Nodes on this architecture will update from the coordinator.`)) return;
+  if (!(await confirmModal(`Upload ${file.name} (${fmtUpdateSize(file.size)}) for ${arch}? Nodes on this architecture will update from the coordinator.`, {ok: 'Upload'}))) return;
   try {
     await api('/v1/admin/updates/binaries/' + encodeURIComponent(arch), {method: 'PUT', body: file});
     toast('Binary stored on the coordinator');
@@ -1471,7 +1581,7 @@ async function uploadUpdateBinary(arch, file) {
 }
 
 async function removeUpdateBinary(arch) {
-  if (!confirm(`Remove the stored ${arch} binary from the coordinator?`)) return;
+  if (!(await confirmModal(`Remove the stored ${arch} binary from the coordinator?`, {ok: 'Remove', danger: true}))) return;
   try {
     await api('/v1/admin/updates/binaries/' + encodeURIComponent(arch), {method: 'DELETE'});
     toast('Stored binary removed');

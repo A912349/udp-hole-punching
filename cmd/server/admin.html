@@ -408,6 +408,11 @@
      </h2>
      <div class="toolbar">
       <input id="eventSearch" placeholder="Filter by event or detail" type="search"/>
+      <span class="muted" id="auditCount">
+      </span>
+      <button class="ghost" hidden id="auditMore">
+       Show older events
+      </button>
      </div>
      <table>
       <thead>
@@ -625,6 +630,18 @@
     </article>
    </section>
   </main>
+  <dialog id="confirmDialog">
+   <p id="confirmText">
+   </p>
+   <div class="confirmActions">
+    <button class="ghost" id="confirmCancel">
+     Cancel
+    </button>
+    <button id="confirmOk">
+     Confirm
+    </button>
+   </div>
+  </dialog>
   <script src="/admin.js">
   </script>
  </body>

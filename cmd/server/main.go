@@ -129,6 +129,12 @@ type server struct {
 	linkCache           map[string]cachedLinks
 	cacheEpoch          uint64
 	metricStamp         atomic.Uint64
+
+	// Admin push channel (SSE). See broadcast/adminStream below.
+	sseMu      sync.Mutex
+	sseClients map[chan []byte]struct{}
+	sseDirty   map[string]bool
+	sseTimer   *time.Timer
 }
 
 type symmetricRendezvous struct {
@@ -325,6 +331,22 @@ func main() {
 			log.Printf("[SERVER] enter this token in the Registration invite field at /admin; it is not stored in the database")
 		}
 	}
+	// Audit retention: the log grows on every login, update and role change,
+	// so old rows are pruned in the background. MESH_AUDIT_RETENTION_DAYS=0
+	// disables pruning entirely. Defaults to 90 days.
+	if retentionDays := envInt("MESH_AUDIT_RETENTION_DAYS", 90); retentionDays > 0 {
+		go func(days int) {
+			prune := func() {
+				if _, err := s.db.Exec("DELETE FROM audit_log WHERE created_at < ?", time.Now().Unix()-int64(days)*86400); err != nil {
+					log.Printf("[SERVER] audit retention: %v", err)
+				}
+			}
+			prune()
+			for range time.Tick(6 * time.Hour) {
+				prune()
+			}
+		}(retentionDays)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/register", s.register)
 	mux.HandleFunc("POST /v1/auth/register", s.accountRegister)
@@ -357,6 +379,7 @@ func main() {
 	mux.HandleFunc("GET /v1/admin/topology", s.adminTopology)
 	mux.HandleFunc("POST /v1/telemetry", s.telemetry)
 	mux.HandleFunc("GET /v1/admin/audit", s.adminAudit)
+	mux.HandleFunc("GET /v1/admin/stream", s.adminStream)
 	mux.HandleFunc("GET /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("POST /v1/admin/invites", s.adminInvite)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
@@ -414,10 +437,12 @@ func securityHeaders(next http.Handler) http.Handler {
 // gzipAdmin compresses the larger read-only admin JSON responses. Topology
 // snapshots contain repeated node IDs and fields, so compression cuts browser
 // refresh traffic substantially while the small control-plane frames and the
-// websocket upgrade remain untouched.
+// websocket upgrade remain untouched. The SSE stream is exempt too: it must
+// flush frames as they happen instead of being buffered into one body.
 func gzipAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/admin/") ||
+			r.URL.Path == "/v1/admin/stream" ||
 			!strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 			next.ServeHTTP(w, r)
 			return
@@ -1310,6 +1335,7 @@ func (s *server) accountRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_registered", fmt.Sprintf("user_id=%d username=%s", userID, d.Username))
+	s.broadcast("audit")
 	reply(w, http.StatusCreated, map[string]any{"status": "created", "username": d.Username, "network_token": networkToken})
 }
 
@@ -1432,6 +1458,7 @@ func (s *server) rotateAccountToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_token_rotated", fmt.Sprintf("user_id=%d", userID))
+	s.broadcast("audit")
 	reply(w, http.StatusOK, map[string]any{"network_token": token, "rotated_at": now})
 }
 
@@ -1699,6 +1726,7 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	s.db.Exec(`INSERT INTO dns_settings(key,value) VALUES('upstream',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, next.DNSUpstream)
 	s.pushTopologies()
+	s.broadcast("config", "audit")
 	reply(w, http.StatusOK, next)
 }
 
@@ -1834,6 +1862,7 @@ func (s *server) adminUpdates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_links_saved", fmt.Sprintf("archs=%d", len(next.URLs)))
+	s.broadcast("updates", "audit")
 	reply(w, http.StatusOK, map[string]any{"urls": s.updateURLs()})
 }
 
@@ -1855,6 +1884,7 @@ func (s *server) adminUpdateBinary(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_binary_removed", arch)
+		s.broadcast("updates", "audit")
 		reply(w, http.StatusOK, map[string]string{"status": "removed"})
 		return
 	}
@@ -1876,6 +1906,7 @@ func (s *server) adminUpdateBinary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_binary_stored", fmt.Sprintf("%s size=%d", arch, len(body)))
+	s.broadcast("updates", "audit")
 	reply(w, http.StatusOK, map[string]any{"arch": arch, "size": len(body), "sha256": hex.EncodeToString(sum[:])})
 }
 
@@ -1996,6 +2027,7 @@ func (s *server) adminUpdateDispatch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "update_dispatched", fmt.Sprintf("%s sent=%d", scope, sent))
+	s.broadcast("updates", "audit")
 	reply(w, http.StatusOK, map[string]any{"results": results})
 }
 
@@ -2434,6 +2466,7 @@ func (s *server) adminNodeNetwork(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_, _ = tx.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_network", fmt.Sprintf("node=%s name=%s routes=%s", id, d.Name, string(raw)))
+	s.broadcast("topology", "audit")
 	if err = tx.Commit(); err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
@@ -2523,6 +2556,7 @@ func (s *server) adminAddNodeRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_route_added", fmt.Sprintf("node=%s route=%s virtual=%s", id, lan, virtual))
+	s.broadcast("topology", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]any{"route": routeAdvertisement{LAN: lan, Virtual: virtual}})
 }
@@ -2582,6 +2616,7 @@ func (s *server) adminRemoveNodeRoute(w http.ResponseWriter, r *http.Request) {
 		rows.Close()
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_route_removed", fmt.Sprintf("node=%s route=%s", id, lan))
+	s.broadcast("topology", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]any{"removed": lan, "routes": remaining})
 }
@@ -2629,6 +2664,7 @@ func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.updateLinkMetrics(report.NodeID, report.Links) {
 		s.metricStamp.Add(1)
+		s.broadcast("topology")
 	}
 	reply(w, 200, map[string]string{"status": "ok"})
 }
@@ -2665,6 +2701,107 @@ func (s *server) updateLinkMetrics(nodeID string, links []protocol.LinkMeasureme
 	s.metricsMu.Unlock()
 	return stateChanged
 }
+// Admin push channel (server-sent events). Browsers open GET /v1/admin/stream
+// and receive a coalesced "update" event whenever topology, configuration,
+// updates or the audit trail change, so the UI reacts immediately instead of
+// waiting for the next poll. The 10-second polling cycle stays in place as a
+// fallback; SSE only removes the visibility lag. EventSource cannot send the
+// X-Mesh-Token header, so the stream authenticates with the account session
+// cookie; token-only sessions simply keep polling.
+// Broadcasts are coalesced: heartbeats from many nodes within one second
+// produce a single event per browser.
+func (s *server) broadcast(topics ...string) {
+	s.sseMu.Lock()
+	defer s.sseMu.Unlock()
+	if s.sseClients == nil {
+		return
+	}
+	dirty := false
+	for _, t := range topics {
+		if !s.sseDirty[t] {
+			s.sseDirty[t] = true
+			dirty = true
+		}
+	}
+	if dirty && s.sseTimer == nil {
+		s.sseTimer = time.AfterFunc(time.Second, s.flushBroadcasts)
+	}
+}
+
+func (s *server) flushBroadcasts() {
+	s.sseMu.Lock()
+	topics := make([]string, 0, len(s.sseDirty))
+	for t := range s.sseDirty {
+		topics = append(topics, t)
+	}
+	s.sseDirty = map[string]bool{}
+	s.sseTimer = nil
+	clients := make([]chan []byte, 0, len(s.sseClients))
+	for c := range s.sseClients {
+		clients = append(clients, c)
+	}
+	s.sseMu.Unlock()
+	if len(topics) == 0 || len(clients) == 0 {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{"topics": topics})
+	frame := []byte("event: update\ndata: " + string(payload) + "\n\n")
+	for _, c := range clients {
+		select {
+		case c <- frame:
+		default: // slow client: drop the frame, the polling fallback covers it
+		}
+	}
+}
+
+func (s *server) adminStream(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		reply(w, http.StatusInternalServerError, map[string]string{"error": "streaming unsupported"})
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no")
+	ch := make(chan []byte, 8)
+	s.sseMu.Lock()
+	if s.sseClients == nil {
+		s.sseClients = map[chan []byte]struct{}{}
+		s.sseDirty = map[string]bool{}
+	}
+	s.sseClients[ch] = struct{}{}
+	s.sseMu.Unlock()
+	defer func() {
+		s.sseMu.Lock()
+		delete(s.sseClients, ch)
+		s.sseMu.Unlock()
+	}()
+	_, _ = io.WriteString(w, ": connected\n\n")
+	flusher.Flush()
+	// Comment frames keep intermediate proxies from closing an idle stream.
+	ping := time.NewTicker(25 * time.Second)
+	defer ping.Stop()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case frame := <-ch:
+			if _, err := w.Write(frame); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ping.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	if !s.adminAuth(w, r) {
 		return
@@ -2675,21 +2812,46 @@ func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
 		reply(w, http.StatusOK, []map[string]any{})
 		return
 	}
-	rows, err := s.db.Query("SELECT created_at,event,detail FROM audit_log ORDER BY created_at DESC LIMIT 30")
+	limit := 100
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 500 {
+			limit = n
+		}
+	}
+	query := "SELECT created_at,event,detail FROM audit_log"
+	args := []any{}
+	if v := r.URL.Query().Get("before"); v != "" {
+		// Cursor pagination: return the page immediately older than the last
+		// row the UI already has.
+		if ts, e := strconv.ParseInt(v, 10, 64); e == nil && ts > 0 {
+			query += " WHERE created_at < ?"
+			args = append(args, ts)
+		}
+	}
+	// One extra row distinguishes "page ends here" from "older rows exist"
+	// without a separate COUNT query.
+	query += " ORDER BY created_at DESC LIMIT ?"
+	args = append(args, limit+1)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
 	defer rows.Close()
 	out := []map[string]any{}
+	hasMore := false
 	for rows.Next() {
+		if len(out) == limit {
+			hasMore = true
+			break
+		}
 		var at int64
 		var event, detail string
 		if rows.Scan(&at, &event, &detail) == nil {
 			out = append(out, map[string]any{"created_at": at, "event": event, "detail": detail})
 		}
 	}
-	reply(w, 200, out)
+	reply(w, 200, map[string]any{"events": out, "has_more": hasMore})
 }
 func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 	s.metricsMu.RLock()
@@ -2885,6 +3047,7 @@ func (s *server) adminInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "invite_created", "six-digit device invite created")
+	s.broadcast("audit")
 	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": now + 60, "expires_in_seconds": 60})
 }
 
@@ -2930,6 +3093,7 @@ func (s *server) accountInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", now, "account_invite_created", "account invitation created")
+	s.broadcast("audit")
 	// The raw token is returned exactly once and is never logged or stored.
 	reply(w, http.StatusCreated, map[string]any{"invite_token": token, "expires_at": expires, "expires_in_seconds": 24 * 60 * 60})
 }
@@ -2961,6 +3125,7 @@ func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
 	_, _ = s.db.Exec("DELETE FROM node_network WHERE node_id=?", id)
 	_, _ = s.db.Exec("DELETE FROM dns_records WHERE node_id=?", id)
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_deleted", id)
+	s.broadcast("topology", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]string{"status": "deleted"})
 }
@@ -3007,6 +3172,7 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "role_changed", id+":"+input.Role)
+	s.broadcast("topology", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]string{"status": "ok", "role": input.Role})
 }
@@ -3094,6 +3260,7 @@ func (s *server) adminGraph(w http.ResponseWriter, r *http.Request) {
 	}
 	s.invalidateLinkCache()
 	s.pushTopologies()
+	s.broadcast("topology", "audit")
 	reply(w, 200, map[string]any{"links": input.Links, "blocked_links": input.BlockedLinks})
 }
 
@@ -3178,7 +3345,6 @@ func (s *server) adminAsset(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
-
 
 func (s *server) rows(query string, args ...any) ([]node, error) {
 	rs, e := s.db.Query(query, args...)
@@ -3467,6 +3633,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 	if len(d.Links) > 0 && s.updateLinkMetrics(d.ID, d.Links) {
 		s.metricStamp.Add(1)
 	}
+	s.broadcast("topology")
 	var enrollmentToken string
 	if accountScoped && r.Header.Get("X-Mesh-Invite") != "" {
 		enrollmentToken, e = s.issueAccountToken(accountID)
@@ -4083,6 +4250,7 @@ func (s *server) adminForwards(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "port_forward_created", f.Source+":"+strconv.Itoa(f.ListenPort)+" -> "+f.Target+":"+f.TargetHost+":"+strconv.Itoa(f.TargetPort))
+	s.broadcast("forwards", "audit")
 	s.pushTopologies()
 	reply(w, 201, map[string]any{"status": "ok"})
 }
@@ -4105,6 +4273,7 @@ func (s *server) adminForward(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = s.db.Exec(`DELETE FROM port_forwards WHERE id=?`, id)
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "port_forward_removed", strconv.FormatInt(id, 10))
+	s.broadcast("forwards", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]any{"status": "ok"})
 }

@@ -426,6 +426,41 @@ code.copyable:hover,
   width: 280px
 }
 
+#auditCount {
+  font-size: 12px
+}
+
+#auditMore {
+  margin-left: auto
+}
+
+/* Confirmation dialog */
+dialog#confirmDialog {
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 18px;
+  max-width: 440px;
+  width: calc(100% - 40px)
+}
+
+dialog#confirmDialog::backdrop {
+  background: rgba(5, 8, 12, 0.6)
+}
+
+dialog#confirmDialog p {
+  margin: 0 0 14px;
+  line-height: 1.5;
+  white-space: pre-line
+}
+
+.confirmActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px
+}
+
 /* Graph canvas: flat dot grid on a solid base. Two background layers are
    required — admin.js moves and scales both during pan/zoom. */
 svg {
