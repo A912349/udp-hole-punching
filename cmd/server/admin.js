@@ -22,6 +22,8 @@
   }
 })();
 const $ = id => document.getElementById(id);
+// Timestamp of the last error toast shown by the periodic refresh.
+let lastErrorToast = 0;
 let state = {
     topology: {
       nodes: [],
@@ -198,13 +200,13 @@ function worldPoint(svg, e) {
   };
 }
 const titles = {
-  overview: ['Network overview', 'Health and connectivity at a glance'],
-  peers: ['Peers', 'Inventory, roles and endpoints'],
-  topology: ['Topology', 'Edit routes and roles directly on the graph'],
-  forwards: ['Reverse ports', 'Forward a local source port to another peer’s LAN'],
-  access: ['Setup keys', 'Enroll new devices securely'],
-  events: ['Events', 'Administrative audit trail'],
-  settings: ['Settings', 'Topology policy and device administration']
+  overview: ['Overview', 'Live network state'],
+  peers: ['Peers', 'Registered devices, roles and endpoints'],
+  topology: ['Topology', 'Links, roles and routes'],
+  forwards: ['Reverse ports', 'TCP listeners on peers, targets on remote LANs'],
+  access: ['Setup keys', 'Enroll new devices'],
+  events: ['Events', 'Audit log'],
+  settings: ['Settings', 'Topology policy, client updates, device removal']
 };
 const edgeKey = (a, b) => a < b ? a + '|' + b : b + '|' + a;
 const esc = value => {
@@ -216,7 +218,9 @@ const esc = value => {
 const escAttr = value => esc(value).replace(/"/g, '&quot;');
 const peerLabel = n => n.name || n.node_id.slice(0, 8);
 const peerID = n => n.node_id.slice(0, 8);
-const peerSub = n => duration(n.uptime_seconds) + ' up';
+// Offline nodes keep a stale connected_at on the server, so their uptime is
+// meaningless — show the state instead of a bogus duration.
+const peerSub = n => n.online === false ? 'offline' : duration(n.uptime_seconds) + ' up';
 
 function duration(seconds) {
   seconds = Number(seconds) || 0;
@@ -256,14 +260,19 @@ async function api(path, options = {}) {
     ...(options.headers || {}),
     'X-Mesh-Token': $('token').value
   };
-  let r = await fetch(path, options),
-    body = await r.json();
-  if (!r.ok) throw Error(body.error || r.statusText);
-  return body
+  let r = await fetch(path, options);
+  return checkResponse(r)
 }
 
-function activeTopology() {
-  return state.topology
+// Reverse proxies and captive portals can answer with HTML; report that as a
+// readable error instead of a JSON parse exception.
+async function checkResponse(r) {
+  let body = null;
+  try {
+    body = await r.json();
+  } catch (e) {}
+  if (!r.ok) throw Error((body && body.error) || `${r.statusText || 'Request failed'} (HTTP ${r.status})`);
+  return body
 }
 
 function setScope(scope) {
@@ -507,10 +516,6 @@ function selectEdge(key) {
   }
 }
 
-function seedManual() {
-  // Automatic links must not be copied into the manual graph. Otherwise
-  // deleting one causes the automatic client attachment logic to recreate it.
-}
 async function publishEdges(message) {
   await api('/v1/admin/graph', {
     method: 'PUT',
@@ -529,7 +534,6 @@ async function addDirectEdge(a, b) {
   let cost = Number($('quickCost').value);
   if (!(cost > 0 && cost <= 1000)) return toast('Cost must be between 0.1 and 1000');
   try {
-    seedManual();
     let key = edgeKey(a, b),
       e = state.manualLinks.find(x => edgeKey(x.a, x.b) === key);
     if (e) e.cost = cost;
@@ -548,7 +552,6 @@ async function addDirectEdge(a, b) {
 async function saveDirectEdge(a, b, cost) {
   if (!(cost > 0 && cost <= 1000)) return toast('Cost must be between 0.1 and 1000');
   try {
-    seedManual();
     let key = edgeKey(a, b),
       e = state.manualLinks.find(x => edgeKey(x.a, x.b) === key);
     if (e) e.cost = cost;
@@ -566,7 +569,6 @@ async function saveDirectEdge(a, b, cost) {
 async function removeDirectEdge(key, button) {
   try {
     if (button) button.disabled = true;
-    seedManual();
     state.manualLinks = state.manualLinks.filter(e => edgeKey(e.a, e.b) !== key);
     // A deleted manual edge must also stay deleted when automatic topology
     // would otherwise select the same client-superpeer pair again.
@@ -715,9 +717,12 @@ function render() {
   $('rttN').textContent = rtts.length ? Math.round(rtts.reduce((a, b) => a + b, 0) / rtts.length) + ' ms' : '—';
   $('healthPct').textContent = (links.length ? Math.round(up * 100 / links.length) : 0) + '% available';
   $('peerBadge').textContent = n.length;
+  let onlineCount = (state.topologies?.online?.nodes || []).length,
+    registeredCount = (state.topologies?.all?.nodes || []).length;
+  $('peerTrend').textContent = onlineCount + ' online · ' + registeredCount + ' registered';
   overviewGraph();
   drawInteractive();
-  $('healthList').innerHTML = links.slice(0, 8).map(x => `<p><span class="statusDot" style="background:${x.status==='up'?'#22c55e':'#ef4444'}"></span> ${esc(x.a.slice(0,6))} → ${esc(x.b.slice(0,6))} <b>${x.rtt_ms?Math.round(x.rtt_ms)+'ms':esc(x.status)}</b></p>`).join('') || '<p class="muted">No links yet</p>';
+  $('healthList').innerHTML = links.slice(0, 8).map(x => `<p><span class="statusDot" style="background:var(--${x.status==='up'?'green':'red'})"></span> ${esc(x.a.slice(0,6))} → ${esc(x.b.slice(0,6))} <b>${x.rtt_ms?Math.round(x.rtt_ms)+'ms':esc(x.status)}</b></p>`).join('') || '<p class="muted">No links yet</p>';
   $('eventPreview').innerHTML = state.audit.slice(0, 5).map(x => `<p><b>${esc(x.event)}</b><br><span class="muted">${new Date(x.created_at*1000).toLocaleString()}</span></p>`).join('');
   renderPeers();
   renderEditor();
@@ -746,29 +751,6 @@ function renderEditor() {
     return `<tr><td>${esc(x.a.slice(0,10))}</td><td>${esc(x.b.slice(0,10))}</td><td>${x.cost}</td><td>${live?.rtt_ms?Math.round(live.rtt_ms)+' ms':'—'}</td><td><button class="ghost" data-delete-edge="${i}">Remove</button></td></tr>`
   }).join('') || '<tr><td colspan="5" class="muted">Automatic topology is active.</td></tr>';
   $('edgeRows').querySelectorAll('[data-delete-edge]').forEach(b => b.onclick = () => deleteEdge(Number(b.dataset.deleteEdge)))
-}
-async function load() {
-  try {
-    let [config, topology, audit, invites, graphData] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology'), api('/v1/admin/audit'), api('/v1/admin/invites'), api('/v1/admin/graph')]);
-    state = {
-      config,
-      topology,
-      audit: audit || [],
-      invites: invites || [],
-      manualLinks: graphData.links || [],
-      blockedLinks: graphData.blocked_links || []
-    };
-    applySettingsFromServer();
-    $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
-    $('liveDot').classList.add('live');
-    $('liveText').textContent = 'Live · ' + new Date().toLocaleTimeString();
-    renderDNSNodeChoice(topology.nodes || []);
-    render()
-  } catch (e) {
-    $('liveDot').classList.remove('live');
-    $('liveText').textContent = 'Disconnected';
-    toast(e.message)
-  }
 }
 async function deleteEdge(i) {
   try {
@@ -893,7 +875,6 @@ async function loadScopes() {
         results: {}
       }
     };
-    $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
     applySettingsFromServer();
     renderDNSNodeChoice(all.nodes || []);
     $('liveDot').classList.add('live');
@@ -903,9 +884,15 @@ async function loadScopes() {
     renderAllRemoveList();
     renderUpdates()
   } catch (e) {
+    let wasLive = $('liveDot').classList.contains('live');
     $('liveDot').classList.remove('live');
     $('liveText').textContent = 'Disconnected';
-    toast(e.message)
+    // A failing background refresh must not spam a toast every 10 seconds:
+    // one message per 30 s is enough, the status dot shows the rest.
+    if (!wasLive || Date.now() - lastErrorToast > 30000) {
+      toast(e.message);
+      lastErrorToast = Date.now()
+    }
   }
 }
 
@@ -961,9 +948,15 @@ function startLiveRefresh() {
   timer = setInterval(loadScopes, 10000);
   graphTimer = setInterval(refreshGraph, 3000);
 }
-$('connect').onclick = () => {
+// Double clicks on Connect must not fire two overlapping refresh cycles.
+$('connect').onclick = async () => {
   sessionStorage.setItem('meshToken', $('token').value);
-  loadScopes();
+  $('connect').disabled = true;
+  try {
+    await loadScopes();
+  } finally {
+    $('connect').disabled = false;
+  }
   startLiveRefresh()
 };
 $('refresh').onclick = loadScopes;
@@ -1123,10 +1116,8 @@ async function authJSON(path, options = {}) {
     ...(options.headers || {}),
     'Content-Type': 'application/json'
   };
-  let r = await fetch(path, options),
-    body = await r.json();
-  if (!r.ok) throw Error(body.error || r.statusText);
-  return body
+  let r = await fetch(path, options);
+  return checkResponse(r)
 }
 
 function accountError(e) {

@@ -4,32 +4,20 @@
   <meta charset="utf-8"/>
   <meta content="width=device-width,initial-scale=1" name="viewport"/>
   <title>
-   Mesh Control
+   mesh coordinator
   </title>
   <link href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2307101e'/%3E%3Cpath d='M8 2 14 8 8 14 2 8Z' fill='%236ca6ff'/%3E%3C/svg%3E" rel="icon"/>
   <link href="/admin.css" rel="stylesheet"/>
   <link href="/admin-interactive.css" rel="stylesheet"/>
  </head>
  <body>
-  <div class="scopeBar" id="scopeBar">
-   <span>
-    Topology view
-   </span>
-   <select id="topologyScope">
-    <option value="online">
-     Online devices only
-    </option>
-    <option value="all">
-     All registered devices
-    </option>
-   </select>
-  </div>
   <aside>
    <div class="brand">
+    mesh
     <span>
-     ◆
+     -
     </span>
-    Mesh Control
+    coordinator
    </div>
    <nav>
     <button class="active" data-page="overview">
@@ -66,11 +54,24 @@
    <header>
     <div>
      <h1 id="pageTitle">
-      Network overview
+      Overview
      </h1>
      <p id="subtitle">
-      Health and connectivity at a glance
+      Live network state
      </p>
+    </div>
+    <div class="scopeBar" id="scopeBar">
+     <span>
+      Scope
+     </span>
+     <select id="topologyScope">
+      <option value="online">
+       Online devices only
+      </option>
+      <option value="all">
+       All registered devices
+      </option>
+     </select>
     </div>
     <div class="connect">
      <input id="token" placeholder="Network token" type="password"/>
@@ -94,7 +95,7 @@
        0
       </b>
       <span id="peerTrend">
-       No data
+       —
       </span>
      </article>
      <article>
