@@ -488,9 +488,36 @@ function renderNodeInspector(n) {
   let box = $('nodeDetail'),
     routes = n.routes || [],
     records = n.dns_records || [];
-  box.innerHTML = `<b class="copyable" data-copy="${escAttr(n.node_id)}" title="Click to copy the full node ID">${esc(n.node_id.slice(0,12))}</b><span><code class="copyable" data-copy="${escAttr(n.mesh_ip)}" title="Click to copy">${esc(n.mesh_ip)}</code> · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><button id="directRemove" class="dangerButton">Remove peer</button>`;
+  box.innerHTML = `<b class="copyable" data-copy="${escAttr(n.node_id)}" title="Click to copy the full node ID">${esc(n.node_id.slice(0,12))}</b><span><code class="copyable" data-copy="${escAttr(n.mesh_ip)}" title="Click to copy">${esc(n.mesh_ip)}</code> · ${esc(n.nat_type)} NAT<br>${esc(routes.map(r=>r.lan_cidr+' → '+r.virtual_cidr).join(', '))}</span><label>Node DNS name <input id="directName" value="${esc(n.name||'')}" placeholder="office"></label><label>Physical LAN CIDRs <input id="directRoutes" value="${esc(routes.map(r=>r.lan_cidr).join(', '))}" placeholder="192.168.1.0/24, 192.168.2.0/24"></label><small class="muted">Multiple CIDRs are comma-separated. Saving replaces the complete list.</small><div id="directRouteList">${routes.map(r=>`<div class="routeRow"><code>${esc(r.lan_cidr)} → ${esc(r.virtual_cidr)}</code><button class="ghost" data-remove-route="${esc(r.lan_cidr)}">Revoke</button></div>`).join('')||'<span class="muted">No advertised subnets</span>'}</div><div class="toolbar"><input id="directRouteAdd" placeholder="192.168.10.0/24"><button id="directRouteAddButton">Add subnet</button></div><label>LAN objects (one name=IP per line)<textarea id="directDNSRecords" rows="3" placeholder="printer=192.168.1.20">${esc(records.map(r=>r.name+'='+r.ip).join('\n'))}</textarea></label><button id="directNetworkSave">Allocate addresses and save</button><button id="directRoutesClear" class="dangerButton">Revoke all subnets</button><span class="spacer"></span><label>Role <select id="directRole"><option value="auto">Automatic</option><option value="client">Client</option><option value="superpeer">Superpeer</option></select></label><button id="directRoleSave">Apply role</button><span class="spacer"></span><label>Mesh firewall <select id="directFirewallMode"><option value="allow_all">Allow all connections</option><option value="whitelist">Whitelist only</option></select></label><label>Allowed ports <input id="directFirewallPorts" placeholder="80/tcp, 53/udp, 443"></label><small class="muted">Applies to inbound connections to this node's mesh IP; ICMP always passes. A bare port allows both TCP and UDP. Nodes apply changes within seconds.</small><button id="directFirewallSave">Save firewall</button><button id="directRemove" class="dangerButton">Remove peer</button>`;
   $('directRole').value = n.requested_role || 'auto';
   $('directRoleSave').onclick = () => setRole(n.node_id, $('directRole').value);
+  api('/v1/admin/nodes/' + encodeURIComponent(n.node_id) + '/firewall').then(fw => {
+    $('directFirewallMode').value = fw.mode || 'allow_all';
+    $('directFirewallPorts').value = (fw.ports || []).join(', ')
+  }).catch(() => {});
+  $('directFirewallSave').onclick = async () => {
+    let button = $('directFirewallSave');
+    button.disabled = true;
+    try {
+      let fw = await api('/v1/admin/nodes/' + encodeURIComponent(n.node_id) + '/firewall', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          mode: $('directFirewallMode').value,
+          ports: $('directFirewallPorts').value.split(/[\s,]+/).filter(Boolean)
+        })
+      });
+      $('directFirewallMode').value = fw.mode;
+      $('directFirewallPorts').value = (fw.ports || []).join(', ');
+      toast('Firewall saved; the node applies it within seconds')
+    } catch (e) {
+      toast(e.message)
+    } finally {
+      button.disabled = false
+    }
+  };
   $('directNetworkSave').onclick = () => setNetwork(n.node_id);
   $('directRoutesClear').onclick = () => clearNetwork(n.node_id);
   $('directRouteAddButton').onclick = () => addRoute(n.node_id);

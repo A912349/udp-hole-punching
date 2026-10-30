@@ -166,15 +166,91 @@ type edge struct {
 	Cost float64 `json:"cost"`
 }
 type topology struct {
-	Unchanged   bool          `json:"unchanged,omitempty"`
-	Version     string        `json:"topology_version"`
-	Self        peer          `json:"self"`
-	Neighbors   []peer        `json:"neighbors"`
-	Directory   []peer        `json:"directory"`
-	Links       []edge        `json:"backbone_links"`
-	Forwards    []portForward `json:"forwards"`
-	DNSUpstream string        `json:"dns_upstream,omitempty"`
+	Unchanged   bool            `json:"unchanged,omitempty"`
+	Version     string          `json:"topology_version"`
+	Self        peer            `json:"self"`
+	Neighbors   []peer          `json:"neighbors"`
+	Directory   []peer          `json:"directory"`
+	Links       []edge          `json:"backbone_links"`
+	Forwards    []portForward   `json:"forwards"`
+	DNSUpstream string          `json:"dns_upstream,omitempty"`
+	Firewall    *firewallConfig `json:"firewall,omitempty"`
 }
+
+// firewallConfig mirrors the coordinator-managed mesh firewall policy.
+type firewallConfig struct {
+	Mode  string   `json:"mode"`
+	Ports []string `json:"ports"`
+}
+
+// fwRules is the immutable parsed form of the whitelist. A nil pointer in
+// node.firewall means allow-all, so the default-mode per-packet cost on the
+// TUN ingress path is a single atomic load and nil check.
+type fwRules struct {
+	tcp map[uint16]struct{}
+	udp map[uint16]struct{}
+}
+
+func parseFirewallRules(c *firewallConfig) *fwRules {
+	if c == nil || c.Mode != "whitelist" {
+		return nil
+	}
+	r := &fwRules{tcp: map[uint16]struct{}{}, udp: map[uint16]struct{}{}}
+	for _, raw := range c.Ports {
+		entry := strings.ToLower(strings.TrimSpace(raw))
+		if entry == "" {
+			continue
+		}
+		port, proto := entry, ""
+		if i := strings.IndexByte(entry, '/'); i >= 0 {
+			port, proto = entry[:i], entry[i+1:]
+		}
+		n, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || n == 0 {
+			continue
+		}
+		switch proto {
+		case "tcp":
+			r.tcp[uint16(n)] = struct{}{}
+		case "udp":
+			r.udp[uint16(n)] = struct{}{}
+		case "":
+			r.tcp[uint16(n)] = struct{}{}
+			r.udp[uint16(n)] = struct{}{}
+		}
+	}
+	return r
+}
+
+// permits reports whether an inbound IPv4 packet from the mesh may enter the
+// local stack. ICMP always passes (ping and path diagnostics stay usable);
+// TCP/UDP must target a listed destination port; other protocols are dropped.
+// Non-first fragments are dropped because the port lives in the first
+// fragment — reassembly cannot complete without it anyway.
+func (f *fwRules) permits(p []byte) bool {
+	switch p[9] {
+	case 1: // ICMP
+		return true
+	case 6, 17: // TCP, UDP
+	default:
+		return false
+	}
+	if binary.BigEndian.Uint16(p[6:8])&0x1fff != 0 {
+		return false // non-first fragment: no port header to match
+	}
+	ihl := int(p[0]&15) * 4
+	if ihl+4 > len(p) {
+		return false
+	}
+	port := binary.BigEndian.Uint16(p[ihl+2 : ihl+4])
+	if p[9] == 6 {
+		_, ok := f.tcp[port]
+		return ok
+	}
+	_, ok := f.udp[port]
+	return ok
+}
+
 type portForward struct {
 	ID         int64  `json:"id"`
 	Source     string `json:"source_node_id"`
@@ -321,6 +397,7 @@ type node struct {
 	tun                tunDevice
 	tunLUID            uint64
 	meshIPv4           atomic.Uint32
+	firewall           atomic.Pointer[fwRules]
 	startedAt          time.Time
 	fastQueue          chan fastFrame
 	udpSendQueue       chan outboundDatagram
@@ -1539,6 +1616,7 @@ func (n *node) applyTopology(t topology) {
 		n.neighbors[p.ID] = &p
 	}
 	n.links = t.Links
+	n.firewall.Store(parseFirewallRules(t.Firewall))
 	n.topologyVersion = t.Version
 	n.routes = n.buildRoutes()
 	n.mu.Unlock()
@@ -4926,6 +5004,15 @@ func (n *node) deliver(src string, p []byte) {
 	if !n.addressOwnedBy(src, sourceIP) || !(localDestination || n.addressOwnedBy(n.id.ID, destinationIP)) {
 		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
 		return
+	}
+	if localDestination {
+		// Coordinator-managed mesh firewall. Nil rules mean allow-all, so the
+		// default-mode cost is one atomic load per packet; whitelist mode adds
+		// a protocol check, a fragment-offset test and one small map lookup.
+		if fw := n.firewall.Load(); fw != nil && !fw.permits(p) {
+			n.debugf("firewall drop from %s: proto %d not permitted", src[:8], p[9])
+			return
+		}
 	}
 	if !localDestination && !n.translateLocalPacket(p, false) {
 		n.debugf("drop IP packet from %s: missing local translation", src[:8])

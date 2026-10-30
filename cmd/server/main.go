@@ -83,6 +83,15 @@ type portForward struct {
 	TargetHost string `json:"target_host"`
 	TargetPort int    `json:"target_port"`
 }
+
+// firewallConfig is the coordinator-managed mesh firewall of one node. It
+// governs inbound connections to the node's mesh IP: "allow_all" (the
+// default) accepts everything, "whitelist" accepts only the listed
+// destination ports. ICMP always passes.
+type firewallConfig struct {
+	Mode  string   `json:"mode"`
+	Ports []string `json:"ports"`
+}
 type link struct {
 	A      string  `json:"a"`
 	B      string  `json:"b"`
@@ -385,6 +394,8 @@ func main() {
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}", s.adminNode)
 	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/role", s.adminNodeRole)
 	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/network", s.adminNodeNetwork)
+	mux.HandleFunc("GET /v1/admin/nodes/{node_id}/firewall", s.adminFirewallGet)
+	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/firewall", s.adminFirewallSet)
 	mux.HandleFunc("POST /v1/admin/nodes/{node_id}/network/routes", s.adminAddNodeRoute)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}/network/routes", s.adminRemoveNodeRoute)
 	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
@@ -847,7 +858,7 @@ func value(k, d string) string {
 }
 // init opens the database, applies schema setup, and loads server settings.
 func (s *server) init() error {
-	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);`)
+	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS node_firewall (node_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'allow_all',ports TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL DEFAULT 0);`)
 	if err != nil {
 		return err
 	}
@@ -4191,10 +4202,126 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	version += "-f" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
 	encoded, _ = json.Marshal(services)
 	version += "-s" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
+	firewall := s.loadFirewall(id)
+	encoded, _ = json.Marshal(firewall)
+	version += "-fw" + fmt.Sprintf("%x", sha256.Sum256(encoded))[:12]
 	if bootstrapUnchanged(w, r, version) {
 		return
 	}
-	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "graph_update_mode": "reserved"})
+	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "firewall": firewall, "graph_update_mode": "reserved"})
+}
+
+// firewallPortList normalizes user-supplied port entries into the canonical
+// stored form: sorted, deduplicated "port/proto" strings. A bare number
+// expands to both TCP and UDP; the protocol part is case-insensitive.
+func firewallPortList(input []string) ([]string, error) {
+	out := map[string]bool{}
+	for _, raw := range input {
+		entry := strings.TrimSpace(strings.ToLower(raw))
+		if entry == "" {
+			continue
+		}
+		port, proto := entry, "both"
+		if i := strings.IndexByte(entry, '/'); i >= 0 {
+			port, proto = entry[:i], entry[i+1:]
+		}
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return nil, fmt.Errorf("invalid port %q", raw)
+		}
+		switch proto {
+		case "tcp":
+			out[fmt.Sprintf("%d/tcp", n)] = true
+		case "udp":
+			out[fmt.Sprintf("%d/udp", n)] = true
+		case "both", "":
+			out[fmt.Sprintf("%d/tcp", n)] = true
+			out[fmt.Sprintf("%d/udp", n)] = true
+		default:
+			return nil, fmt.Errorf("unsupported protocol in %q (use tcp or udp)", raw)
+		}
+	}
+	list := make([]string, 0, len(out))
+	for p := range out {
+		list = append(list, p)
+	}
+	sort.Strings(list)
+	return list, nil
+}
+
+// loadFirewall returns the mesh firewall policy of a node; nodes without a
+// stored row run in the permissive default mode.
+func (s *server) loadFirewall(id string) firewallConfig {
+	fw := firewallConfig{Mode: "allow_all", Ports: []string{}}
+	var mode, ports string
+	if err := s.db.QueryRow("SELECT mode,ports FROM node_firewall WHERE node_id=?", id).Scan(&mode, &ports); err == nil {
+		if mode == "whitelist" {
+			fw.Mode = "whitelist"
+		}
+		var list []string
+		if json.Unmarshal([]byte(ports), &list) == nil {
+			if normalized, e := firewallPortList(list); e == nil {
+				fw.Ports = normalized
+			}
+		}
+	}
+	return fw
+}
+
+func (s *server) adminFirewallGet(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
+	reply(w, 200, s.loadFirewall(id))
+}
+
+// adminFirewallSet configures the mesh firewall of a node. The policy is
+// enforced by the node itself on the TUN ingress path (it arrives with the
+// bootstrap/push topology), so LAN forwarding and outbound traffic are
+// unaffected and no OS-level rules are touched.
+func (s *server) adminFirewallSet(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	if !s.requireNodeAccess(w, r, id) {
+		return
+	}
+	var d struct {
+		Mode  string   `json:"mode"`
+		Ports []string `json:"ports"`
+	}
+	if decodeJSON(w, r, &d) != nil {
+		reply(w, 400, map[string]string{"error": "invalid firewall settings"})
+		return
+	}
+	d.Mode = strings.TrimSpace(strings.ToLower(d.Mode))
+	if d.Mode != "allow_all" && d.Mode != "whitelist" {
+		reply(w, 400, map[string]string{"error": "mode must be allow_all or whitelist"})
+		return
+	}
+	ports, err := firewallPortList(d.Ports)
+	if err != nil {
+		reply(w, 400, map[string]string{"error": err.Error()})
+		return
+	}
+	if len(ports) > 256 {
+		reply(w, 400, map[string]string{"error": "too many ports (max 256)"})
+		return
+	}
+	raw, _ := json.Marshal(ports)
+	if _, err := s.db.Exec(`INSERT INTO node_firewall(node_id,mode,ports,updated_at) VALUES(?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET mode=excluded.mode,ports=excluded.ports,updated_at=excluded.updated_at`, id, d.Mode, string(raw), time.Now().Unix()); err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "firewall_updated", fmt.Sprintf("node=%s mode=%s ports=%s", id, d.Mode, string(raw)))
+	s.pushTopologies()
+	s.broadcast("topology", "audit")
+	reply(w, 200, firewallConfig{Mode: d.Mode, Ports: ports})
 }
 
 // adminForwards lists the service-forwarding rules visible to this account.
