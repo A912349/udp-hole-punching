@@ -43,6 +43,7 @@ let state = {
     audit: [],
     config: {},
     invites: [],
+    revoked: [],
     manualLinks: [],
     blockedLinks: []
   },
@@ -716,8 +717,21 @@ async function removeRoute(id, route) {
     toast(e.message)
   }
 }
+async function unbanNode(id) {
+  if (!(await confirmModal(`Allow node ${id.slice(0,12)} to enroll again? A fresh setup key is required; the old key stays invalid.`, {ok: 'Unban'}))) return;
+  try {
+    await api('/v1/admin/revoked/' + encodeURIComponent(id), {
+      method: 'DELETE'
+    });
+    toast('Node unbanned');
+    await load()
+  } catch (e) {
+    toast(e.message)
+  }
+}
+
 async function removePeer(id) {
-  if (!(await confirmModal(`Remove peer ${id.slice(0,12)}? The device must be re-enrolled with a new setup key.`, {ok: 'Remove', danger: true}))) return;
+  if (!(await confirmModal(`Remove peer ${id.slice(0,12)}? The node identity is banned permanently — it cannot return even after a restart until unbanned on the Access page.`, {ok: 'Remove and ban', danger: true}))) return;
   try {
     await api('/v1/admin/nodes/' + encodeURIComponent(id), {
       method: 'DELETE'
@@ -755,6 +769,8 @@ function render() {
   renderEditor();
   renderAudit();
   $('inviteRows').innerHTML = state.invites.map(x => `<tr><td><code>${esc(x.token)}</code></td><td>${new Date(x.expires_at*1000).toLocaleTimeString()}</td><td><span class="chip">${x.used?'used':'active'}</span></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No active setup keys.</td></tr>';
+  $('revokedRows').innerHTML = state.revoked.map(x => `<tr><td><code class="copyable" data-copy="${escAttr(x.node_id)}" title="Click to copy the full node ID">${esc(x.node_id.slice(0,12))}</code><br><span class="muted">${esc(x.reason||'')}</span></td><td>${new Date(x.revoked_at*1000).toLocaleString()}</td><td><button class="ghost" data-unban="${escAttr(x.node_id)}">Unban</button></td></tr>`).join('') || '<tr><td colspan="3" class="muted">No banned nodes.</td></tr>';
+  $('revokedRows').querySelectorAll('[data-unban]').forEach(b => b.onclick = () => unbanNode(b.dataset.unban));
   for (let k in state.config) {
     let f = $('settingsForm').elements[k];
     if (f && !isDirtySetting(f)) f.value = state.config[k] || ''
@@ -926,7 +942,7 @@ function renderAllRemoveList() {
 }
 async function loadScopes() {
   try {
-    let [config, online, all, auditResp, invites, graphData, updates] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit?limit=100'), api('/v1/admin/invites'), api('/v1/admin/graph'), api('/v1/admin/updates')]);
+    let [config, online, all, auditResp, invites, graphData, updates, revokedResp] = await Promise.all([api('/v1/admin/config'), api('/v1/admin/topology?scope=online'), api('/v1/admin/topology?scope=all'), api('/v1/admin/audit?limit=100'), api('/v1/admin/invites'), api('/v1/admin/graph'), api('/v1/admin/updates'), api('/v1/admin/revoked')]);
     state = {
       config,
       topology: (state.scope === 'all' ? all : online),
@@ -938,6 +954,7 @@ async function loadScopes() {
       audit: [],
       auditHasMore: false,
       invites: invites || [],
+      revoked: (revokedResp && revokedResp.revoked) || [],
       manualLinks: graphData.links || [],
       blockedLinks: graphData.blocked_links || [],
       updates: updates || {

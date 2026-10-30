@@ -368,7 +368,7 @@ func main() {
 	mux.Handle("/v1/ws", websocket.Server{
 		Handler: websocket.Handler(s.controlWS),
 		Handshake: func(_ *websocket.Config, r *http.Request) error {
-			if !s.networkTokenValid(r) {
+			if !s.networkTokenValid(r) && !s.anyNodeTokenValid(r) {
 				if !s.allowInviteAttempt(r.RemoteAddr) || !s.consumeInvite(r.Header.Get("X-Mesh-Invite")) {
 					return fmt.Errorf("unauthorized")
 				}
@@ -396,6 +396,8 @@ func main() {
 	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/network", s.adminNodeNetwork)
 	mux.HandleFunc("GET /v1/admin/nodes/{node_id}/firewall", s.adminFirewallGet)
 	mux.HandleFunc("PUT /v1/admin/nodes/{node_id}/firewall", s.adminFirewallSet)
+	mux.HandleFunc("GET /v1/admin/revoked", s.adminRevoked)
+	mux.HandleFunc("DELETE /v1/admin/revoked/{node_id}", s.adminUnban)
 	mux.HandleFunc("POST /v1/admin/nodes/{node_id}/network/routes", s.adminAddNodeRoute)
 	mux.HandleFunc("DELETE /v1/admin/nodes/{node_id}/network/routes", s.adminRemoveNodeRoute)
 	mux.HandleFunc("GET /v1/admin/graph", s.adminGraph)
@@ -858,7 +860,7 @@ func value(k, d string) string {
 }
 // init opens the database, applies schema setup, and loads server settings.
 func (s *server) init() error {
-	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS node_firewall (node_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'allow_all',ports TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL DEFAULT 0);`)
+	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS node_firewall (node_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'allow_all',ports TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS node_tokens (node_id TEXT PRIMARY KEY,token_hash TEXT NOT NULL,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE TABLE IF NOT EXISTS revoked_nodes (node_id TEXT PRIMARY KEY,reason TEXT NOT NULL DEFAULT '',revoked_at INTEGER NOT NULL);`)
 	if err != nil {
 		return err
 	}
@@ -1529,7 +1531,7 @@ func (s *server) requireNodeAccess(w http.ResponseWriter, r *http.Request, nodeI
 }
 
 func (s *server) auth(w http.ResponseWriter, r *http.Request) bool {
-	if !s.networkTokenValid(r) && !s.inviteRegistrationAuthorized(r) {
+	if !s.networkTokenValid(r) && !s.anyNodeTokenValid(r) && !s.inviteRegistrationAuthorized(r) {
 		reply(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
 		return false
 	}
@@ -1570,6 +1572,43 @@ func (s *server) networkTokenValid(r *http.Request) bool {
 	_, ok := s.accountTokenUser(r)
 	return ok
 }
+
+// anyNodeTokenValid matches the credential against per-node enrollment
+// tokens. Unlike the network token or account tokens, a node token carries no
+// admin API privileges: it only satisfies the node-facing auth checks, and it
+// is revoked together with the node it was issued for.
+func (s *server) anyNodeTokenValid(r *http.Request) bool {
+	provided := r.Header.Get("X-Mesh-Token")
+	if provided == "" || s.db == nil {
+		return false
+	}
+	var one int
+	return s.db.QueryRow("SELECT 1 FROM node_tokens WHERE token_hash=? AND revoked_at IS NULL", tokenDigest(provided)).Scan(&one) == nil
+}
+
+// issueNodeToken mints the per-node enrollment credential handed out in the
+// register response under the legacy "network_token" field name (old clients
+// store and use whatever opaque token they receive).
+func (s *server) issueNodeToken(nodeID string) (string, error) {
+	token, err := randomToken(32)
+	if err != nil {
+		return "", err
+	}
+	_, err = s.db.Exec(`INSERT INTO node_tokens(node_id,token_hash,created_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET token_hash=excluded.token_hash,created_at=excluded.created_at,revoked_at=NULL`, nodeID, tokenDigest(token), time.Now().Unix())
+	if err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+// nodeRevoked reports whether a node identity is banned. Revocation is keyed
+// by the persistent node_id (derived from the node's private key), so a
+// removed node cannot return by re-registering with the same identity.
+func (s *server) nodeRevoked(nodeID string) bool {
+	var one int
+	return s.db.QueryRow("SELECT 1 FROM revoked_nodes WHERE node_id=?", nodeID).Scan(&one) == nil
+}
+
 func reply(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -3135,7 +3174,13 @@ func (s *server) adminNode(w http.ResponseWriter, r *http.Request) {
 	_, _ = s.db.Exec("DELETE FROM role_overrides WHERE node_id=?", id)
 	_, _ = s.db.Exec("DELETE FROM node_network WHERE node_id=?", id)
 	_, _ = s.db.Exec("DELETE FROM dns_records WHERE node_id=?", id)
+	_, _ = s.db.Exec("DELETE FROM node_firewall WHERE node_id=?", id)
+	_, _ = s.db.Exec("DELETE FROM node_tokens WHERE node_id=?", id)
+	// Removal is permanent: ban the persistent identity so the node cannot
+	// simply re-register on its next restart. Unban via /v1/admin/revoked.
+	_, _ = s.db.Exec("INSERT INTO revoked_nodes(node_id,reason,revoked_at) VALUES(?,'removed via admin panel',?) ON CONFLICT(node_id) DO UPDATE SET reason=excluded.reason,revoked_at=excluded.revoked_at", id, time.Now().Unix())
 	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_deleted", id)
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_revoked", id)
 	s.broadcast("topology", "audit")
 	s.pushTopologies()
 	reply(w, 200, map[string]string{"status": "deleted"})
@@ -3542,6 +3587,12 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		reply(w, 400, map[string]any{"error": "node_id does not match public_key"})
 		return
 	}
+	// A banned identity stays banned no matter which credential it presents:
+	// this is what makes removing a node from the mesh permanent.
+	if s.nodeRevoked(d.ID) {
+		reply(w, http.StatusForbidden, map[string]any{"error": "node revoked by coordinator"})
+		return
+	}
 	previous, existingOwner, roleOverride, e := s.registeredNode(d.ID)
 	if e != nil {
 		reply(w, 500, map[string]any{"error": e.Error()})
@@ -3645,11 +3696,19 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		s.metricStamp.Add(1)
 	}
 	s.broadcast("topology")
+	// Invite-based enrollment used to hand out the account's admin-grade API
+	// token, so a six-character setup key was enough to obtain a permanent
+	// full-privilege credential. Nodes now receive a credential bound to their
+	// own identity: it only satisfies node-facing endpoints (bootstrap,
+	// telemetry, services, the control websocket) and dies with the node. The
+	// legacy "network_token" field name is kept for wire compatibility, and
+	// every invite enrollment gets one — the owner-less path previously left
+	// the node without any permanent credential at all.
 	var enrollmentToken string
-	if accountScoped && r.Header.Get("X-Mesh-Invite") != "" {
-		enrollmentToken, e = s.issueAccountToken(accountID)
+	if r.Header.Get("X-Mesh-Invite") != "" {
+		enrollmentToken, e = s.issueNodeToken(d.ID)
 		if e != nil {
-			reply(w, http.StatusInternalServerError, map[string]any{"error": "could not issue account device token"})
+			reply(w, http.StatusInternalServerError, map[string]any{"error": "could not issue node token"})
 			return
 		}
 	}
@@ -4209,6 +4268,50 @@ func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	reply(w, 200, map[string]any{"topology_version": version, "self": self, "neighbors": peers, "directory": all, "backbone_links": ls, "dns_upstream": settings.DNSUpstream, "services": services, "forwards": forwards, "firewall": firewall, "graph_update_mode": "reserved"})
+}
+
+// adminRevoked lists banned node identities shown in the access page.
+func (s *server) adminRevoked(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	rows, err := s.db.Query("SELECT node_id,reason,revoked_at FROM revoked_nodes ORDER BY revoked_at DESC LIMIT 500")
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	defer rows.Close()
+	list := []map[string]any{}
+	for rows.Next() {
+		var id, reason string
+		var at int64
+		if rows.Scan(&id, &reason, &at) == nil {
+			list = append(list, map[string]any{"node_id": id, "reason": reason, "revoked_at": at})
+		}
+	}
+	reply(w, 200, map[string]any{"revoked": list})
+}
+
+// adminUnban lifts the ban so the node identity may enroll again (its old
+// per-node token was destroyed together with the node row, so a fresh setup
+// key is required either way).
+func (s *server) adminUnban(w http.ResponseWriter, r *http.Request) {
+	if !s.adminAuth(w, r) {
+		return
+	}
+	id := r.PathValue("node_id")
+	res, err := s.db.Exec("DELETE FROM revoked_nodes WHERE node_id=?", id)
+	if err != nil {
+		reply(w, 500, map[string]string{"error": err.Error()})
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		reply(w, 404, map[string]string{"error": "node is not banned"})
+		return
+	}
+	_, _ = s.db.Exec("INSERT INTO audit_log(created_at,event,detail) VALUES(?,?,?)", time.Now().Unix(), "node_unbanned", id)
+	s.broadcast("audit")
+	reply(w, 200, map[string]string{"status": "unbanned"})
 }
 
 // firewallPortList normalizes user-supplied port entries into the canonical

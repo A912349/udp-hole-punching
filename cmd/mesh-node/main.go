@@ -364,6 +364,7 @@ type node struct {
 	linksRejected      atomic.Bool // coordinator cannot accept piggybacked link reports
 	goarchRejected     atomic.Bool // coordinator cannot accept the goarch report
 	lanAddrsRejected   atomic.Bool // coordinator cannot accept the lan_addrs report
+	revokedLogged      atomic.Bool // re-enrollment blocked: identity banned by coordinator
 	updating           atomic.Bool // a self-update download/swap is in progress
 	telemetryMu        sync.Mutex
 	lastTelemetrySent  time.Time
@@ -1496,6 +1497,11 @@ func (n *node) bootstrap() error {
 		if strings.Contains(e.Error(), "404: unknown node") {
 			n.logf("bootstrap returned unknown node; refreshing registration lease")
 			if registerErr := n.register(); registerErr != nil {
+				// A revoked identity keeps failing forever; say so once, loudly,
+				// instead of leaving an opaque retry loop in the logs.
+				if strings.Contains(registerErr.Error(), "status 403") && !n.revokedLogged.Swap(true) {
+					n.logf("coordinator banned this node identity; removal is permanent until unbanned in the admin panel — wipe local state or use a fresh setup key to re-enroll")
+				}
 				return fmt.Errorf("bootstrap unknown node; re-register failed: %w", registerErr)
 			}
 			if retryErr := n.request("GET", path, condition, &t); retryErr != nil {
