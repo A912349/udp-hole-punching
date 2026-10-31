@@ -57,8 +57,8 @@ const (
 	// Upper bound for one blocking UDP receive. The receive loop renews the
 	// deadline each iteration; the brief unlock between reads lets rebind or
 	// STUN take the exclusive udpReadMu lock (see receiveSocket).
-	udpReadWindow      = 1 * time.Second
-	linkGrace          = 20 * time.Second
+	udpReadWindow = 1 * time.Second
+	linkGrace     = 20 * time.Second
 	// Bounded retries for the post-reconnect endpoint check: right after a
 	// radio transition (LTE <-> Wi-Fi, doze resume) DNS and STUN often need a
 	// few seconds to become usable, and a single failed check used to leave
@@ -91,6 +91,11 @@ const (
 	scanDelay                = 500 * time.Microsecond
 	symmetricRetryDelay      = 2 * time.Second
 	symmetricBurstRetries    = 4
+	// Exponential backoff cap between burst rounds toward one relay. On
+	// carrier NATs (LTE CGNAT) a burst allocates hundreds of UDP mappings;
+	// repeating it every few seconds only floods conntrack and drains the
+	// battery without improving the odds.
+	symmetricBurstBackoffMax = 90 * time.Second
 	fastMagic                = "MIP1"
 	fastHeader               = 49
 	maxTUN                   = 1350
@@ -117,12 +122,12 @@ var fastMagicBytes = []byte(fastMagic)
 var ipv4LimitedBroadcast = netip.MustParseAddr("255.255.255.255")
 
 type config struct {
-	server, token, inviteToken, role, nat, bind, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
-	port, capacity, prefix, symmetricScanStep                                                                            int
-	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                bool
-	fastWorkers, deliverWorkers                                                                                          int
-	statsInterval                                                                                                        time.Duration
-	services, allows, bootstrapDNS                                                                                       multi
+	server, token, inviteToken, role, nat, bind, bindIface, endpoint, meshIP, tun, state, call, requestFile, pprofListen, controlCA string
+	port, capacity, prefix, symmetricScanStep                                                                                       int
+	noRelay, autoTUN, debug, resetConfig, controlInsecure                                                                           bool
+	fastWorkers, deliverWorkers                                                                                                     int
+	statsInterval                                                                                                                   time.Duration
+	services, allows, bootstrapDNS                                                                                                  multi
 }
 type multi []string
 
@@ -292,6 +297,14 @@ type symmetricReply struct {
 	conn *net.UDPConn
 	addr *net.UDPAddr
 }
+
+// symmetricBurstCall lets concurrent callers share one in-flight port scan.
+// Callers that arrive while a burst is already running toward a relay join it
+// and return the same outcome instead of opening another 500 sockets.
+type symmetricBurstCall struct {
+	done chan struct{}
+	ok   bool
+}
 type symmetricRelayTarget struct {
 	id   string
 	peer peer
@@ -347,6 +360,8 @@ type node struct {
 	subnetsMu          sync.Mutex
 	subnets            []netip.Prefix
 	subnetsAt          time.Time
+	lanSubnetCache     []netip.Prefix // RFC1918 subnets on non-modem interfaces
+	lanSubnetsAt       time.Time
 	udpReadMu          sync.RWMutex
 	recoveryMu         sync.Mutex
 	recoveryNext       time.Time
@@ -356,6 +371,7 @@ type node struct {
 	controlMu          sync.Mutex
 	controlRxAt        atomic.Int64
 	roamRefreshAt      atomic.Int64
+	networkGen         atomic.Uint64 // bumped on every UDP rebind; stale bursts detect roaming
 	closing            atomic.Bool
 	controlCall        sync.Mutex
 	controlReply       chan controlFrame
@@ -426,8 +442,16 @@ type node struct {
 	symmetricBurstAt    map[string]time.Time
 	symmetricBurstSess  map[string]string
 	symmetricScanSlots  chan struct{}
-	edgeRetryMu         sync.Mutex
-	edgeRetries         map[string]bool
+	// symmetricBurstMu guards symmetricBurstInFlight: startup, roaming
+	// recovery and per-edge retries all used to start their own 500-socket
+	// scan for the same superpeer; concurrent rendezvous requests also
+	// cancelled each other on the relay side, so neither scan could succeed.
+	symmetricBurstMu       sync.Mutex
+	symmetricBurstInFlight map[string]*symmetricBurstCall
+	symmetricFailures      map[string]int       // consecutive failed bursts per relay
+	symmetricBackoff       map[string]time.Time // next allowed burst attempt per relay
+	edgeRetryMu            sync.Mutex
+	edgeRetries            map[string]bool
 }
 
 func main() {
@@ -547,6 +571,7 @@ func parse() config {
 	f.StringVar(&c.role, "role", "auto", "auto, superpeer or client")
 	f.StringVar(&c.nat, "nat-type", "auto", "auto, cone or symmetric")
 	f.StringVar(&c.bind, "bind", "0.0.0.0", "UDP bind host")
+	f.StringVar(&c.bindIface, "bind-iface", "", "pin UDP sockets to this interface (Linux, root): name, \"auto\" = default-route interface, \"none\" = wildcard; empty = auto on Android, none elsewhere")
 	f.IntVar(&c.port, "udp-port", 0, "UDP port")
 	f.StringVar(&c.endpoint, "public-endpoint", "", "public HOST:PORT")
 	f.StringVar(&c.meshIP, "mesh-ip", "", "static mesh IPv4")
@@ -614,6 +639,9 @@ func parse() config {
 			if c.bind == "0.0.0.0" {
 				c.bind = saved.bind
 			}
+			if c.bindIface == "" {
+				c.bindIface = saved.bindIface
+			}
 			// Never restore a previously observed public endpoint; rediscover it.
 			if c.meshIP == "" {
 				c.meshIP = saved.meshIP
@@ -667,10 +695,10 @@ const (
 )
 
 type savedConfig struct {
-	Server, Token, InviteToken, Role, NAT, Bind, Endpoint, MeshIP, TUN, State, ControlCA string
-	Port, Capacity, Prefix, SymmetricScanStep                                            int
-	NoRelay, AutoTUN, Debug, ControlInsecure                                             bool
-	PrivateKey                                                                           string `json:"private_key,omitempty"`
+	Server, Token, InviteToken, Role, NAT, Bind, BindIface, Endpoint, MeshIP, TUN, State, ControlCA string
+	Port, Capacity, Prefix, SymmetricScanStep                                                       int
+	NoRelay, AutoTUN, Debug, ControlInsecure                                                        bool
+	PrivateKey                                                                                      string `json:"private_key,omitempty"`
 }
 
 func loadInteractiveConfig() (config, error) {
@@ -695,7 +723,7 @@ func loadInteractiveConfig() (config, error) {
 		if step == 0 {
 			step = symmetricScanDefaultStep
 		}
-		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: unifiedStateFile, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, symmetricScanStep: step, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
+		c = config{server: saved.Server, token: saved.Token, inviteToken: saved.InviteToken, role: saved.Role, nat: saved.NAT, bind: saved.Bind, bindIface: saved.BindIface, endpoint: "", meshIP: saved.MeshIP, tun: saved.TUN, state: unifiedStateFile, controlCA: saved.ControlCA, port: saved.Port, capacity: saved.Capacity, prefix: saved.Prefix, symmetricScanStep: step, noRelay: saved.NoRelay, autoTUN: saved.AutoTUN, debug: false, controlInsecure: saved.ControlInsecure}
 		if saved.PrivateKey == "" && saved.State != "" {
 			if legacy, readErr := os.ReadFile(filepath.Join(saved.State, "identity.json")); readErr == nil {
 				var identity struct {
@@ -729,7 +757,7 @@ func saveInteractiveConfigWithKey(c config, privateKey string) error {
 			}
 		}
 	}
-	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: unifiedStateFile, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, SymmetricScanStep: c.symmetricScanStep, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure, PrivateKey: privateKey}
+	saved := savedConfig{Server: c.server, Token: c.token, InviteToken: c.inviteToken, Role: c.role, NAT: c.nat, Bind: c.bind, BindIface: c.bindIface, Endpoint: c.endpoint, MeshIP: c.meshIP, TUN: c.tun, State: unifiedStateFile, ControlCA: c.controlCA, Port: c.port, Capacity: c.capacity, Prefix: c.prefix, SymmetricScanStep: c.symmetricScanStep, NoRelay: c.noRelay, AutoTUN: c.autoTUN, Debug: false, ControlInsecure: c.controlInsecure, PrivateKey: privateKey}
 	b, err := json.MarshalIndent(saved, "", "  ")
 	if err != nil {
 		return err
@@ -748,7 +776,7 @@ func askInteractiveConfig() config {
 		}
 		return v
 	}
-	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: unifiedStateFile, tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1, symmetricScanStep: symmetricScanDefaultStep}
+	c := config{server: ask("Coordinator URL", "http://127.0.0.1:8001"), role: "auto", nat: "auto", bind: "0.0.0.0", state: unifiedStateFile, tun: "mesh0", autoTUN: true, prefix: 24, capacity: 1, symmetricScanStep: symmetricScanDefaultStep, bindIface: ""}
 	credential := ask("Network token or 6-character invite", "")
 	if len(credential) == 6 {
 		c.inviteToken = credential
@@ -758,6 +786,7 @@ func askInteractiveConfig() config {
 	c.role = ask("Role (auto/client/superpeer)", "auto")
 	return c
 }
+
 // loadIdentity loads the persistent node key, creating one on first use.
 func loadIdentity(dir string) (*protocol.Identity, error) {
 	if b, e := os.ReadFile(dir); e == nil {
@@ -836,6 +865,7 @@ func createUnifiedIdentity(path string) (*protocol.Identity, error) {
 	}
 	return i, os.WriteFile(path, encoded, 0600)
 }
+
 // newNode initializes runtime state and network resources from configuration.
 func newNode(c config) (*node, error) {
 	id, e := loadIdentity(c.state)
@@ -856,45 +886,55 @@ func newNode(c config) (*node, error) {
 	if e != nil {
 		return nil, e
 	}
+	if iface := resolveBindIface(c.bindIface); iface != "" {
+		if err := bindUDPInterface(conn, iface); err != nil {
+			log.Printf("[mesh-node] UDP bind to interface %s failed: %v (using wildcard socket)", iface, err)
+		} else {
+			log.Printf("[mesh-node] UDP socket pinned to interface %s", iface)
+		}
+	}
 	configureUDPSocket(conn)
 	k := sha256.Sum256([]byte(c.token))
 	n := &node{
-		c:                   c,
-		requestedRole:       c.role,
-		requestedNAT:        c.nat,
-		id:                  id,
-		idBinary:            idBinary,
-		key:                 k[:],
-		conn:                conn,
-		symmetricConns:      map[string]*net.UDPConn{},
-		receiveSockets:      map[*net.UDPConn]struct{}{},
-		dir:                 map[string]*peer{},
-		pendingLAN:          map[string]*net.UDPAddr{},
-		neighbors:           map[string]*peer{},
-		routes:              map[string]string{},
-		meshNodes:           map[netip.Addr]string{},
-		installedRoutes:     map[string]bool{},
-		seen:                map[string]struct{}{},
-		fastSeen:            make(map[[12]byte]struct{}, fastSeenCapacity),
-		fastSeenRing:        make([][12]byte, 0, fastSeenCapacity),
-		pending:             map[string]chan serviceResult{},
-		services:            map[string]string{},
-		allow:               map[string]bool{"*": true},
-		forwardListeners:    map[int64]net.Listener{},
-		forwardRules:        map[int64]portForward{},
-		tunnels:             map[string]net.Conn{},
-		startedAt:           time.Now(),
-		sharedKeys:          map[string]cachedKey{},
-		reassembly:          map[string]*reassembly{},
-		symmetricScans:      map[string]chan struct{}{},
-		symmetricSessions:   map[string]string{},
-		symmetricAckWaiters: map[string]chan struct{}{},
-		symmetricConnected:  map[string]bool{},
-		symmetricBurstAt:    map[string]time.Time{},
-		symmetricBurstSess:  map[string]string{},
-		symmetricScanSlots:  make(chan struct{}, 2),
-		edgeRetries:         map[string]bool{},
-		pings:               map[string]pingProbe{},
+		c:                      c,
+		requestedRole:          c.role,
+		requestedNAT:           c.nat,
+		id:                     id,
+		idBinary:               idBinary,
+		key:                    k[:],
+		conn:                   conn,
+		symmetricConns:         map[string]*net.UDPConn{},
+		receiveSockets:         map[*net.UDPConn]struct{}{},
+		dir:                    map[string]*peer{},
+		pendingLAN:             map[string]*net.UDPAddr{},
+		neighbors:              map[string]*peer{},
+		routes:                 map[string]string{},
+		meshNodes:              map[netip.Addr]string{},
+		installedRoutes:        map[string]bool{},
+		seen:                   map[string]struct{}{},
+		fastSeen:               make(map[[12]byte]struct{}, fastSeenCapacity),
+		fastSeenRing:           make([][12]byte, 0, fastSeenCapacity),
+		pending:                map[string]chan serviceResult{},
+		services:               map[string]string{},
+		allow:                  map[string]bool{"*": true},
+		forwardListeners:       map[int64]net.Listener{},
+		forwardRules:           map[int64]portForward{},
+		tunnels:                map[string]net.Conn{},
+		startedAt:              time.Now(),
+		sharedKeys:             map[string]cachedKey{},
+		reassembly:             map[string]*reassembly{},
+		symmetricScans:         map[string]chan struct{}{},
+		symmetricSessions:      map[string]string{},
+		symmetricAckWaiters:    map[string]chan struct{}{},
+		symmetricConnected:     map[string]bool{},
+		symmetricBurstAt:       map[string]time.Time{},
+		symmetricBurstSess:     map[string]string{},
+		symmetricScanSlots:     make(chan struct{}, 2),
+		symmetricBurstInFlight: map[string]*symmetricBurstCall{},
+		symmetricFailures:      map[string]int{},
+		symmetricBackoff:       map[string]time.Time{},
+		edgeRetries:            map[string]bool{},
+		pings:                  map[string]pingProbe{},
 	}
 	if _, e = rand.Read(n.packetPrefix[:]); e != nil {
 		_ = conn.Close()
@@ -1167,6 +1207,9 @@ func (n *node) pokeControlReconnect() {
 		n.logf("control reconnect after disconnect failed: %v", err)
 	}
 }
+
+// androidRuntimeFn is a hook so tests can simulate Android detection.
+var androidRuntimeFn = androidRuntime
 
 func androidRuntime() bool {
 	if runtime.GOOS == "android" {
@@ -1477,6 +1520,7 @@ func (n *node) register() error {
 	}
 	return nil
 }
+
 // bootstrap fetches the current peer list and forwarding topology.
 func (n *node) bootstrap() error {
 	n.mu.RLock()
@@ -1514,6 +1558,7 @@ func (n *node) bootstrap() error {
 	n.applyTopology(t)
 	return nil
 }
+
 // applyTopology updates peer state and routes from a coordinator snapshot.
 func (n *node) applyTopology(t topology) {
 	n.mu.RLock()
@@ -1589,8 +1634,10 @@ func (n *node) applyTopology(t topology) {
 		// LAN addresses it advertised. touch() flips the path to LAN only
 		// when a reply actually arrives from a local address; a silent
 		// candidate (segmentation, AP isolation, non-routable subnet) never
-		// disturbs the working WAN path.
-		if len(v.LANAddrs) > 0 {
+		// disturbs the working WAN path. On mobile data (no local LAN
+		// subnet) probing is disabled entirely: the probes would leave
+		// through the carrier network and never reach anyone.
+		if len(v.LANAddrs) > 0 && n.hasLAN() {
 			probedAt := time.Now()
 			if probedAt.Sub(p.lastLANProbe) >= lanProbeInterval && !freshLAN(&p, probedAt) {
 				p.lastLANProbe = probedAt
@@ -1600,6 +1647,9 @@ func (n *node) applyTopology(t topology) {
 					}
 					addr, err := net.ResolveUDPAddr("udp4", raw)
 					if err != nil || addr.IP == nil {
+						continue
+					}
+					if !n.lanCandidateUsable(addr.IP) {
 						continue
 					}
 					// Candidates equal to lastLAN are re-probed deliberately:
@@ -1826,6 +1876,7 @@ func (p pq) Less(i, j int) bool { return p[i].cost < p[j].cost }
 func (p pq) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 func (p *pq) Push(x any)        { *p = append(*p, x.(qitem)) }
 func (p *pq) Pop() any          { x := (*p)[len(*p)-1]; *p = (*p)[:len(*p)-1]; return x }
+
 // buildRoutes computes the lowest-cost next hop to each reachable node.
 func (n *node) buildRoutes() map[string]string {
 	adj := map[string][]qitem{}
@@ -1873,6 +1924,7 @@ func (n *node) buildRoutes() map[string]string {
 	}
 	return out
 }
+
 // start brings up transports, discovery, packet workers, and health loops.
 func (n *node) start() error {
 	if n.c.endpoint == "" {
@@ -2033,9 +2085,16 @@ func (n *node) establishSymmetricTransport() bool {
 		}
 	}()
 	defer func() { close(leaseStop); <-leaseDone }()
+	// Bursts started before a network switch belong to the dead mapping;
+	// a newer recovery pass re-establishes on the fresh network.
+	generation := n.networkGen.Load()
 	for attempt := 1; attempt <= symmetricBurstRetries; attempt++ {
+		if n.networkGen.Load() != generation {
+			return false
+		}
 		relays := n.symmetricRelays()
 		ready := 0
+		started := 0
 		for _, relay := range relays {
 			if n.symmetricTransportReady(relay.id) || n.relayLANLive(relay.id) {
 				// A traffic-confirmed LAN path already serves the relay through
@@ -2046,6 +2105,10 @@ func (n *node) establishSymmetricTransport() bool {
 				ready++
 				continue
 			}
+			if n.symmetricBackoffWait(relay.id) > 0 {
+				continue
+			}
+			started++
 			if n.establishSymmetricTransportOnce(relay.id, &relay.peer, attempt) {
 				ready++
 				n.logf("symmetric NAT connected to superpeer %s", relay.id[:8])
@@ -2053,6 +2116,11 @@ func (n *node) establishSymmetricTransport() bool {
 		}
 		if len(relays) > 0 && ready == len(relays) {
 			return true
+		}
+		if started == 0 {
+			// Every relay is ready-or-backing-off; further rounds cannot make
+			// progress and would only spin.
+			break
 		}
 		if attempt < symmetricBurstRetries {
 			n.logf("symmetric burst retry round %d/%d", attempt, symmetricBurstRetries-1)
@@ -2087,7 +2155,7 @@ func (n *node) someRelayLANLive() bool {
 	return false
 }
 
-func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, attempt int) bool {
+func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, attempt int) (ok bool) {
 	if n.c.nat != "symmetric" {
 		return true
 	}
@@ -2098,6 +2166,42 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 		n.logf("symmetric NAT: superpeer %s is reachable via LAN; skipping probe burst", relayID[:8])
 		return true
 	}
+	// Exponential per-relay backoff after failed bursts. Every 5-second
+	// linkHealth tick used to restart the full rendezvous + 500-socket scan,
+	// flooding conntrack and the coordinator without improving the odds.
+	if wait := n.symmetricBackoffWait(relayID); wait > 0 {
+		n.debugf("symmetric scan for %s postponed %s by previous failures", relayID[:8], wait.Round(time.Second))
+		return false
+	}
+	// Share one burst per relay. Startup, roaming recovery and per-edge
+	// retries used to run independent scans; concurrent rendezvous requests
+	// also cancelled each other on the relay side (startSymmetricScan keeps
+	// only the newest session), so neither scan could ever succeed.
+	n.symmetricBurstMu.Lock()
+	if call := n.symmetricBurstInFlight[relayID]; call != nil {
+		n.symmetricBurstMu.Unlock()
+		n.debugf("symmetric scan for %s already in flight; joining", relayID[:8])
+		select {
+		case <-call.done:
+		case <-time.After(symmetricBurstTimeout + 15*time.Second):
+		}
+		return call.ok
+	}
+	call := &symmetricBurstCall{done: make(chan struct{})}
+	n.symmetricBurstInFlight[relayID] = call
+	n.symmetricBurstMu.Unlock()
+	defer func() {
+		n.symmetricBurstMu.Lock()
+		if n.symmetricBurstInFlight[relayID] == call {
+			delete(n.symmetricBurstInFlight, relayID)
+		}
+		n.symmetricBurstMu.Unlock()
+		call.ok = ok
+		close(call.done)
+	}()
+	// A burst that started before a network switch must not install its
+	// socket afterwards: it is pinned to the dead network's mapping.
+	generation := n.networkGen.Load()
 	endpoint, err := net.ResolveUDPAddr("udp", relay.Endpoint)
 	if err != nil {
 		n.logf("invalid superpeer endpoint: %v", err)
@@ -2110,6 +2214,7 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 	}
 	proceed, coordinated := n.requestSymmetricScan(relayID, sessionID)
 	if !proceed {
+		n.symmetricBurstFailed(relayID)
 		return false
 	}
 	if !coordinated {
@@ -2120,11 +2225,21 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 
 	responses := make(chan symmetricReply, symmetricBurstSize)
 	sockets := make([]*net.UDPConn, 0, symmetricBurstSize)
+	iface := resolveBindIface(n.c.bindIface)
 	n.logf("symmetric NAT: probing %d UDP ports via %s (attempt %d/%d)", symmetricBurstSize, relayID[:8], attempt, symmetricBurstRetries)
 	for range symmetricBurstSize {
 		probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)})
 		if err != nil {
 			continue
+		}
+		if iface != "" {
+			// Probe sockets must ride the same uplink as the transport: on a
+			// phone with a VPN TUN (VLESS/Happ), wildcard probes vanish into
+			// the proxy and the reverse scan can never find them.
+			if err := bindUDPInterface(probe, iface); err != nil {
+				probe.Close()
+				continue
+			}
 		}
 		burst := protocol.NewPacket("SYMMETRIC_BURST", n.id.ID, relayID, map[string]any{"session_id": sessionID})
 		encoded, err := protocol.EncodePacket(burst, n.key)
@@ -2139,6 +2254,9 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 		configureUDPSocket(probe)
 		sockets = append(sockets, probe)
 		go n.awaitSymmetricHello(probe, relayID, sessionID, responses)
+		// Pace the burst: dumping hundreds of packets back-to-back trips
+		// uplink QoS and carrier-NAT rate limits on mobile networks.
+		time.Sleep(scanDelay)
 	}
 
 	deadline := time.NewTimer(symmetricBurstTimeout)
@@ -2147,6 +2265,15 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 	for selected == nil {
 		select {
 		case received := <-responses:
+			if n.networkGen.Load() != generation {
+				// The network changed mid-burst: this socket belongs to the
+				// previous mapping and must not become the transport.
+				for _, probe := range sockets {
+					_ = probe.Close()
+				}
+				n.debugf("symmetric scan for %s abandoned after network change", relayID[:8])
+				return false
+			}
 			selected = received.conn
 			// awaitSymmetricHello reads the handshake directly from the probe
 			// socket, so it does not pass through handleDatagram/touch. Mark the
@@ -2162,6 +2289,7 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 				_ = probe.Close()
 			}
 			n.logf("symmetric NAT burst timed out without HELLO")
+			n.symmetricBurstFailed(relayID)
 			return false
 		}
 	}
@@ -2184,6 +2312,7 @@ func (n *node) establishSymmetricTransportOnce(relayID string, relay *peer, atte
 			}
 		}
 	}
+	n.symmetricBurstSucceeded(relayID)
 	n.logf("symmetric NAT synchronized through %s on %s", relayID[:8], selected.LocalAddr())
 	return true
 }
@@ -2194,6 +2323,51 @@ func newSymmetricSessionID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// symmetricBackoffWait reports how long a burst toward relayID must wait
+// before the next attempt. Zero means "go ahead".
+func (n *node) symmetricBackoffWait(relayID string) time.Duration {
+	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+	due, ok := n.symmetricBackoff[relayID]
+	if !ok {
+		return 0
+	}
+	if wait := time.Until(due); wait > 0 {
+		return wait
+	}
+	return 0
+}
+
+// symmetricBurstFailed records a failed burst and schedules the next attempt
+// with exponential backoff (2s, 4s, 8s, ... capped).
+func (n *node) symmetricBurstFailed(relayID string) {
+	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+	if n.symmetricFailures == nil {
+		n.symmetricFailures = map[string]int{}
+	}
+	if n.symmetricBackoff == nil {
+		n.symmetricBackoff = map[string]time.Time{}
+	}
+	n.symmetricFailures[relayID]++
+	delay := symmetricRetryDelay
+	for i := 1; i < n.symmetricFailures[relayID] && delay < symmetricBurstBackoffMax; i++ {
+		delay *= 2
+	}
+	if delay > symmetricBurstBackoffMax {
+		delay = symmetricBurstBackoffMax
+	}
+	n.symmetricBackoff[relayID] = time.Now().Add(delay)
+}
+
+// symmetricBurstSucceeded clears the per-relay failure history.
+func (n *node) symmetricBurstSucceeded(relayID string) {
+	n.symmetricMu.Lock()
+	defer n.symmetricMu.Unlock()
+	delete(n.symmetricFailures, relayID)
+	delete(n.symmetricBackoff, relayID)
 }
 
 func (n *node) requestSymmetricScan(relayID, sessionID string) (proceed, coordinated bool) {
@@ -2313,6 +2487,31 @@ func (n *node) replaceUDPConn(next *net.UDPConn) {
 	n.addReceiveSocket(next)
 }
 
+// defaultRouteInterfaceFn is a hook so tests can simulate route lookup.
+var defaultRouteInterfaceFn = defaultRouteInterface
+
+// resolveBindIface resolves the configured interface name for UDP sockets.
+// "auto" selects the current default-route interface and is re-evaluated on
+// every rebind, so Wi-Fi <-> LTE switches move the binding along. Empty means
+// "auto" on Android and wildcard elsewhere: wildcard UDP on Android is pulled
+// into VPN TUNs (VLESS/Happ, WireGuard apps) by policy routing, which
+// silently breaks hole punching. "none" forces the wildcard socket.
+func resolveBindIface(configured string) string {
+	switch configured {
+	case "none":
+		return ""
+	case "auto":
+		return defaultRouteInterfaceFn()
+	case "":
+		if !androidRuntimeFn() {
+			return ""
+		}
+		return defaultRouteInterfaceFn()
+	default:
+		return configured
+	}
+}
+
 // rebindUDPConn drops the socket created on the previous network and creates
 // a new one. On Android a wildcard-bound UDP socket can remain associated with
 // the Wi-Fi Network after the default network changes to LTE; refreshing STUN
@@ -2355,6 +2554,15 @@ func (n *node) rebindUDPConn() error {
 		return err
 	}
 	configureUDPSocket(next)
+	// Re-resolve on every rebind: "auto" follows the network (wlan0 <->
+	// rmnet_data1) after roaming. Bump the generation first so in-flight
+	// symmetric bursts detect that their sockets are now stale.
+	n.networkGen.Add(1)
+	if iface := resolveBindIface(n.c.bindIface); iface != "" {
+		if err := bindUDPInterface(next, iface); err != nil {
+			n.logf("UDP bind to interface %s failed: %v (using wildcard socket)", iface, err)
+		}
+	}
 	n.conn = next
 	n.connMu.Unlock()
 	n.finishUDPConnReplacement(old, next)
@@ -2741,6 +2949,11 @@ func (n *node) lanDiscoveryBurst(ctx context.Context) {
 // candidate set is re-checked on a fixed schedule instead of waiting for a
 // topology push, so candidates also work in a fully stable network.
 func (n *node) probeLanCandidates() {
+	if !n.hasLAN() {
+		// No physical LAN right now (mobile data): candidates cannot be
+		// on-link, probing would just leak packets into the carrier network.
+		return
+	}
 	type probe struct {
 		id   string
 		addr *net.UDPAddr
@@ -2758,7 +2971,7 @@ func (n *node) probeLanCandidates() {
 				break
 			}
 			addr, err := net.ResolveUDPAddr("udp4", raw)
-			if err != nil || addr.IP == nil {
+			if err != nil || addr.IP == nil || !n.lanCandidateUsable(addr.IP) {
 				continue
 			}
 			p.lastLAN = copyUDPAddr(addr)
@@ -2924,6 +3137,10 @@ func (n *node) resetTransportState() {
 	n.symmetricConnected = map[string]bool{}
 	n.symmetricBurstAt = map[string]time.Time{}
 	n.symmetricBurstSess = map[string]string{}
+	// A new network means a new NAT mapping: scan failures observed on the
+	// previous network say nothing about the fresh one, so clear the backoff.
+	n.symmetricFailures = map[string]int{}
+	n.symmetricBackoff = map[string]time.Time{}
 	n.symmetricMu.Unlock()
 }
 
@@ -3004,6 +3221,30 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 				// only hairpin through the NAT and flood conntrack again.
 				return
 			}
+			if n.symmetricTransportReady(id) {
+				// Another recovery pass already re-established this edge while
+				// this retry was queued.
+				return
+			}
+			// Space out scan rounds: on carrier NATs a burst is expensive
+			// (hundreds of UDP mappings) and repeating it every few seconds
+			// only floods conntrack. The per-relay backoff lives in
+			// symmetricBackoff; wait here so this goroutine fires its attempt
+			// exactly when it becomes due.
+			for {
+				wait := n.symmetricBackoffWait(id)
+				if wait <= 0 {
+					break
+				}
+				if wait > 10*time.Second {
+					wait = 10 * time.Second
+				}
+				time.Sleep(wait)
+				if n.symmetricTransportReady(id) || n.relayLANLive(id) {
+					return
+				}
+			}
+			n.logf("symmetric edge %s is down; starting scan round", id[:8])
 			n.resetSymmetricRelay(id)
 			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
 				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
@@ -3030,6 +3271,9 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 			n.mu.RUnlock()
 			if current == nil {
 				return
+			}
+			if attempt == 1 {
+				n.logf("edge %s is down; retrying HELLO", id[:8])
 			}
 			// HELLO is deliberately sent on every retry, even when the cached
 			// observed address is stale: sendHello also tries the endpoint from
@@ -4194,10 +4438,45 @@ func (n *node) localSubnets() []netip.Prefix {
 	if n.subnets != nil && now.Sub(n.subnetsAt) < localSubnetsRefresh {
 		return n.subnets
 	}
+	n.subnets = n.collectSubnets(false)
+	n.subnetsAt = now
+	return n.subnets
+}
+
+// lanSubnets returns only the subnets that can plausibly host LAN peers:
+// RFC1918 addresses on non-modem interfaces. Carrier ranges on rmnet/ccmni
+// belong to the provider's internal network and must never be advertised or
+// probed as LAN candidates.
+func (n *node) lanSubnets() []netip.Prefix {
+	n.subnetsMu.Lock()
+	defer n.subnetsMu.Unlock()
+	now := time.Now()
+	if n.lanSubnetCache != nil && now.Sub(n.lanSubnetsAt) < localSubnetsRefresh {
+		return n.lanSubnetCache
+	}
+	n.lanSubnetCache = n.collectSubnets(true)
+	n.lanSubnetsAt = now
+	return n.lanSubnetCache
+}
+
+// hasLAN reports whether any interface currently offers a private LAN subnet.
+// A phone on mobile data has none, which disables LAN probing entirely:
+// without this gate the node kept unicasting HELLOs to 192.168.x addresses
+// through the carrier network after leaving Wi-Fi.
+func (n *node) hasLAN() bool {
+	return len(n.lanSubnets()) > 0
+}
+
+// collectSubnets enumerates IPv4 prefixes of up physical interfaces. With
+// lanOnly, modem interfaces are skipped and only RFC1918 ranges are kept.
+func (n *node) collectSubnets(lanOnly bool) []netip.Prefix {
 	subnets := make([]netip.Prefix, 0, 4)
 	if interfaces, err := net.Interfaces(); err == nil {
 		for _, iface := range interfaces {
 			if iface.Flags&net.FlagUp == 0 || virtualInterfaceName(iface.Name) || (n.c.tun != "" && iface.Name == n.c.tun) {
+				continue
+			}
+			if lanOnly && wwanInterfaceName(iface.Name) {
 				continue
 			}
 			addrs, err := iface.Addrs()
@@ -4217,13 +4496,14 @@ func (n *node) localSubnets() []netip.Prefix {
 				if !ip.Is4() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || n.isMeshAddr(ip) {
 					continue
 				}
+				if lanOnly && !ip.IsPrivate() {
+					continue
+				}
 				bits, _ := net.IPMask(ipnet.Mask).Size()
 				subnets = append(subnets, netip.PrefixFrom(ip, bits))
 			}
 		}
 	}
-	n.subnets = subnets
-	n.subnetsAt = now
 	return subnets
 }
 
@@ -4260,7 +4540,14 @@ func (n *node) advertisedLanAddrs() []string {
 		seen[ip.String()] = true
 		out = append(out, net.JoinHostPort(ip.String(), strconv.Itoa(port)))
 	}
-	for _, prefix := range n.localSubnets() {
+	// Advertise only genuine LAN material: private addresses on non-modem
+	// interfaces. Advertising carrier ranges (10.x inside CGNAT, exotic
+	// public ranges) made other nodes probe addresses inside the provider's
+	// network.
+	for _, prefix := range n.lanSubnets() {
+		if !prefix.Addr().IsPrivate() {
+			continue
+		}
 		add(prefix.Addr())
 	}
 	return out
@@ -4283,6 +4570,48 @@ func (n *node) localSource(ip net.IP) bool {
 	}
 	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() {
 		return true
+	}
+	for _, subnet := range n.localSubnets() {
+		if subnet.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// wwanInterfaceName reports whether the interface belongs to a mobile-data
+// modem (Android rmnet*/ccmni*, iOS pdp*, generic wwan*). Addresses of such
+// interfaces live inside the carrier's internal network: probing or
+// advertising them as LAN candidates sends packets into the provider's
+// network and never reaches a peer.
+func wwanInterfaceName(name string) bool {
+	lower := strings.ToLower(name)
+	for _, prefix := range []string{"rmnet", "ccmni", "pdp", "wwan"} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// lanCandidateUsable reports whether a coordinator-advertised LAN address
+// can plausibly be on-link for this node right now: it must be private
+// (RFC1918) while the node itself has a LAN, or sit inside one of this
+// node's own subnets (exotic public LAN ranges). Private candidates on a
+// mobile-data-only node fail the first check: without a local LAN there is
+// no way a 192.168.x address is reachable, and probing would leak packets
+// into the carrier's network.
+func (n *node) lanCandidateUsable(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	if !addr.Is4() {
+		return false
+	}
+	if addr.IsPrivate() {
+		return n.hasLAN()
 	}
 	for _, subnet := range n.localSubnets() {
 		if subnet.Contains(addr) {
@@ -4413,11 +4742,10 @@ func (n *node) linkHealth(ctx context.Context) {
 				n.mu.Unlock()
 			}
 			for _, peer := range deadEdges {
-				if n.c.nat == "symmetric" && peer.Role == "superpeer" {
-					n.logf("symmetric edge %s is down; retrying scan", peer.ID[:8])
-				} else {
-					n.logf("edge %s is down; retrying HELLO", peer.ID[:8])
-				}
+				// The up/down transition was already logged above. Retry
+				// scheduling and its logging live inside retryDeadEdge: a line
+				// here repeated every tick made mobile logs useless.
+				n.debugf("edge %s is dead; retry scheduled", peer.ID[:8])
 				n.retryDeadEdge(peer.ID, peer)
 			}
 		}
@@ -4844,6 +5172,7 @@ func (n *node) sendFastMode(dst string, data []byte, wait bool) bool {
 	copy(owned, data)
 	return n.enqueueUDP(outboundDatagram{conn: conn, data: owned, address: address}, wait)
 }
+
 // tunLoop reads IP packets from the host and injects received packets back.
 func (n *node) tunLoop(ctx context.Context) {
 	n.logf("TUN reader started")
@@ -4951,6 +5280,7 @@ func (n *node) isTUNBroadcast(addr netip.Addr) bool {
 	}
 	return true
 }
+
 // sendIP encrypts a TUN packet and forwards it toward its mesh destination.
 func (n *node) sendIP(dst string, p []byte) bool {
 	if len(p) > maxTUN {
@@ -5196,6 +5526,7 @@ func min(a, b int) int {
 	}
 	return b
 }
+
 // stunEndpoint queries available STUN servers to discover the public UDP mapping.
 func stunEndpoint(c *net.UDPConn, onPacket func([]byte, *net.UDPAddr), bootstrap ...string) (string, string, error) {
 	// STUN shares the node's UDP socket with the receive loop. Always restore

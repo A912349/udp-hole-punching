@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -69,6 +70,10 @@ func TestTouchClassifiesByPacketSource(t *testing.T) {
 func TestApplyTopologyProbesAdvertisedLanAddrs(t *testing.T) {
 	id := "0123456789abcdef0123456789abcdef"
 	n := &node{id: &protocol.Identity{ID: "fedcba9876543210fedcba9876543210"}, neighbors: map[string]*peer{}}
+	// Simulate an on-link LAN: without a local private subnet (mobile data)
+	// LAN probing is disabled entirely.
+	n.lanSubnetCache = []netip.Prefix{netip.MustParsePrefix("192.168.77.111/24")}
+	n.lanSubnetsAt = time.Now()
 	// applyTopology installs a fresh peer struct on every push, so the test
 	// must re-read the map instead of holding a stale pointer.
 	cur := func() *peer { return n.neighbors[id] }

@@ -168,6 +168,30 @@ between ports in each scan pass (default: `200`). For example, a target port
 of `54532` is probed as `54332`, `54732`, and so on through the port range;
 the following pass is centered on `54531`.
 
+### Mobile devices, VPN apps and `--bind-iface`
+
+On Android, wildcard-bound UDP sockets follow policy routing: a VPN app
+(VLESS/Happ, WireGuard, ...) that owns a TUN silently pulls the mesh traffic
+into itself, where hole punching and STUN are broken by design. If the node
+runs as root (Magisk/Termux), it pins its UDP sockets to the default-route
+interface (`SO_BINDTODEVICE`, re-resolved on every network switch), so mesh
+traffic always rides the physical uplink (wlan/rmnet) and bypasses VPN TUNs.
+This is the default on Android; control it explicitly with:
+
+```bash
+--bind-iface auto   # pin to the current default-route interface (default on Android)
+--bind-iface wlan0  # pin to a fixed interface
+--bind-iface none   # wildcard socket, no pinning
+```
+
+`SO_BINDTODEVICE` needs `CAP_NET_RAW`; without root the node logs a warning
+and keeps the wildcard socket. Additional mobile-data safeguards: scan
+bursts toward one relay are shared instead of duplicated, repeated failures
+back off exponentially (up to 90 s) and reset on network changes, bursts
+that survive a Wi-Fi/LTE switch are discarded, and LAN probing/advertised
+LAN addresses are disabled while the node has no physical LAN (carrier
+rmnet/ccmni/pdp ranges are never treated as LAN candidates).
+
 Publish a one-shot TCP service:
 
 ```bash
