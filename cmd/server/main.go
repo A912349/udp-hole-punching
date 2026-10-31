@@ -128,6 +128,7 @@ type server struct {
 	registerMu          sync.Mutex
 	controlMu           sync.Mutex
 	controls            map[*controlClient]string
+	controlSessions     atomic.Uint64
 	symmetricMu         sync.Mutex
 	symmetricRendezvous map[string]symmetricRendezvous
 	metricsMu           sync.RWMutex
@@ -200,6 +201,10 @@ type controlClient struct {
 	ws         sync.Mutex
 	auth       sync.RWMutex
 	c          *websocket.Conn
+	// session is the connection's accept order. When the same node id
+	// registers on two overlapping connections, the newer session owns the
+	// binding; the older one must never tear the newer one down.
+	session    uint64
 	invited    bool
 	invite     string
 	credential string
@@ -356,6 +361,35 @@ func main() {
 			}
 		}(retentionDays)
 	}
+	// Graph maintenance: a superpeer that silently goes offline only frees
+	// its slot when something triggers rebalanceRoles (usually the next
+	// registration). Run it periodically so a replacement is promoted and
+	// offline nodes drop out of the graph without waiting for any event, and
+	// connected clients receive the healed topology right away.
+	go func() {
+		for {
+			ttl := s.settings().TTL
+			interval := time.Duration(ttl) * time.Second / 2
+			if interval < 10*time.Second {
+				interval = 10 * time.Second
+			}
+			if interval > 60*time.Second {
+				interval = 60 * time.Second
+			}
+			time.Sleep(interval)
+			changed, err := s.rebalanceRoles()
+			if err != nil {
+				log.Printf("[SERVER] topology maintenance: %v", err)
+				continue
+			}
+			if changed {
+				s.invalidateLinkCache()
+				s.pushTopologies()
+				s.broadcast("topology", "audit")
+				log.Printf("[SERVER] topology maintenance: roles rebalanced after membership change")
+			}
+		}
+	}()
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/register", s.register)
 	mux.HandleFunc("POST /v1/auth/register", s.accountRegister)
@@ -542,7 +576,7 @@ func (s *server) controlWS(ws *websocket.Conn) {
 	if credential == "" {
 		credential = s.token
 	}
-	client := &controlClient{c: ws, invited: ws.Request().Header.Get("X-Mesh-Invite") != "", invite: ws.Request().Header.Get("X-Mesh-Invite"), credential: credential}
+	client := &controlClient{c: ws, session: s.controlSessions.Add(1), invited: ws.Request().Header.Get("X-Mesh-Invite") != "", invite: ws.Request().Header.Get("X-Mesh-Invite"), credential: credential}
 	// Control frames are small JSON documents. The library default of 32 MiB
 	// per frame lets one authenticated client exhaust memory with a single
 	// oversized frame.
@@ -599,15 +633,28 @@ func (s *server) controlWS(ws *websocket.Conn) {
 				// exclusively: otherwise the node has two bindings and event
 				// delivery picks one at random, so topology pushes and
 				// symmetric-scan requests can silently land on the dead one.
+				superseded := false
 				for other := range s.controls {
 					if other != client && s.controls[other] == registration.ID {
+						// Register post-processing is not synchronized, so a
+						// slow old registration can reach this loop after the
+						// node already reconnected on a newer socket. Closing
+						// by "not me" alone would then kill the fresh
+						// connection. Supersession is decided by accept
+						// order: the newest session owns the binding.
+						if other.session > client.session {
+							superseded = true
+							continue
+						}
 						delete(s.controls, other)
 						stale := other
 						go func() { _ = stale.c.Close() }()
 					}
 				}
 				alreadySynced := s.controls[client] == registration.ID
-				s.controls[client] = registration.ID
+				if !superseded {
+					s.controls[client] = registration.ID
+				}
 				s.controlMu.Unlock()
 				var result struct {
 					TopologyChanged bool `json:"topology_changed"`
@@ -1770,7 +1817,7 @@ func (s *server) adminConfig(w http.ResponseWriter, r *http.Request) {
 	s.dnsUpstream = next.DNSUpstream
 	s.configMu.Unlock()
 	s.invalidateLinkCache()
-	if err := s.rebalanceRoles(); err != nil {
+	if _, err := s.rebalanceRoles(); err != nil {
 		reply(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -2147,11 +2194,13 @@ func (s *server) updateStatusSnapshot() map[string]updateResult {
 
 // rebalanceRoles makes an auto-superpeer setting take effect immediately for
 // already registered nodes, not only when their next heartbeat arrives.
-func (s *server) rebalanceRoles() error {
+// rebalanceRoles reports whether any role actually changed, so background
+// maintenance can push fresh topologies only when the graph really moved.
+func (s *server) rebalanceRoles() (bool, error) {
 	return s.rebalanceRolesFor(nil)
 }
 
-func (s *server) rebalanceRolesFor(ownerID *int64) error {
+func (s *server) rebalanceRolesFor(ownerID *int64) (bool, error) {
 	c := s.settings()
 	query := "SELECT node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,connected_at,mesh_ip,goarch,lan_addrs FROM nodes WHERE last_seen>=?"
 	args := []any{time.Now().Unix() - int64(c.TTL)}
@@ -2161,7 +2210,7 @@ func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	}
 	nodes, err := s.rows(query, args...)
 	if err != nil {
-		return err
+		return false, err
 	}
 	manual, candidates := 0, make([]node, 0, len(nodes))
 	for _, n := range nodes {
@@ -2196,6 +2245,7 @@ func (s *server) rebalanceRolesFor(ownerID *int64) error {
 	for _, n := range candidates[:min(target, len(candidates))] {
 		super[n.ID] = true
 	}
+	changed := false
 	for _, n := range nodes {
 		role := "client"
 		if super[n.ID] {
@@ -2205,10 +2255,11 @@ func (s *server) rebalanceRolesFor(ownerID *int64) error {
 			continue
 		}
 		if _, err := s.db.Exec("UPDATE nodes SET role=? WHERE node_id=?", role, n.ID); err != nil {
-			return err
+			return changed, err
 		}
+		changed = true
 	}
-	return nil
+	return changed, nil
 }
 
 // adminTopology returns the authenticated account’s view of its mesh.
@@ -3219,11 +3270,11 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if accountID, scoped := s.accountIDForRequest(r); scoped {
-		if err := s.rebalanceRolesFor(&accountID); err != nil {
+		if _, err := s.rebalanceRolesFor(&accountID); err != nil {
 			reply(w, 500, map[string]string{"error": err.Error()})
 			return
 		}
-	} else if err := s.rebalanceRoles(); err != nil {
+	} else if _, err := s.rebalanceRoles(); err != nil {
 		reply(w, 500, map[string]string{"error": err.Error()})
 		return
 	}
@@ -3718,14 +3769,20 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		(previous != nil && (previous.NAT != d.NAT || previous.RequestedRole != d.Role || previous.Relay != relay || previous.Capacity != d.Capacity)) ||
 		(accountScoped && !existingOwner.Valid)
 	if needsRebalance {
+		var rebalanced bool
 		if accountScoped {
-			e = s.rebalanceRolesFor(&accountID)
+			rebalanced, e = s.rebalanceRolesFor(&accountID)
 		} else {
-			e = s.rebalanceRoles()
+			rebalanced, e = s.rebalanceRoles()
 		}
 		if e != nil {
 			reply(w, 500, map[string]any{"error": e.Error()})
 			return
+		}
+		if rebalanced {
+			// A promotion or demotion moves edges between other nodes too;
+			// drop the cached graph so the next bootstrap serves fresh links.
+			s.invalidateLinkCache()
 		}
 		_ = s.db.QueryRow("SELECT role FROM nodes WHERE node_id=?", d.ID).Scan(&role)
 	}
@@ -3981,69 +4038,220 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 	return rank
 }
 // links builds the forwarding graph from policy and observed link metrics.
+//
+// Invariants, in priority order:
+//  1. Reachability: the effective graph over all online nodes is always
+//     connected. Manual islands, blocked edges, and superpeers going offline
+//     are healed by bridging components instead of stranding clients.
+//  2. Minimal churn: weighted rendezvous hashing keeps client assignments
+//     stable when unrelated nodes join or leave, and the backbone ring only
+//     rewires the edges adjacent to the position that changed.
+//  3. Redundancy: the backbone keeps at least ring degree (2), so the mesh
+//     survives the loss of any single superpeer without a partition.
 func (s *server) links(nodes []node) []link {
-	if manual := s.manualLinksForNodes(nodes); len(manual) > 0 {
-		return s.decorateLinks(s.filterBlockedLinks(s.addAutomaticClientLinks(manual, nodes), nodes), nodes)
-	}
+	blocked := s.blockedEdgeSet(nodes)
 	s.configMu.RLock()
-	backboneDegree, clientLinks, symmetricLinks := s.backboneDegree, s.clientLinks, s.symmetricLinks
+	backboneDegree := s.backboneDegree
 	s.configMu.RUnlock()
+	if manual := s.manualLinksForNodes(nodes); len(manual) > 0 {
+		// Blocked edges are removed before client attachment so a blocked
+		// manual link never consumes a client's automatic link budget.
+		out := removeBlockedEdges(manual, blocked)
+		out = s.addAutomaticClientLinks(out, nodes, superpeerNodes(nodes), blocked)
+		return s.decorateLinks(s.ensureConnected(removeBlockedEdges(out, blocked), nodes, blocked), nodes)
+	}
+	superpeers := superpeerNodes(nodes)
+	var out []link
+	if len(superpeers) > 1 {
+		out = backboneLinks(superpeers, backboneDegree)
+	}
+	// Clients attach to superpeers while any are online. A pure-client mesh
+	// (no relay-capable node available, e.g. right after the last superpeer
+	// leaves, or in small standalone setups) degenerates to peer-to-peer
+	// attachment instead of an empty, unreachable graph.
+	peers := superpeers
+	if len(peers) == 0 {
+		peers = nodes
+	}
+	out = s.addAutomaticClientLinks(out, nodes, peers, blocked)
+	return s.decorateLinks(s.ensureConnected(removeBlockedEdges(out, blocked), nodes, blocked), nodes)
+}
+
+// backboneLinks wires the superpeer backbone as a ring over sorted node IDs
+// plus redundant chords. The ring alone guarantees connectivity and only
+// changes the two edges adjacent to a position when one superpeer joins or
+// leaves; chords shorten paths and add redundancy but are never required for
+// reachability. Degree is floored at 2: honoring degree 1 produced a perfect
+// matching (or, with an odd peer count, no backbone at all), silently
+// partitioning the mesh after the first superpeer failure.
+func backboneLinks(superpeers []node, degree int) []link {
+	n := len(superpeers)
+	if n < 2 {
+		return nil
+	}
+	if degree < 2 {
+		degree = 2
+	}
+	if degree > n-1 {
+		degree = n - 1
+	}
+	seen := make(map[string]bool, n*degree)
+	out := make([]link, 0, n*degree)
+	add := func(a, b string) {
+		if a > b {
+			a, b = b, a
+		}
+		if a == b {
+			return
+		}
+		k := a + ":" + b
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		out = append(out, link{A: a, B: b, Cost: 1})
+	}
+	for i := range superpeers {
+		add(superpeers[i].ID, superpeers[(i+1)%n].ID)
+	}
+	for step := 2; step <= degree/2; step++ {
+		for i := range superpeers {
+			add(superpeers[i].ID, superpeers[(i+step)%n].ID)
+		}
+	}
+	if degree%2 == 1 {
+		half := n / 2
+		for i := 0; i < half; i++ {
+			add(superpeers[i].ID, superpeers[i+half].ID)
+		}
+	}
+	return out
+}
+
+// ensureConnected is the safety net that keeps the mesh reachable: after all
+// other graph rules (manual edits, blocked pairs, departed nodes) have been
+// applied, any remaining disconnected components are bridged with the
+// cheapest deterministic edges. Repairs are idempotent and independent of
+// live telemetry, so repeated builds produce the same bridges. Explicitly
+// blocked pairs are never restored: if admin policy blocks every candidate
+// pair between two components, those components stay disconnected.
+func (s *server) ensureConnected(edges []link, nodes []node, blocked map[string]bool) []link {
+	if len(nodes) < 2 {
+		return edges
+	}
+	parent := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		parent[n.ID] = n.ID
+	}
+	var find func(string) string
+	find = func(x string) string {
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
+		}
+		return x
+	}
+	for _, e := range edges {
+		if _, ok := parent[e.A]; !ok {
+			continue
+		}
+		if _, ok := parent[e.B]; !ok {
+			continue
+		}
+		if ra, rb := find(e.A), find(e.B); ra != rb {
+			parent[ra] = rb
+		}
+	}
+	components := map[string][]node{}
+	for _, n := range nodes {
+		root := find(n.ID)
+		components[root] = append(components[root], n)
+	}
+	if len(components) <= 1 {
+		return edges
+	}
+	// Deterministic order keeps the repair reproducible across builds.
+	roots := make([]string, 0, len(components))
+	for root := range components {
+		roots = append(roots, root)
+	}
+	sort.Strings(roots)
+	out := append([]link(nil), edges...)
+	for i := 1; i < len(roots); i++ {
+		a, b, ok := bridgeNodes(components[roots[i-1]], components[roots[i]], blocked)
+		if !ok {
+			continue
+		}
+		out = append(out, link{A: a.ID, B: b.ID, Cost: 1.25})
+	}
+	return out
+}
+
+// bridgeNodes picks the pair of nodes joining two components. Superpeers are
+// preferred on both ends (client degree stays low), then weighted rendezvous
+// hashing breaks ties so the same components always yield the same bridge,
+// biased toward higher-capacity relays. Blocked pairs are skipped; ok is
+// false when every possible pair is blocked.
+func bridgeNodes(a, b []node, blocked map[string]bool) (node, node, bool) {
+	tier := func(n node) int {
+		if n.Role == "superpeer" {
+			return 0
+		}
+		return 1
+	}
+	var bestA, bestB node
+	bestTier, bestScore := 0, uint64(0)
+	found := false
+	for _, x := range a {
+		for _, y := range b {
+			if blocked[edgeKey(x.ID, y.ID)] {
+				continue
+			}
+			t := tier(x) + tier(y)
+			s1 := rendezvousScore(x.ID, y.ID, x.Capacity)
+			s2 := rendezvousScore(y.ID, x.ID, y.Capacity)
+			lo, hi := s1, s2
+			if hi < lo {
+				lo, hi = hi, lo
+			}
+			idPair := x.ID + "\x00" + y.ID
+			bestPair := bestA.ID + "\x00" + bestB.ID
+			if !found || t < bestTier || (t == bestTier && (lo < bestScore || (lo == bestScore && idPair < bestPair))) {
+				bestA, bestB, bestTier, bestScore, found = x, y, t, lo, true
+			}
+		}
+	}
+	return bestA, bestB, found
+}
+
+// superpeerNodes returns the online superpeers in directory order. Nodes are
+// loaded ORDER BY node_id, so the backbone ring is deterministic.
+func superpeerNodes(nodes []node) []node {
 	var sp []node
 	for _, n := range nodes {
 		if n.Role == "superpeer" {
 			sp = append(sp, n)
 		}
 	}
-	out := []link{}
-	degree := min(max(1, backboneDegree), len(sp)-1)
-	seen := map[string]bool{}
-	for i, n := range sp {
-		for step := 1; step <= degree/2; step++ {
-			a, b := n.ID, sp[(i+step)%len(sp)].ID
-			if a > b {
-				a, b = b, a
-			}
-			k := a + ":" + b
-			if !seen[k] {
-				seen[k] = true
-				out = append(out, link{A: a, B: b, Cost: 1})
-			}
-		}
-		if degree%2 == 1 && len(sp)%2 == 0 {
-			a, b := n.ID, sp[(i+len(sp)/2)%len(sp)].ID
-			if a > b {
-				a, b = b, a
-			}
-			k := a + ":" + b
-			if !seen[k] {
-				seen[k] = true
-				out = append(out, link{A: a, B: b, Cost: 1})
-			}
-		}
-	}
-	for _, n := range nodes {
-		if n.Role != "client" {
-			continue
-		}
-		linkCount := clientLinks
-		if n.NAT == "symmetric" {
-			linkCount = symmetricLinks
-		}
-		rank := s.telemetryPeerOrder(n, sp)
-		for i, p := range rank[:min(linkCount, len(rank))] {
-			out = append(out, link{A: n.ID, B: p.ID, Cost: 1 + float64(i)/10})
-		}
-	}
-	return s.decorateLinks(s.filterBlockedLinks(out, nodes), nodes)
+	return sp
 }
 
-func (s *server) filterBlockedLinks(links []link, nodes []node) []link {
-	blocked := map[string]bool{}
+// blockedEdgeSet collects blocked pairs among the online nodes once per graph
+// build instead of once per filtering pass.
+func (s *server) blockedEdgeSet(nodes []node) map[string]bool {
+	blocked := make(map[string]bool)
 	for _, e := range s.blockedLinksForNodes(nodes) {
 		blocked[edgeKey(e.A, e.B)] = true
 	}
-	out := links[:0]
-	for _, e := range links {
+	return blocked
+}
+
+func removeBlockedEdges(edges []link, blocked map[string]bool) []link {
+	if len(blocked) == 0 {
+		return edges
+	}
+	out := edges[:0]
+	for _, e := range edges {
 		if !blocked[edgeKey(e.A, e.B)] {
 			out = append(out, e)
 		}
@@ -4117,23 +4325,19 @@ func edgeKey(a, b string) string {
 	return a + ":" + b
 }
 
-// addAutomaticClientLinks preserves manually managed backbone edges while
-// still attaching every client to the nearest available superpeers. Without
-// this merge, adding any manual graph edge disables all automatic client
-// attachments, leaving newly registered nodes with neighbors=0.
-func (s *server) addAutomaticClientLinks(out []link, nodes []node) []link {
+// addAutomaticClientLinks preserves managed backbone edges while attaching
+// every client to its preferred peers in weighted rendezvous order: normally
+// the superpeers, or the whole directory when no superpeer is online. Blocked
+// pairs are skipped outright so they never consume a client's link budget,
+// and the wanted count is floored at one so a blocked first choice or a
+// misconfiguration still leaves the client reachable.
+func (s *server) addAutomaticClientLinks(out []link, nodes, peers []node, blocked map[string]bool) []link {
+	if len(peers) == 0 {
+		return out
+	}
 	s.configMu.RLock()
 	clientLinks, symmetricLinks := s.clientLinks, s.symmetricLinks
 	s.configMu.RUnlock()
-	var superpeers []node
-	for _, n := range nodes {
-		if n.Role == "superpeer" {
-			superpeers = append(superpeers, n)
-		}
-	}
-	if len(superpeers) == 0 {
-		return out
-	}
 	for _, client := range nodes {
 		if client.Role != "client" {
 			continue
@@ -4141,6 +4345,9 @@ func (s *server) addAutomaticClientLinks(out []link, nodes []node) []link {
 		want := clientLinks
 		if client.NAT == "symmetric" {
 			want = symmetricLinks
+		}
+		if want < 1 {
+			want = 1
 		}
 		connected := map[string]bool{}
 		for _, edge := range out {
@@ -4152,16 +4359,16 @@ func (s *server) addAutomaticClientLinks(out []link, nodes []node) []link {
 			}
 		}
 		count := 0
-		for _, peer := range superpeers {
-			if connected[peer.ID] {
+		for _, peer := range peers {
+			if peer.ID != client.ID && connected[peer.ID] {
 				count++
 			}
 		}
-		for _, peer := range s.telemetryPeerOrder(client, superpeers) {
+		for _, peer := range s.telemetryPeerOrder(client, peers) {
 			if count >= want {
 				break
 			}
-			if connected[peer.ID] {
+			if peer.ID == client.ID || connected[peer.ID] || blocked[edgeKey(client.ID, peer.ID)] {
 				continue
 			}
 			out = append(out, link{A: client.ID, B: peer.ID, Cost: 1 + float64(count)/10})

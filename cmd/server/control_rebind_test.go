@@ -93,9 +93,22 @@ func TestControlReconnectRebindsNodeExclusively(t *testing.T) {
 		t.Fatal("sendControlEvent could not deliver to the reconnected node")
 	}
 	// The register already triggered one pushed topology; any received
-	// topology event proves delivery reaches the live connection.
-	if err := websocket.JSON.Receive(second, &out); err != nil || out.Event != "topology" {
-		t.Fatalf("topology event not delivered to the live connection: %v %+v", err, out)
+	// topology event proves delivery reaches the live connection. Frames
+	// interleave with the register response still in flight, so drain
+	// buffered frames until a topology event shows up.
+	delivered := false
+	_ = second.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for i := 0; i < 8; i++ {
+		if err := websocket.JSON.Receive(second, &out); err != nil {
+			t.Fatalf("topology event not delivered to the live connection: %v", err)
+		}
+		if out.Event == "topology" {
+			delivered = true
+			break
+		}
+	}
+	if !delivered {
+		t.Fatal("topology event not delivered to the live connection")
 	}
 
 	// The stale connection must have been closed by the coordinator. It may

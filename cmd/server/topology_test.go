@@ -93,7 +93,7 @@ func TestRebalanceRolesDoesNotRewriteStableRoles(t *testing.T) {
 	if err := s.db.QueryRow("SELECT total_changes()").Scan(&before); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.rebalanceRoles(); err != nil {
+	if _, err := s.rebalanceRoles(); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow("SELECT total_changes()").Scan(&after); err != nil {
@@ -111,10 +111,218 @@ func TestManualBackboneStillAttachesNewClients(t *testing.T) {
 		testNode("sp-b", "cone", "superpeer", 1),
 		testNode("new-client", "cone", "client", 1),
 	}
-	links := s.addAutomaticClientLinks([]link{{A: "sp-a", B: "sp-b"}}, nodes)
+	links := s.addAutomaticClientLinks([]link{{A: "sp-a", B: "sp-b"}}, nodes, superpeerNodes(nodes), nil)
 	if got := len(neighborsFor(links, "new-client")); got != 2 {
 		t.Fatalf("new client has %d automatic superpeer links, want 2", got)
 	}
+}
+
+func TestBackboneDegreeOneStaysConnected(t *testing.T) {
+	s := &server{backboneDegree: 1, clientLinks: 2, symmetricLinks: 3}
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("sp-c", "cone", "superpeer", 1),
+		testNode("sp-d", "cone", "superpeer", 1),
+		testNode("sp-e", "cone", "superpeer", 1),
+		testNode("sp-f", "cone", "superpeer", 1),
+		testNode("sp-g", "cone", "superpeer", 1),
+	}
+	// backboneDegree=1 used to emit a perfect matching (even peer count) or
+	// no backbone at all (odd peer count): a silently partitioned mesh.
+	for _, count := range []int{2, 3, 4, 5, 6, 7} {
+		ls := s.links(nodes[:count])
+		if !connected(ls, nodes[:count]) {
+			t.Fatalf("backbone of %d superpeers with degree=1 is disconnected", count)
+		}
+	}
+}
+
+func TestBackboneSurvivesSingleSuperpeerLoss(t *testing.T) {
+	s := &server{backboneDegree: 2, clientLinks: 2, symmetricLinks: 3}
+	sp := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("sp-c", "cone", "superpeer", 1),
+		testNode("sp-d", "cone", "superpeer", 1),
+		testNode("sp-e", "cone", "superpeer", 1),
+	}
+	for drop := range sp {
+		remaining := append(append([]node(nil), sp[:drop]...), sp[drop+1:]...)
+		ls := s.links(remaining)
+		if !connected(ls, remaining) {
+			t.Fatalf("backbone disconnected after losing %s", sp[drop].ID)
+		}
+	}
+}
+
+func TestGraphStaysConnectedWhenSuperpeerLeaves(t *testing.T) {
+	s := &server{backboneDegree: 2, clientLinks: 2, symmetricLinks: 3}
+	full := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("c-1", "cone", "client", 1),
+		testNode("c-2", "cone", "client", 1),
+		testNode("c-3", "symmetric", "client", 1),
+	}
+	if !connected(s.links(full), full) {
+		t.Fatal("full mesh is disconnected")
+	}
+	// The remaining superpeer keeps every client attached; nobody strands.
+	left := []node{full[1], full[2], full[3], full[4]}
+	ls := s.links(left)
+	if !connected(ls, left) {
+		t.Fatal("mesh disconnected after the superpeer left")
+	}
+	for _, n := range left {
+		if len(neighborsFor(ls, n.ID)) == 0 {
+			t.Fatalf("%s has no neighbors after the superpeer left", n.ID)
+		}
+	}
+}
+
+func TestPureClientMeshWithoutSuperpeersStaysConnected(t *testing.T) {
+	s := &server{backboneDegree: 6, clientLinks: 2, symmetricLinks: 3}
+	nodes := []node{
+		testNode("n-1", "symmetric", "client", 1),
+		testNode("n-2", "symmetric", "client", 1),
+		testNode("n-3", "symmetric", "client", 1),
+	}
+	// Before the fallback this produced zero links: after the last relay
+	// node left, the whole mesh went dark.
+	ls := s.links(nodes)
+	if !connected(ls, nodes) {
+		t.Fatal("pure-client mesh must degrade to peer-to-peer, not an empty graph")
+	}
+	for _, n := range nodes {
+		if len(neighborsFor(ls, n.ID)) == 0 {
+			t.Fatalf("%s has no neighbors in a superpeerless mesh", n.ID)
+		}
+	}
+}
+
+func TestManualIslandsAreBridged(t *testing.T) {
+	s := &server{clientLinks: 1, symmetricLinks: 1}
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("sp-c", "cone", "superpeer", 1),
+		testNode("sp-d", "cone", "superpeer", 1),
+	}
+	links := s.ensureConnected([]link{{A: "sp-a", B: "sp-b"}, {A: "sp-c", B: "sp-d"}}, nodes, nil)
+	if !connected(links, nodes) {
+		t.Fatal("manual islands were not bridged")
+	}
+	// A superpeer-to-superpeer bridge is preferred over client endpoints.
+	bridged := false
+	for _, e := range links {
+		if (e.A == "sp-b" && e.B == "sp-c") || (e.A == "sp-a" && e.B == "sp-c") ||
+			(e.A == "sp-b" && e.B == "sp-d") || (e.A == "sp-a" && e.B == "sp-d") {
+			bridged = true
+		}
+	}
+	if !bridged {
+		t.Fatalf("bridge should connect superpeers directly, got %v", links)
+	}
+}
+
+func TestEnsureConnectedIsStableAcrossRebuilds(t *testing.T) {
+	s := &server{clientLinks: 1, symmetricLinks: 1}
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 2),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("c-1", "cone", "client", 1),
+		testNode("c-2", "cone", "client", 1),
+	}
+	edges := []link{{A: "sp-a", B: "sp-b"}}
+	first := s.ensureConnected(append([]link(nil), edges...), nodes, nil)
+	second := s.ensureConnected(append([]link(nil), edges...), nodes, nil)
+	if len(first) != len(second) {
+		t.Fatalf("repair added %d then %d edges", len(first), len(second))
+	}
+	for i := range first {
+		if first[i].A != second[i].A || first[i].B != second[i].B {
+			t.Fatalf("repair is not deterministic: %v vs %v", first, second)
+		}
+	}
+}
+
+func TestBlockedFirstChoiceDoesNotIsolateClient(t *testing.T) {
+	s := testAuthServer(t)
+	defer s.db.Close()
+	now := time.Now().Unix()
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+		testNode("client", "cone", "client", 1),
+	}
+	for i, n := range nodes {
+		if _, err := s.db.Exec(`INSERT INTO nodes(node_id,public_key,nat_type,role,endpoint,requested_role,relay_capable,capacity,last_seen,created_at,mesh_ip) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			n.ID, "key-"+n.ID, "cone", n.Role, "127.0.0.1:10000", "auto", 1, 1, now, now, fmt.Sprintf("10.77.0.%d", i+10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := s.db.Exec("INSERT INTO graph_blocks(a,b) VALUES(?,?)", "client", "sp-a"); err != nil {
+		t.Fatal(err)
+	}
+	// rendezvous would pick sp-a first; the blocked edge must shift the
+	// attachment to sp-b instead of leaving the client with one link fewer.
+	rank := weightedPeerOrder(nodes[2], []node{nodes[0], nodes[1]})
+	if rank[0].ID == "sp-a" {
+		ls := s.links(nodes)
+		if got := len(neighborsFor(ls, "client")); got != 1 {
+			t.Fatalf("blocked first choice cost the client links: %d", got)
+		}
+	}
+}
+
+func TestEnsureConnectedRespectsBlocks(t *testing.T) {
+	s := &server{clientLinks: 1, symmetricLinks: 1}
+	nodes := []node{
+		testNode("sp-a", "cone", "superpeer", 1),
+		testNode("sp-b", "cone", "superpeer", 1),
+	}
+	blocked := map[string]bool{edgeKey("sp-a", "sp-b"): true}
+	out := s.ensureConnected(nil, nodes, blocked)
+	for _, e := range out {
+		if edgeKey(e.A, e.B) == edgeKey("sp-a", "sp-b") {
+			t.Fatal("repair restored an explicitly blocked edge")
+		}
+	}
+	// Without the block the same components are bridged.
+	if len(s.ensureConnected(nil, nodes, nil)) != 1 {
+		t.Fatal("unblocked components were not bridged")
+	}
+}
+
+func connected(ls []link, nodes []node) bool {
+	if len(nodes) < 2 {
+		return true
+	}
+	parent := map[string]string{}
+	var find func(string) string
+	find = func(x string) string {
+		for parent[x] != x {
+			x = parent[x]
+		}
+		return x
+	}
+	for _, n := range nodes {
+		parent[n.ID] = n.ID
+	}
+	for _, e := range ls {
+		a, b := find(e.A), find(e.B)
+		if a != b {
+			parent[a] = b
+		}
+	}
+	root := find(nodes[0].ID)
+	for _, n := range nodes[1:] {
+		if find(n.ID) != root {
+			return false
+		}
+	}
+	return true
 }
 
 func TestBlockedAutomaticClientLinkStaysRemoved(t *testing.T) {
