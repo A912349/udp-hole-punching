@@ -107,6 +107,94 @@ func TestSymmetricBurstJoinsInFlightScan(t *testing.T) {
 	}
 }
 
+func TestSymmetricEdgeNeedsRescanDespiteInstalledTransport(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Skipf("no UDP socket: %v", err)
+	}
+	defer conn.Close()
+	relay := "d8da7f47d8da7f47d8da7f47d8da7f47"
+	n := &node{
+		id:              &protocol.Identity{ID: "fedcba9876543210fedcba9876543210"},
+		c:               config{nat: "symmetric"},
+		neighbors:       map[string]*peer{relay: {ID: relay, Role: "superpeer", Endpoint: "10.0.0.1:40000", lastRX: time.Now().Add(-2 * linkTimeout)}},
+		symmetricConns:  map[string]*net.UDPConn{relay: conn},
+		symmetricConnMu: sync.RWMutex{},
+	}
+	// Regression: the punched transport socket lingers after the relay went
+	// silent (link down), and treating its mere presence as "ready" blocked
+	// all retries — the edge stayed down forever.
+	if !n.symmetricEdgeNeedsRescan(relay) {
+		t.Fatal("installed but silent transport must not block a rescan")
+	}
+	// Fresh traffic means the edge recovered; no rescan needed.
+	n.mu.Lock()
+	n.neighbors[relay].lastRX = time.Now()
+	n.mu.Unlock()
+	if n.symmetricEdgeNeedsRescan(relay) {
+		t.Fatal("edge with fresh traffic must not be rescanned")
+	}
+	// A traffic-confirmed LAN path also suppresses the burst (hairpin).
+	n.mu.Lock()
+	p := n.neighbors[relay]
+	p.lastRX = time.Time{}
+	p.lastLAN = copyUDPAddr(&net.UDPAddr{IP: net.ParseIP("192.168.1.35"), Port: 47959})
+	p.lastLANRX = time.Now()
+	n.mu.Unlock()
+	if n.symmetricEdgeNeedsRescan(relay) {
+		t.Fatal("traffic-confirmed LAN path must not trigger a rescan")
+	}
+}
+
+func TestResetSymmetricRelayKeepsPrimary(t *testing.T) {
+	primary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Skipf("no UDP socket: %v", err)
+	}
+	defer primary.Close()
+	secondary, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
+	if err != nil {
+		t.Skipf("no UDP socket: %v", err)
+	}
+	defer secondary.Close()
+
+	relayA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	relayB := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	n := &node{
+		id:                 &protocol.Identity{ID: "fedcba9876543210fedcba9876543210"},
+		c:                  config{nat: "symmetric", bind: "127.0.0.1"},
+		symmetricConns:     map[string]*net.UDPConn{relayA: primary, relayB: secondary},
+		symmetricConnMu:    sync.RWMutex{},
+		conn:               primary,
+		connMu:             sync.RWMutex{},
+		symmetricScans:     map[string]chan struct{}{},
+		symmetricSessions:  map[string]string{},
+		symmetricConnected: map[string]bool{},
+		symmetricBurstAt:   map[string]time.Time{},
+		symmetricBurstSess: map[string]string{},
+		symmetricMu:        sync.Mutex{},
+	}
+
+	// Resetting the secondary must not touch the primary.
+	n.resetSymmetricRelay(relayB)
+	if n.currentUDPConn() != primary {
+		t.Fatal("primary socket must survive a secondary relay reset")
+	}
+	if _, ok := n.symmetricConns[relayB]; ok {
+		t.Fatal("secondary transport must be removed")
+	}
+
+	// Resetting a relay without any transport must not disturb the primary
+	// either (retry path after a failed scan).
+	n.resetSymmetricRelay(relayB)
+	if n.currentUDPConn() != primary {
+		t.Fatal("primary socket must survive resetting an absent relay")
+	}
+	if _, err := primary.WriteToUDP([]byte{0}, &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}); err != nil {
+		t.Fatalf("primary socket must stay usable: %v", err)
+	}
+}
+
 func TestLanCandidateUsable(t *testing.T) {
 	now := time.Now()
 	withLAN := func() *node {

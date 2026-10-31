@@ -3168,12 +3168,49 @@ func (n *node) forceTUNRouteSync() error {
 // single edge dies, so the remaining symmetric links stay usable while this
 // relay gets a fresh rendezvous and port scan.
 func (n *node) resetSymmetricRelay(relayID string) {
+	primary := n.currentUDPConn()
+	var closeConn, promote *net.UDPConn
+	wasPrimary := false
 	n.symmetricConnMu.Lock()
 	if conn := n.symmetricConns[relayID]; conn != nil {
-		_ = conn.Close()
+		if conn == primary {
+			// The dead transport doubles as the primary socket. Move the node
+			// onto a replacement socket before closing it: closing the primary
+			// outright kills the whole mesh data path.
+			wasPrimary = true
+			for _, other := range n.symmetricConns {
+				promote = other
+				break
+			}
+		} else {
+			closeConn = conn
+		}
 	}
 	delete(n.symmetricConns, relayID)
 	n.symmetricConnMu.Unlock()
+
+	if wasPrimary && promote == nil {
+		// No surviving symmetric transport to promote: recreate a plain main
+		// socket so the node keeps a working primary. Created outside the
+		// symmetric lock; the stale primary is closed by replaceUDPConn.
+		if fresh, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)}); err == nil {
+			configureUDPSocket(fresh)
+			if iface := resolveBindIface(n.c.bindIface); iface != "" {
+				if err := bindUDPInterface(fresh, iface); err != nil {
+					n.logf("UDP bind to interface %s failed: %v (using wildcard socket)", iface, err)
+				}
+			}
+			promote = fresh
+		} else {
+			n.logf("primary socket reset failed: %v", err)
+		}
+	}
+	if promote != nil {
+		n.replaceUDPConn(promote) // closes the stale primary
+	}
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
 
 	n.symmetricMu.Lock()
 	if cancel := n.symmetricScans[relayID]; cancel != nil {
@@ -3196,6 +3233,20 @@ const (
 // recovery is intentionally conservative and only runs when every neighbor is
 // stale, so it cannot be the mechanism that revives one dead edge in an
 // otherwise healthy mesh.
+// symmetricEdgeNeedsRescan reports whether a dead symmetric superpeer edge
+// must get a new probe burst. A merely installed transport socket does not
+// count as alive: it can linger after the relay stopped answering, which
+// used to block retries forever and left the edge permanently down.
+func (n *node) symmetricEdgeNeedsRescan(id string) bool {
+	if n.relayLANLive(id) {
+		return false
+	}
+	n.mu.RLock()
+	p := n.neighbors[id]
+	n.mu.RUnlock()
+	return !n.usable(p)
+}
+
 func (n *node) retryDeadEdge(id string, snapshot peer) {
 	n.edgeRetryMu.Lock()
 	if n.edgeRetries == nil {
@@ -3216,14 +3267,10 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 		}()
 
 		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
-			if n.relayLANLive(id) {
-				// The LAN path keeps the edge alive; a public probe burst would
-				// only hairpin through the NAT and flood conntrack again.
-				return
-			}
-			if n.symmetricTransportReady(id) {
-				// Another recovery pass already re-established this edge while
-				// this retry was queued.
+			if !n.symmetricEdgeNeedsRescan(id) {
+				// A traffic-confirmed LAN path or fresh traffic keeps the edge
+				// alive; a public probe burst would only hairpin through the
+				// NAT and flood conntrack again.
 				return
 			}
 			// Space out scan rounds: on carrier NATs a burst is expensive
@@ -3240,11 +3287,14 @@ func (n *node) retryDeadEdge(id string, snapshot peer) {
 					wait = 10 * time.Second
 				}
 				time.Sleep(wait)
-				if n.symmetricTransportReady(id) || n.relayLANLive(id) {
+				if !n.symmetricEdgeNeedsRescan(id) {
 					return
 				}
 			}
 			n.logf("symmetric edge %s is down; starting scan round", id[:8])
+			// Drop the stale transport before scanning: an installed-but-
+			// silent socket would make establishSymmetricTransportOnce return
+			// early and the edge would stay down forever.
 			n.resetSymmetricRelay(id)
 			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
 				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
