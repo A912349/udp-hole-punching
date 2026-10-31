@@ -359,7 +359,7 @@ func DecodePacket(data, networkKey []byte) (Packet, error) {
 //
 //	offset  size  field
 //	0       1     magic 0xC1
-//	1       1     type: 1=PING, 2=PONG
+//	1       1     type: 1=PING, 2=PONG, 3=HELLO, 4=HELLO_ACK
 //	2       16    source node ID (raw)
 //	18      16    destination node ID (raw)
 //	34      12    packet ID (raw; hex-encoded on the Packet struct)
@@ -368,18 +368,29 @@ func DecodePacket(data, networkKey []byte) (Packet, error) {
 //	last    16    HMAC-SHA256(everything before)[:16]
 //
 // PING encodes to CompactPingSize bytes and PONG to CompactPongSize bytes
-// (~-70% versus JSON). The magic byte deliberately differs from the fast-path
-// "MIP1" prefix and from '{' so receivers can demultiplex in one comparison.
-// Receivers reply in the format they received, so mixed-version fleets keep
-// working: old nodes still send and receive JSON, relays re-encode to JSON on
-// the forwarding path.
+// (~-70% versus JSON). HELLO and HELLO_ACK encode to CompactHelloSize bytes
+// (~-85% versus the JSON envelope). The magic byte deliberately differs from
+// the fast-path "MIP1" prefix and from '{' so receivers can demultiplex in
+// one comparison. Receivers reply in the format they received, so
+// mixed-version fleets keep working: old nodes still send and receive JSON,
+// relays re-encode to JSON on the forwarding path.
+//
+// Compact HELLO/HELLO_ACK carry no payload fields. The JSON HELLO includes a
+// public_key entry, but receivers never read it (identities are exchanged at
+// enrollment), so dropping it is safe. Senders therefore must not use the
+// compact form for symmetric-scan HELLOs: those echo a session_id in
+// HELLO_ACK and are always sent as JSON.
 const (
-	compactMagic    = 0xC1
-	compactTypePing = 1
-	compactTypePong = 2
-	compactHMACSize = 16
-	CompactPingSize = 70
-	CompactPongSize = 82
+	compactMagic        = 0xC1
+	compactTypePing     = 1
+	compactTypePong     = 2
+	compactTypeHello    = 3
+	compactTypeHelloAck = 4
+	compactHMACSize     = 16
+	CompactPingSize     = 70
+	CompactPongSize     = 82
+	CompactHelloSize    = 70
+	CompactHelloAckSize = 70
 )
 
 // IsCompact reports whether the datagram uses the binary keepalive format.
@@ -387,8 +398,9 @@ func IsCompact(data []byte) bool {
 	return len(data) >= 2 && data[0] == compactMagic
 }
 
-// EncodeCompact serializes a PING or PONG packet into the binary keepalive
-// format. Any other packet type fails; callers fall back to EncodePacket.
+// EncodeCompact serializes a PING, PONG, HELLO or HELLO_ACK packet into the
+// binary keepalive format. Any other packet type fails; callers fall back to
+// EncodePacket.
 func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
 	var typ byte
 	switch p.Type {
@@ -396,8 +408,12 @@ func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
 		typ = compactTypePing
 	case "PONG":
 		typ = compactTypePong
+	case "HELLO":
+		typ = compactTypeHello
+	case "HELLO_ACK":
+		typ = compactTypeHelloAck
 	default:
-		return nil, fmt.Errorf("%w: compact encoding supports only PING/PONG", ErrProtocol)
+		return nil, fmt.Errorf("%w: compact encoding supports only PING/PONG/HELLO/HELLO_ACK", ErrProtocol)
 	}
 	src, err := hex.DecodeString(p.Source)
 	if err != nil || len(src) != 16 {
@@ -428,6 +444,14 @@ func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%w: compact PONG requires ping_id", ErrProtocol)
 		}
 	}
+	if typ == compactTypeHello || typ == compactTypeHelloAck {
+		// The compact frame cannot carry a session_id. Symmetric-scan HELLOs
+		// and their ACKs echo one and must keep the JSON envelope; dropping
+		// the field silently would strand the scan handshake.
+		if sessionID, _ := p.Payload["session_id"].(string); sessionID != "" {
+			return nil, fmt.Errorf("%w: compact HELLO/HELLO_ACK cannot carry a session_id", ErrProtocol)
+		}
+	}
 	mac := hmac.New(sha256.New, networkKey)
 	mac.Write(body)
 	// Sum appends the 32-byte digest; keep only the truncated prefix.
@@ -448,6 +472,10 @@ func DecodeCompact(data, networkKey []byte) (Packet, error) {
 		kind = "PING"
 	case compactTypePong:
 		kind, want = "PONG", CompactPongSize
+	case compactTypeHello:
+		kind = "HELLO"
+	case compactTypeHelloAck:
+		kind = "HELLO_ACK"
 	default:
 		return Packet{}, fmt.Errorf("%w: unknown compact type %d", ErrProtocol, data[1])
 	}

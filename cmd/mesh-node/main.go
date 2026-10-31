@@ -45,15 +45,19 @@ const (
 	// PING/PONG maintains liveness and learns a peer's current UDP endpoint.
 	// HELLO carries a public key and therefore only needs a slow background
 	// refresh after the immediate startup and topology-change handshakes.
-	pingInterval       = 15 * time.Second
-	helloInterval      = 90 * time.Second
-	linkHealthInterval = 5 * time.Second
-	refresh            = 5 * time.Second
-	heartbeat          = 20 * time.Second
-	telemetryInterval  = 15 * time.Second
-	recoveryCheck      = 5 * time.Second
-	topologyPoll       = 90 * time.Second
-	linkTimeout        = 30 * time.Second
+	pingInterval  = 15 * time.Second
+	helloInterval = 90 * time.Second
+	// compactHelloCapabilityTTL bounds how long a peer's demonstrated compact
+	// support is trusted for HELLO/HELLO_ACK. Live paths refresh it every ping
+	// interval; seven days covers week-long sleeps without relearning churn.
+	compactHelloCapabilityTTL = 7 * 24 * time.Hour
+	linkHealthInterval        = 5 * time.Second
+	refresh                   = 5 * time.Second
+	heartbeat                 = 20 * time.Second
+	telemetryInterval         = 15 * time.Second
+	recoveryCheck             = 5 * time.Second
+	topologyPoll              = 90 * time.Second
+	linkTimeout               = 30 * time.Second
 	// Upper bound for one blocking UDP receive. The receive loop renews the
 	// deadline each iteration; the brief unlock between reads lets rebind or
 	// STUN take the exclusive udpReadMu lock (see receiveSocket).
@@ -151,10 +155,16 @@ type peer struct {
 	lastLANRX    time.Time
 	lastPathLAN  bool      // the most recent datagram arrived from a local address
 	lastLANProbe time.Time // last unicast HELLO probe round to the LAN candidates
-	LANAddrs     []string  `json:"lan_addrs,omitempty"` // coordinator-advertised local addresses
-	discovered   time.Time
-	up           bool
-	rttMS        float64
+	// compactHelloUntil caches how long this peer has demonstrated binary-format
+	// support, so HELLO/HELLO_ACK can ride the ~70-byte compact encoding. It is
+	// refreshed by every compact PING/PONG/HELLO/HELLO_ACK received from the
+	// peer and expires for silent neighbors so a downgraded or stale entry
+	// falls back to the JSON envelope for one round.
+	compactHelloUntil time.Time
+	LANAddrs          []string `json:"lan_addrs,omitempty"` // coordinator-advertised local addresses
+	discovered        time.Time
+	up                bool
+	rttMS             float64
 }
 type routeAdvertisement struct {
 	LAN     string `json:"lan_cidr"`
@@ -2840,7 +2850,7 @@ func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
 }
 
 func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
-	encoded, err := protocol.EncodePacket(packet, n.key)
+	encoded, err := n.encodePacketForPeer(packet)
 	if err != nil {
 		return
 	}
@@ -2849,6 +2859,45 @@ func (n *node) sendToAddress(packet protocol.Packet, address *net.UDPAddr) {
 		return
 	}
 	_, _ = conn.WriteToUDP(encoded, address)
+}
+
+// encodePacketForPeer picks the wire format for one outbound UDP packet.
+// HELLO and HELLO_ACK ride the ~70-byte compact encoding when the destination
+// has demonstrated compact support and carries no session_id (symmetric-scan
+// probes echo a session_id in HELLO_ACK and stay JSON). Packets with a
+// decremented TTL are being relayed: DecodeCompact restores TTL to DefaultTTL,
+// so a relayed compact frame would let the receiver mistake the relay address
+// for a direct path — those stay JSON, matching the relay re-encoding rule.
+// Everything else keeps the JSON envelope, so pre-compact peers are unaffected.
+func (n *node) encodePacketForPeer(packet protocol.Packet) ([]byte, error) {
+	if packet.TTL == protocol.DefaultTTL &&
+		(packet.Type == "HELLO" || packet.Type == "HELLO_ACK") &&
+		payloadString(packet, "session_id") == "" &&
+		n.speaksCompactHello(packet.Destination) {
+		if encoded, err := protocol.EncodeCompact(packet, n.key); err == nil {
+			return encoded, nil
+		}
+	}
+	return protocol.EncodePacket(packet, n.key)
+}
+
+// markCompactHello records that the peer emitted a compact-format packet.
+func (n *node) markCompactHello(id string) {
+	n.mu.Lock()
+	if peer := n.neighbors[id]; peer != nil {
+		peer.compactHelloUntil = time.Now().Add(compactHelloCapabilityTTL)
+	}
+	n.mu.Unlock()
+}
+
+// speaksCompactHello reports whether the peer recently proved binary-format
+// support. Peers that never do (pre-compact versions) permanently keep the
+// JSON HELLO envelope they have always received.
+func (n *node) speaksCompactHello(id string) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	peer := n.neighbors[id]
+	return peer != nil && time.Now().Before(peer.compactHelloUntil)
 }
 
 // sendCompact emits PING/PONG in the binary keepalive format, cutting each
@@ -3862,7 +3911,7 @@ func (n *node) send(p protocol.Packet) bool {
 			return false
 		}
 	}
-	b, e := protocol.EncodePacket(p, n.key)
+	b, e := n.encodePacketForPeer(p)
 	if e != nil {
 		return false
 	}
@@ -4276,6 +4325,16 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 		return
 	}
 	compact := protocol.IsCompact(datagram)
+	if compact {
+		switch p.Type {
+		case "PING", "PONG", "HELLO", "HELLO_ACK":
+			// The peer just proved it speaks the binary format, so compact
+			// HELLO/HELLO_ACK toward it is safe. Unknown senders are marked as
+			// soon as they appear in the neighbor table; the next compact PING
+			// (15 s away) covers the gap.
+			n.markCompactHello(p.Source)
+		}
+	}
 	if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
 		n.touch(p.Source, address)
 	}

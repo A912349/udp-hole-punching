@@ -48,6 +48,61 @@ func TestCompactRoundTripAndSizes(t *testing.T) {
 	}
 }
 
+func TestCompactHelloRoundTripAndSessionGuard(t *testing.T) {
+	key := make([]byte, 32)
+	src := strings.Repeat("a", 32)
+	dst := strings.Repeat("b", 32)
+
+	// A plain HELLO with the legacy public_key payload compacts to 70 bytes;
+	// receivers ignore the payload, so dropping it is safe.
+	hello := NewPacket("HELLO", src, dst, map[string]any{"public_key": "AQIDBAUGBw"})
+	hello.Timestamp = time.Now().Unix()
+	encoded, err := EncodeCompact(hello, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != CompactHelloSize {
+		t.Fatalf("compact HELLO size = %d, want %d", len(encoded), CompactHelloSize)
+	}
+	decoded, err := DecodeCompact(encoded, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Type != "HELLO" || decoded.Source != src || decoded.Destination != dst ||
+		decoded.ID != hello.ID || decoded.TTL != DefaultTTL || decoded.Timestamp != hello.Timestamp {
+		t.Fatalf("HELLO round trip mismatch: %+v vs %+v", decoded, hello)
+	}
+
+	ack := NewPacket("HELLO_ACK", dst, src, map[string]any{"session_id": ""})
+	ack.Timestamp = time.Now().Unix()
+	ackEncoded, err := EncodeCompact(ack, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ackEncoded) != CompactHelloAckSize {
+		t.Fatalf("compact HELLO_ACK size = %d, want %d", len(ackEncoded), CompactHelloAckSize)
+	}
+	ackDecoded, err := DecodeCompact(ackEncoded, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ackDecoded.Type != "HELLO_ACK" || ackDecoded.Source != dst || ackDecoded.Destination != src {
+		t.Fatalf("HELLO_ACK round trip mismatch: %+v", ackDecoded)
+	}
+
+	// A symmetric-scan HELLO echoes a session_id in HELLO_ACK, which the
+	// compact format cannot carry: encoding must refuse instead of silently
+	// dropping the field and stranding the scan handshake.
+	scan := NewPacket("HELLO", src, dst, map[string]any{"public_key": "k", "session_id": "abcdef"})
+	if _, err := EncodeCompact(scan, key); err == nil {
+		t.Fatal("EncodeCompact accepted a session-carrying HELLO")
+	}
+	scanAck := NewPacket("HELLO_ACK", dst, src, map[string]any{"session_id": "abcdef"})
+	if _, err := EncodeCompact(scanAck, key); err == nil {
+		t.Fatal("EncodeCompact accepted a session-carrying HELLO_ACK")
+	}
+}
+
 func TestCompactRejectsTampering(t *testing.T) {
 	key := make([]byte, 32)
 	other := make([]byte, 32)
@@ -100,8 +155,10 @@ func TestCompactRejectsTampering(t *testing.T) {
 
 func TestCompactEncodeRejectsOtherTypes(t *testing.T) {
 	key := make([]byte, 32)
-	if _, err := EncodeCompact(NewPacket("HELLO", strings.Repeat("a", 32), strings.Repeat("b", 32), map[string]any{}), key); err == nil {
-		t.Fatal("EncodeCompact accepted a HELLO packet")
+	// HELLO/HELLO_ACK are compact-encodable since the capability-gated HELLO
+	// change; DATA and unknown types must still be refused.
+	if _, err := EncodeCompact(NewPacket("DATA", strings.Repeat("a", 32), strings.Repeat("b", 32), map[string]any{}), key); err == nil {
+		t.Fatal("EncodeCompact accepted a DATA packet")
 	}
 	pong := NewPacket("PONG", strings.Repeat("a", 32), strings.Repeat("b", 32), map[string]any{})
 	if _, err := EncodeCompact(pong, key); err == nil {
