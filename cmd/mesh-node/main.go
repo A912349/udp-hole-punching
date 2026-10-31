@@ -69,6 +69,13 @@ const (
 	// the node advertising a stale endpoint until the next disconnect.
 	endpointRefreshRetries    = 4
 	endpointRefreshRetryDelay = 5 * time.Second
+	// Slow-clock re-verification of the public UDP endpoint on the CURRENT
+	// socket. Peers keepalive an old NAT mapping with inbound probes, so a
+	// STUN check right after reconnect can still return the old address; the
+	// mapping then dies the moment peers go quiet while the coordinator keeps
+	// advertising it. A periodic check bounds that staleness even when no
+	// reconnect fires at all.
+	endpointVerifyInterval = 15 * time.Minute
 	// Mobile devices switch networks (Wi-Fi <-> LTE) without asking. Polling
 	// the interface table is the only portable way to notice such a switch
 	// within seconds; reacting to traffic failures alone takes 30-90 s because
@@ -1049,6 +1056,14 @@ func (n *node) connectControl() (bool, error) {
 	n.controlReply = make(chan controlFrame, 1)
 	go n.readControl(ws, n.controlReply)
 	n.logf("control WebSocket connected")
+	if reconnected {
+		// Refresh the endpoint as soon as the socket is back, not when some
+		// later request happens to receive a reply: after a resume from doze
+		// the first request can time out (or 404 on an evicted node) before
+		// any reply-path trigger runs, and the node would keep advertising a
+		// stale NAT mapping until the next successful reconnect.
+		go n.refreshEndpointAfterControlReconnect()
+	}
 	return reconnected, nil
 }
 
@@ -1252,7 +1267,7 @@ func (n *node) request(method, path string, in, out any) error {
 	var last error
 	for attempt := 0; attempt < 2; attempt++ {
 		n.controlMu.Lock()
-		reconnected, err := n.connectControl()
+		_, err := n.connectControl()
 		if err != nil {
 			n.controlMu.Unlock()
 			last = err
@@ -1283,9 +1298,6 @@ func (n *node) request(method, path string, in, out any) error {
 			case reply := <-replies:
 				if !responseTimer.Stop() {
 					<-responseTimer.C
-				}
-				if reconnected {
-					go n.refreshEndpointAfterControlReconnect()
 				}
 				if reply.Status < 200 || reply.Status > 299 {
 					return fmt.Errorf("control plane: status %d: %s", reply.Status, reply.Error)
@@ -1356,19 +1368,48 @@ func (n *node) refreshEndpointAttempt(attempt int) {
 		retry("STUN check failed", err)
 		return
 	}
-	previousEndpoint := n.c.endpoint
-	if endpoint == previousEndpoint {
+	if endpoint == n.c.endpoint {
 		return
 	}
-	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
-	n.logf("control reconnect: UDP endpoint changed %s -> %s", previousEndpoint, endpoint)
-	// A port-only change is a normal NAT rebinding. Do not tear down the
-	// transport here: for symmetric NAT that would start a new scan and
-	// unnecessarily reconnect all existing links. The coordinator receives
-	// the fresh endpoint through the heartbeat, while the current transport
-	// remains intact. Network/IP changes still use the full recovery path
-	// below.
-	if !ipChanged {
+	n.applyEndpointChange(n.c.endpoint, endpoint, nat, "control reconnect")
+}
+
+// verifyEndpoint periodically re-checks the public UDP mapping on the
+// CURRENT socket (no rebind: the socket is alive, and network switches are
+// handled by monitorNetwork/roamRefresh). It bounds how long the node can
+// keep advertising a stale NAT mapping even when no control reconnect fires
+// at all: peers keep an old mapping alive with inbound probes, so the
+// post-reconnect STUN check can return the previous address and the mapping
+// only dies later, when peers go quiet, while the coordinator keeps
+// pointing every newcomer at it.
+func (n *node) verifyEndpoint() {
+	if n.c.endpoint == "" {
+		return
+	}
+	if !n.recoveryMu.TryLock() {
+		// A recovery or refresh pass is running; it already re-detects the
+		// endpoint. Skip this tick instead of queueing a retry.
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		n.logf("endpoint verify: STUN check failed: %v", err)
+		return
+	}
+	if endpoint == n.c.endpoint {
+		return
+	}
+	n.applyEndpointChange(n.c.endpoint, endpoint, nat, "endpoint verify")
+}
+
+// applyEndpointChange adopts a freshly observed public endpoint. A port-only
+// change is a normal NAT rebinding and just re-teaches peers through the
+// current transport; an IP change rebuilds it and re-registers immediately
+// so the coordinator stops advertising the dead mapping.
+func (n *node) applyEndpointChange(previous, endpoint, nat, source string) {
+	n.logf("%s: UDP endpoint changed %s -> %s", source, previous, endpoint)
+	if !endpointIPChanged(previous, endpoint) {
 		n.c.endpoint = endpoint
 		if n.requestedNAT == "auto" {
 			n.c.nat = nat
@@ -1388,22 +1429,22 @@ func (n *node) refreshEndpointAttempt(attempt int) {
 	// never start a scan for the new endpoint.
 	n.resetTransportState()
 	if err := n.restoreTUNNetwork(); err != nil {
-		n.logf("control reconnect: TUN network restore failed: %v", err)
+		n.logf("%s: TUN network restore failed: %v", source, err)
 	}
 	n.c.endpoint = endpoint
 	if n.requestedNAT == "auto" {
 		n.c.nat = nat
 	}
 	if err := n.register(); err != nil {
-		n.logf("control reconnect: re-register failed: %v", err)
+		n.logf("%s: re-register failed: %v", source, err)
 		return
 	}
 	if err := n.bootstrap(); err != nil {
-		n.logf("control reconnect: topology refresh failed: %v", err)
+		n.logf("%s: topology refresh failed: %v", source, err)
 		return
 	}
 	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
-		n.logf("control reconnect: symmetric handshake did not complete")
+		n.logf("%s: symmetric handshake did not complete", source)
 	}
 	// After an IP change every peer still points at the dead mapping. HELLO
 	// and PING through the new socket let every peer relearn the fresh source
@@ -2021,6 +2062,7 @@ func (n *node) start() error {
 		}
 	})
 	go n.periodic(ctx, recoveryCheck, n.recoverNetwork)
+	go n.periodic(ctx, endpointVerifyInterval, n.verifyEndpoint)
 	go n.periodic(ctx, topologyPoll, func() {
 		if err := n.bootstrap(); err != nil {
 			n.logf("periodic topology refresh failed: %v", err)
@@ -4639,7 +4681,12 @@ func (n *node) isMeshAddr(ip netip.Addr) bool {
 // HELLO probes to them, which finds neighbors across cascaded routers where
 // broadcast LAN discovery cannot reach.
 func (n *node) advertisedLanAddrs() []string {
-	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
+	conn := n.currentUDPConn()
+	if conn == nil {
+		// No socket (startup or a failed rebind): nothing to advertise.
+		return nil
+	}
+	port := conn.LocalAddr().(*net.UDPAddr).Port
 	seen := map[string]bool{}
 	out := make([]string, 0, 4)
 	add := func(ip netip.Addr) {

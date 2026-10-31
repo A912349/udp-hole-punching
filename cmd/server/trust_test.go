@@ -71,8 +71,8 @@ func TestInviteEnrollmentIssuesScopedNodeToken(t *testing.T) {
 	}
 
 	// The credential authenticates node-facing endpoints.
-	r, w := nodeTokenRequest(s, http.MethodGet, "/v1/bootstrap/"+id, token, nil)
-	r.SetPathValue("node_id", id)
+	r, w := nodeTokenRequest(s, http.MethodGet, "/v1/bootstrap/"+id.ID, token, nil)
+	r.SetPathValue("node_id", id.ID)
 	s.bootstrap(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("bootstrap with node token status = %d, body=%s", w.Code, w.Body.String())
@@ -86,7 +86,7 @@ func TestInviteEnrollmentIssuesScopedNodeToken(t *testing.T) {
 		t.Fatal("issued credential not recognized as node token")
 	}
 	aw, ar := nodeTokenRequest(s, http.MethodGet, "/v1/admin/revoked", token, nil)
-	if s.adminAuth(aw, ar) {
+	if s.adminAuth(ar, aw) {
 		t.Fatal("node token satisfied adminAuth")
 	}
 }
@@ -100,6 +100,7 @@ func TestRemovedNodeStaysRemoved(t *testing.T) {
 
 	// Remove the node the way the admin panel does.
 	r, w := nodeTokenRequest(s, http.MethodDelete, "/v1/admin/nodes/"+identity.ID, s.token, nil)
+	r.SetPathValue("node_id", identity.ID)
 	s.adminNode(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("admin delete status = %d, body=%s", w.Code, w.Body.String())
