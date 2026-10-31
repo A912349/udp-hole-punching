@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -97,6 +98,7 @@ type link struct {
 	B      string  `json:"b"`
 	Cost   float64 `json:"cost"`
 	RTTMS  float64 `json:"rtt_ms,omitempty"`
+	Loss   float64 `json:"loss,omitempty"`
 	Status string  `json:"status,omitempty"`
 	// ViaLAN is true when node telemetry observed traffic on a LAN path for
 	// this edge. It is a measurement, so an edge between same-subnet peers
@@ -158,10 +160,11 @@ type cachedLinks struct {
 	links []link
 }
 type linkMetric struct {
-	RTTMS  float64
-	Up     bool
-	ViaLAN bool
-	Seen   time.Time
+	RTTMS    float64
+	LossRate float64
+	Up       bool
+	ViaLAN   bool
+	Seen     time.Time
 }
 
 // updateResult is the last self-update report a node delivered. Kept in
@@ -198,9 +201,9 @@ type updateSources struct {
 const updateMaxBinaryBytes = 128 << 20
 
 type controlClient struct {
-	ws         sync.Mutex
-	auth       sync.RWMutex
-	c          *websocket.Conn
+	ws   sync.Mutex
+	auth sync.RWMutex
+	c    *websocket.Conn
 	// session is the connection's accept order. When the same node id
 	// registers on two overlapping connections, the newer session owns the
 	// binding; the older one must never tear the newer one down.
@@ -905,6 +908,7 @@ func value(k, d string) string {
 	}
 	return d
 }
+
 // init opens the database, applies schema setup, and loads server settings.
 func (s *server) init() error {
 	_, err := s.db.Exec(`PRAGMA foreign_keys = ON; CREATE TABLE IF NOT EXISTS nodes (node_id TEXT PRIMARY KEY,public_key TEXT NOT NULL,nat_type TEXT NOT NULL,role TEXT NOT NULL,endpoint TEXT NOT NULL,requested_role TEXT NOT NULL DEFAULT 'auto',relay_capable INTEGER NOT NULL DEFAULT 1,capacity INTEGER NOT NULL DEFAULT 1,last_seen INTEGER NOT NULL,created_at INTEGER NOT NULL,mesh_ip TEXT,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS services (node_id TEXT NOT NULL,name TEXT NOT NULL,target_host TEXT NOT NULL,target_port INTEGER NOT NULL,allowed_nodes TEXT NOT NULL DEFAULT '*',PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY,value INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS dns_settings (key TEXT PRIMARY KEY,value TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS invites (token TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER,owner_id INTEGER REFERENCES users(id));CREATE TABLE IF NOT EXISTS audit_log (created_at INTEGER NOT NULL,event TEXT NOT NULL,detail TEXT NOT NULL);CREATE TABLE IF NOT EXISTS graph_links (a TEXT NOT NULL,b TEXT NOT NULL,cost REAL NOT NULL DEFAULT 1,PRIMARY KEY(a,b));CREATE TABLE IF NOT EXISTS role_overrides (node_id TEXT PRIMARY KEY,role TEXT NOT NULL);CREATE TABLE IF NOT EXISTS node_network (node_id TEXT PRIMARY KEY,name TEXT NOT NULL DEFAULT '',routes TEXT NOT NULL DEFAULT '[]',dns_ip TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS dns_records(node_id TEXT NOT NULL,name TEXT NOT NULL UNIQUE,lan_ip TEXT NOT NULL,PRIMARY KEY(node_id,name));CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT NOT NULL COLLATE NOCASE UNIQUE,password_hash TEXT NOT NULL,created_at INTEGER NOT NULL,last_login_at INTEGER,disabled INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS account_tokens (token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,encrypted_token BLOB,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS account_tokens_user_idx ON account_tokens(user_id);CREATE TABLE IF NOT EXISTS auth_sessions (token_hash TEXT PRIMARY KEY,csrf_hash TEXT NOT NULL,user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,revoked_at INTEGER);CREATE INDEX IF NOT EXISTS auth_sessions_user_idx ON auth_sessions(user_id);CREATE INDEX IF NOT EXISTS auth_sessions_expiry_idx ON auth_sessions(expires_at);CREATE TABLE IF NOT EXISTS account_invites (token_hash TEXT PRIMARY KEY,created_at INTEGER NOT NULL,expires_at INTEGER NOT NULL,used_at INTEGER);CREATE TABLE IF NOT EXISTS server_secrets (name TEXT PRIMARY KEY,value BLOB NOT NULL);CREATE TABLE IF NOT EXISTS update_settings (arch TEXT PRIMARY KEY,url TEXT NOT NULL DEFAULT '');CREATE TABLE IF NOT EXISTS update_binaries (arch TEXT PRIMARY KEY,data BLOB NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,updated_at INTEGER NOT NULL);CREATE TABLE IF NOT EXISTS node_firewall (node_id TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'allow_all',ports TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL DEFAULT 0);CREATE TABLE IF NOT EXISTS node_tokens (node_id TEXT PRIMARY KEY,token_hash TEXT NOT NULL,created_at INTEGER NOT NULL,revoked_at INTEGER);CREATE TABLE IF NOT EXISTS revoked_nodes (node_id TEXT PRIMARY KEY,reason TEXT NOT NULL DEFAULT '',revoked_at INTEGER NOT NULL);`)
@@ -2747,6 +2751,7 @@ func allocateVirtual(bits int, used []netip.Prefix) string {
 }
 
 func metricKey(from, to string) string { return from + "\x00" + to }
+
 // telemetry records link health reported by registered nodes.
 func (s *server) telemetry(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {
@@ -2791,6 +2796,23 @@ func (s *server) updateLinkMetrics(nodeID string, links []protocol.LinkMeasureme
 				old.RTTMS = old.RTTMS*.7 + x.RTTMS*.3
 			}
 		}
+		// Loss is already smoothed on the node, so fold it faster (0.5/0.5).
+		// Zero reports still decay the estimate toward no-loss. Only a shift
+		// across a lossCostStep band invalidates the topology cache: jitter
+		// inside a band must not rebuild the graph.
+		previousBand := int(old.LossRate / lossCostStep)
+		if x.Loss > 0 {
+			if old.LossRate == 0 {
+				old.LossRate = x.Loss
+			} else {
+				old.LossRate = old.LossRate*.5 + x.Loss*.5
+			}
+		} else if old.LossRate > 0 {
+			old.LossRate *= 0.5
+		}
+		if int(old.LossRate/lossCostStep) != previousBand {
+			stateChanged = true
+		}
 		if old.Seen.IsZero() || old.Up != x.Up || old.ViaLAN != x.ViaLAN {
 			stateChanged = true
 		}
@@ -2802,6 +2824,7 @@ func (s *server) updateLinkMetrics(nodeID string, links []protocol.LinkMeasureme
 	s.metricsMu.Unlock()
 	return stateChanged
 }
+
 // Admin push channel (server-sent events). Browsers open GET /v1/admin/stream
 // and receive a coalesced "update" event whenever topology, configuration,
 // updates or the audit trail change, so the UI reacts immediately instead of
@@ -2954,6 +2977,21 @@ func (s *server) adminAudit(w http.ResponseWriter, r *http.Request) {
 	}
 	reply(w, 200, map[string]any{"events": out, "has_more": hasMore})
 }
+
+// Cost-model references for measured links. RTT doubles the base cost at
+// rttCostReferenceMS; the caps keep one pathological measurement (a stalled
+// probe, a nearly dead link) from pushing an edge out of the graph entirely,
+// keeping it comparable to the down-state penalty instead.
+const (
+	rttCostReferenceMS = 100.0
+	maxRTTCostFactor   = 6.0
+	maxLossCostFactor  = 5.0
+	lanCostFactor      = 0.5
+	// A sustained loss shift that crosses a band boundary changes ranking;
+	// jitter inside a band must not rebuild the topology.
+	lossCostStep = 0.15
+)
+
 func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 	s.metricsMu.RLock()
 	defer s.metricsMu.RUnlock()
@@ -2972,15 +3010,19 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 		freshForward := now.Sub(forward.Seen) < 45*time.Second
 		freshReverse := now.Sub(reverse.Seen) < 45*time.Second
 		m := linkMetric{}
-		if freshForward && forward.RTTMS > 0 {
+		if freshForward {
 			m.RTTMS = forward.RTTMS
+			m.LossRate = forward.LossRate
 		}
-		if freshReverse && reverse.RTTMS > 0 {
+		if freshReverse {
 			if m.RTTMS == 0 {
 				m.RTTMS = reverse.RTTMS
-			} else {
+			} else if reverse.RTTMS > 0 {
 				m.RTTMS = (m.RTTMS + reverse.RTTMS) / 2
 			}
+			// Loss is directional in practice; the worse view of the link is
+			// what a payload stream in either direction will experience.
+			m.LossRate = math.Max(m.LossRate, reverse.LossRate)
 		}
 		baseCost := links[i].Cost
 		if baseCost <= 0 {
@@ -2988,12 +3030,21 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 		}
 		if m.RTTMS > 0 {
 			links[i].RTTMS = m.RTTMS
-			// Keep the configured/manual weight as a base, then add the
-			// measured latency. This makes cost useful for both automatic and
-			// manually edited graphs instead of silently replacing it.
-			links[i].Cost = baseCost * (1 + m.RTTMS/1000)
+			// Keep the configured/manual weight as a base, then scale by the
+			// measured latency relative to a 100 ms reference: a 20 ms WAN
+			// link pays almost nothing, 100 ms doubles the cost, 300 ms costs
+			// 4x and loses every tie against a healthy alternate.
+			links[i].Cost = baseCost * math.Min(1+m.RTTMS/rttCostReferenceMS, maxRTTCostFactor)
 		} else {
 			links[i].Cost = baseCost
+		}
+		if m.LossRate > 0 {
+			links[i].Loss = m.LossRate
+			// Expected transmissions per delivery (ETX-style): 10% loss makes
+			// the edge ~1.1x, 50% makes it 2x; the cap keeps a nearly dead
+			// edge comparable to the down-state penalty instead of infinite.
+			loss := math.Min(m.LossRate, 0.95)
+			links[i].Cost *= math.Min(1/(1-loss), maxLossCostFactor)
 		}
 		// New nodes have less observed uptime, so keep them slightly less
 		// attractive until they prove stable. The factor converges to 1.
@@ -3019,6 +3070,12 @@ func (s *server) decorateLinks(links []link, nodes ...[]node) []link {
 		switch {
 		case freshForward && freshReverse:
 			links[i].ViaLAN = forward.ViaLAN && reverse.ViaLAN
+			if links[i].ViaLAN {
+				// A confirmed LAN path carries orders of magnitude more
+				// bandwidth than a WAN relay, so halve its cost — using the
+				// same both-direction confirmation that decides the display.
+				links[i].Cost *= lanCostFactor
+			}
 		case freshForward:
 			links[i].ViaLAN = forward.ViaLAN
 		case freshReverse:
@@ -4037,6 +4094,7 @@ func (s *server) telemetryPeerOrder(client node, peers []node) []node {
 	})
 	return rank
 }
+
 // links builds the forwarding graph from policy and observed link metrics.
 //
 // Invariants, in priority order:
@@ -4384,6 +4442,7 @@ func max(a, b int) int {
 	}
 	return b
 }
+
 // bootstrap returns the topology and connection details a node needs to join.
 func (s *server) bootstrap(w http.ResponseWriter, r *http.Request) {
 	if !s.auth(w, r) {

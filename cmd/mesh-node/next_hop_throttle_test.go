@@ -27,7 +27,7 @@ func TestNextHopThrottlesRouteRecomputation(t *testing.T) {
 	}
 	n := &node{
 		id:         self,
-		dir:        map[string]*peer{},
+		dir:        map[string]*peer{neighbor.ID: {ID: neighbor.ID}},
 		neighbors:  map[string]*peer{},
 		routes:     map[string]string{},
 		links:      []edge{{A: self.ID, B: neighbor.ID, Cost: 1}},

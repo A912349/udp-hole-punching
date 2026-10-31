@@ -63,6 +63,13 @@ const (
 	// STUN take the exclusive udpReadMu lock (see receiveSocket).
 	udpReadWindow = 1 * time.Second
 	linkGrace     = 20 * time.Second
+	// Probe-derived link quality smoothing. RTT is an EWMA so one delayed
+	// probe cannot swing route costs; loss moves 10% per probe round toward
+	// the observed outcome, so a link must miss several rounds before it is
+	// reported to the coordinator as lossy.
+	rttProbeSmooth   = 0.7 // weight of the previous RTT sample in the EWMA
+	lossProbeRecover = 0.9 // loss decay on every answered probe
+	lossProbePenalty = 0.1 // loss increment per expired probe round
 	// Bounded retries for the post-reconnect endpoint check: right after a
 	// radio transition (LTE <-> Wi-Fi, doze resume) DNS and STUN often need a
 	// few seconds to become usable, and a single failed check used to leave
@@ -172,6 +179,9 @@ type peer struct {
 	discovered        time.Time
 	up                bool
 	rttMS             float64
+	// lossEMA is the smoothed keepalive probe loss in [0,1]. It feeds the
+	// telemetry Loss report and survives topology refreshes like rttMS.
+	lossEMA float64
 }
 type routeAdvertisement struct {
 	LAN     string `json:"lan_cidr"`
@@ -412,6 +422,7 @@ type node struct {
 	lastLoggedMeshIP   string
 	lastLoggedRole     string
 	routes             map[string]string
+	altRoutes          map[string]string
 	meshNodes          map[netip.Addr]string
 	subnetRoutes       []subnetRoute
 	installedRoutes    map[string]bool
@@ -926,6 +937,7 @@ func newNode(c config) (*node, error) {
 		pendingLAN:             map[string]*net.UDPAddr{},
 		neighbors:              map[string]*peer{},
 		routes:                 map[string]string{},
+		altRoutes:              map[string]string{},
 		meshNodes:              map[netip.Addr]string{},
 		installedRoutes:        map[string]bool{},
 		seen:                   map[string]struct{}{},
@@ -1678,6 +1690,8 @@ func (n *node) applyTopology(t topology) {
 			p.lastLANRX = q.lastLANRX
 			p.lastPathLAN = q.lastPathLAN
 			p.lastLANProbe = q.lastLANProbe
+			p.rttMS = q.rttMS
+			p.lossEMA = q.lossEMA
 		}
 		// Coordinator-assisted LAN discovery: broadcasts cannot cross a
 		// router, so a peer in an adjacent subnet of the same physical
@@ -1725,7 +1739,7 @@ func (n *node) applyTopology(t topology) {
 	n.links = t.Links
 	n.firewall.Store(parseFirewallRules(t.Firewall))
 	n.topologyVersion = t.Version
-	n.routes = n.buildRoutes()
+	n.routes, n.altRoutes = n.computeRoutes()
 	n.mu.Unlock()
 	for _, hello := range lanHellos {
 		n.logf("LAN endpoint candidate for %s: %s", hello.id[:8], hello.addr)
@@ -1928,52 +1942,96 @@ func (p pq) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 func (p *pq) Push(x any)        { *p = append(*p, x.(qitem)) }
 func (p *pq) Pop() any          { x := (*p)[len(*p)-1]; *p = (*p)[:len(*p)-1]; return x }
 
-// buildRoutes computes the lowest-cost next hop to each reachable node.
-func (n *node) buildRoutes() map[string]string {
-	adj := map[string][]qitem{}
-	for _, e := range n.links {
-		adj[e.A] = append(adj[e.A], qitem{e.B, e.Cost})
-		adj[e.B] = append(adj[e.B], qitem{e.A, e.Cost})
+// computeRoutes runs Dijkstra from this node over the current link set and
+// returns two next-hop tables: the primary cheapest-path hops, and fallback
+// hops that leave through a different neighbor than the primary route. The
+// fallback table lets traffic keep flowing while the primary edge is down or
+// being re-measured instead of dropping packets until the next topology
+// event or recompute window.
+//
+// Caller must hold at least n.mu.RLock.
+func (n *node) computeRoutes() (routes, fallbacks map[string]string) {
+	adjacency := map[string][]qitem{}
+	for _, edge := range n.links {
+		adjacency[edge.A] = append(adjacency[edge.A], qitem{edge.B, edge.Cost})
+		adjacency[edge.B] = append(adjacency[edge.B], qitem{edge.A, edge.Cost})
 	}
-	cost := map[string]float64{n.id.ID: 0}
-	prev := map[string]string{}
-	p := &pq{{n.id.ID, 0}}
-	heap.Init(p)
-	for p.Len() > 0 {
-		x := heap.Pop(p).(qitem)
-		if cost[x.id] != x.cost {
-			continue
-		}
-		for _, v := range adj[x.id] {
-			if x.id == n.id.ID && !n.usable(n.neighbors[v.id]) {
-				continue
-			}
-			c := x.cost + v.cost
-			if old, ok := cost[v.id]; !ok || c < old {
-				cost[v.id] = c
-				prev[v.id] = x.id
-				heap.Push(p, qitem{v.id, c})
-			}
-		}
-	}
-	out := map[string]string{}
+	previous := n.firstHopTable(adjacency, "")
+	routes = map[string]string{}
+	byPrimary := map[string][]string{}
 	for d := range n.dir {
 		if d == n.id.ID {
 			continue
 		}
 		if p, ok := n.neighbors[d]; ok && n.usable(p) {
-			out[d] = d
+			// A usable direct neighbor always wins over relaying: the packet
+			// leaves immediately instead of depending on intermediate nodes.
+			routes[d] = d
 			continue
 		}
-		h := d
-		for prev[h] != "" && prev[h] != n.id.ID {
-			h = prev[h]
-		}
-		if prev[h] == n.id.ID {
-			out[d] = h
+		if hop := firstHopFrom(previous, d, n.id.ID); hop != "" {
+			routes[d] = hop
+			byPrimary[hop] = append(byPrimary[hop], d)
 		}
 	}
-	return out
+	fallbacks = map[string]string{}
+	for hop, dests := range byPrimary {
+		// One extra Dijkstra per distinct first hop (at most this node's own
+		// degree), not per destination.
+		alt := n.firstHopTable(adjacency, hop)
+		for _, d := range dests {
+			if f := firstHopFrom(alt, d, n.id.ID); f != "" && f != hop {
+				fallbacks[d] = f
+			}
+		}
+	}
+	return routes, fallbacks
+}
+
+// firstHopTable is Dijkstra from this node; exclude (when non-empty) is a
+// neighbor that must not be used as the first hop. Unusable direct neighbors
+// are skipped on the first step so a route never starts from an edge that
+// has not carried traffic recently. Returns the predecessor map.
+func (n *node) firstHopTable(adjacency map[string][]qitem, exclude string) map[string]string {
+	costs := map[string]float64{n.id.ID: 0}
+	previous := map[string]string{}
+	queue := &pq{{n.id.ID, 0}}
+	heap.Init(queue)
+	for queue.Len() > 0 {
+		current := heap.Pop(queue).(qitem)
+		if current.cost != costs[current.id] {
+			continue
+		}
+		for _, candidate := range adjacency[current.id] {
+			if current.id == n.id.ID {
+				if candidate.id == exclude {
+					continue
+				}
+				if !n.usable(n.neighbors[candidate.id]) {
+					continue
+				}
+			}
+			candidateCost := current.cost + candidate.cost
+			if existing, ok := costs[candidate.id]; !ok || candidateCost < existing {
+				costs[candidate.id] = candidateCost
+				previous[candidate.id] = current.id
+				heap.Push(queue, qitem{candidate.id, candidateCost})
+			}
+		}
+	}
+	return previous
+}
+
+// firstHopFrom walks the predecessor chain back to the node right after self.
+func firstHopFrom(previous map[string]string, destination, self string) string {
+	hop := destination
+	for previous[hop] != "" && previous[hop] != self {
+		hop = previous[hop]
+	}
+	if previous[hop] == self {
+		return hop
+	}
+	return ""
 }
 
 // start brings up transports, discovery, packet workers, and health loops.
@@ -3787,8 +3845,9 @@ func (n *node) pingAll() {
 	}
 	n.mu.RUnlock()
 	n.pingMu.Lock()
-	prunePings(n.pings, now.Add(-linkTimeout))
+	lost := prunePings(n.pings, now.Add(-linkTimeout))
 	n.pingMu.Unlock()
+	n.noteLostProbes(lost)
 	for _, target := range targets {
 		p := protocol.NewPacket("PING", n.id.ID, target.id, map[string]any{})
 		if target.lan != nil && (target.observed == nil || target.lan.String() != target.observed.String()) {
@@ -3853,10 +3912,28 @@ func (n *node) sendDirect(packet protocol.Packet, endpoint string, observed *net
 // PONG removes its matching entry, but offline peers never answer. Bound the
 // bookkeeping for those peers so a long-running node does not accumulate one
 // ping timestamp per keepalive interval forever.
-func prunePings(pings map[string]pingProbe, before time.Time) {
+func prunePings(pings map[string]pingProbe, before time.Time) []string {
+	var lost []string
 	for id, probe := range pings {
 		if probe.sent.Before(before) {
 			delete(pings, id)
+			lost = append(lost, probe.peerID)
+		}
+	}
+	return lost
+}
+
+// noteLostProbes folds expired probe rounds into the smoothed loss estimate
+// that is reported to the coordinator as LinkMeasurement.Loss.
+func (n *node) noteLostProbes(ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, id := range ids {
+		if p := n.neighbors[id]; p != nil {
+			p.lossEMA = p.lossEMA*lossProbeRecover + lossProbePenalty
 		}
 	}
 }
@@ -3877,7 +3954,7 @@ func (n *node) currentLinks() []protocol.LinkMeasurement {
 	n.mu.RLock()
 	links := make([]protocol.LinkMeasurement, 0, len(n.neighbors))
 	for id, p := range n.neighbors {
-		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout, ViaLAN: p.lastPathLAN})
+		links = append(links, protocol.LinkMeasurement{PeerID: id, RTTMS: p.rttMS, Loss: p.lossEMA, Up: !p.lastRX.IsZero() && time.Since(p.lastRX) < linkTimeout, ViaLAN: p.lastPathLAN})
 	}
 	n.mu.RUnlock()
 	return links
@@ -3919,11 +3996,18 @@ func telemetryChanged(sent, links []protocol.LinkMeasurement) bool {
 	}
 	for _, l := range links {
 		old, ok := previous[l.PeerID]
-		if !ok || old.Up != l.Up || old.ViaLAN != l.ViaLAN || rttDrifted(old.RTTMS, l.RTTMS) {
+		if !ok || old.Up != l.Up || old.ViaLAN != l.ViaLAN || lossDrifted(old.Loss, l.Loss) || rttDrifted(old.RTTMS, l.RTTMS) {
 			return true
 		}
 	}
 	return false
+}
+
+// lossDrifted reports a meaningful loss shift. The estimate moves 0.1 per
+// probe round, so a 0.1 step means roughly one lost keepalive round and is
+// worth telling the coordinator; sub-step jitter stays silent.
+func lossDrifted(prev, next float64) bool {
+	return math.Abs(prev-next) >= 0.1
 }
 
 func rttDrifted(prev, next float64) bool {
@@ -3943,7 +4027,12 @@ func (n *node) usable(p *peer) bool {
 func (n *node) send(p protocol.Packet) bool {
 	hop, q := n.nextHop(p.Destination)
 	if !n.usable(q) {
-		return false
+		// The primary hop is unusable: try the precomputed alternate path
+		// while route recomputation catches up, instead of dropping.
+		hop, q = n.fallbackHop(p.Destination)
+		if !n.usable(q) {
+			return false
+		}
 	}
 	a := q.last
 	if a == nil {
@@ -3972,8 +4061,6 @@ func (n *node) nextHop(destination string) (string, *peer) {
 		n.mu.RUnlock()
 		return hop, peer
 	}
-
-	adjacency := map[string][]qitem{}
 	// Without a usable cached hop every data packet would re-run Dijkstra
 	// here. During an outage with traffic flowing that is a CPU storm on a
 	// mutex-held path; bound full recomputations to a few per second.
@@ -3982,56 +4069,33 @@ func (n *node) nextHop(destination string) (string, *peer) {
 		return "", nil
 	}
 	n.routeRecompute.Store(time.Now().UnixNano())
-	for _, edge := range n.links {
-		adjacency[edge.A] = append(adjacency[edge.A], qitem{edge.B, edge.Cost})
-		adjacency[edge.B] = append(adjacency[edge.B], qitem{edge.A, edge.Cost})
-	}
-	costs := map[string]float64{n.id.ID: 0}
-	previous := map[string]string{}
-	queue := &pq{{n.id.ID, 0}}
-	heap.Init(queue)
-	for queue.Len() > 0 {
-		current := heap.Pop(queue).(qitem)
-		if current.cost != costs[current.id] {
-			continue
-		}
-		for _, candidate := range adjacency[current.id] {
-			if current.id == n.id.ID && !n.usable(n.neighbors[candidate.id]) {
-				continue
-			}
-			candidateCost := current.cost + candidate.cost
-			if existing, ok := costs[candidate.id]; !ok || candidateCost < existing {
-				costs[candidate.id] = candidateCost
-				previous[candidate.id] = current.id
-				heap.Push(queue, qitem{candidate.id, candidateCost})
-			}
-		}
-	}
-	if _, ok := previous[destination]; !ok {
-		n.mu.RUnlock()
-		return "", nil
-	}
-	hop = destination
-	for previous[hop] != n.id.ID {
-		parent := previous[hop]
-		if parent == "" {
-			n.mu.RUnlock()
-			return "", nil
-		}
-		hop = parent
-	}
+	routes, fallbacks := n.computeRoutes()
+	hop = routes[destination]
 	peer = n.neighbors[hop]
+	usable := n.usable(peer)
 	n.mu.RUnlock()
-	if !n.usable(peer) {
+	if !usable {
 		return "", nil
 	}
 	n.mu.Lock()
-	n.routes[destination] = hop
+	n.routes = routes
+	n.altRoutes = fallbacks
 	n.mu.Unlock()
 	if previousHop != hop {
 		n.logf("route failover %s -> %s", destination[:8], hop[:8])
 	}
 	return hop, peer
+}
+
+// fallbackHop returns the precomputed alternate next hop for a destination:
+// the shortest path that leaves through a different neighbor than the primary
+// route. Traffic keeps flowing while the primary edge is down or being
+// re-measured instead of dropping until a recompute window opens.
+func (n *node) fallbackHop(destination string) (string, *peer) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	hop := n.altRoutes[destination]
+	return hop, n.neighbors[hop]
 }
 func (n *node) startFastWorkers(ctx context.Context) {
 	workers := n.c.fastWorkers
@@ -4440,7 +4504,16 @@ func (n *node) handlePong(packet protocol.Packet) {
 	}
 	n.mu.Lock()
 	if peer := n.neighbors[packet.Source]; peer != nil {
-		peer.rttMS = float64(time.Since(probe.sent).Microseconds()) / 1000
+		sample := float64(time.Since(probe.sent).Microseconds()) / 1000
+		// A single stalled probe must not double the reported RTT, so the
+		// sample lands in an EWMA instead of replacing the estimate. A probe
+		// that was answered proves the link is currently alive: decay loss.
+		if peer.rttMS == 0 || peer.rttMS > 60000 {
+			peer.rttMS = sample
+		} else {
+			peer.rttMS = peer.rttMS*rttProbeSmooth + sample*(1-rttProbeSmooth)
+		}
+		peer.lossEMA *= lossProbeRecover
 	}
 	n.mu.Unlock()
 }
@@ -4894,7 +4967,7 @@ func (n *node) linkHealth(ctx context.Context) {
 			n.mu.Unlock()
 			if stateChanged {
 				n.mu.Lock()
-				n.routes = n.buildRoutes()
+				n.routes, n.altRoutes = n.computeRoutes()
 				n.mu.Unlock()
 			}
 			for _, peer := range deadEdges {
@@ -5305,6 +5378,9 @@ func (n *node) sendFast(dst string, data []byte) bool {
 
 func (n *node) sendFastMode(dst string, data []byte, wait bool) bool {
 	_, p := n.nextHop(dst)
+	if !n.usable(p) {
+		_, p = n.fallbackHop(dst)
+	}
 	if !n.usable(p) {
 		n.debugf("fast send to %s: no usable route", dst[:8])
 		return false

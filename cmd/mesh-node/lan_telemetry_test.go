@@ -133,12 +133,12 @@ func TestLinkMeasurementWireFormatKeepsViaLANOptional(t *testing.T) {
 	if m.ViaLAN || m.PeerID != "p" || !m.Up {
 		t.Fatalf("legacy telemetry decoded incorrectly: %+v", m)
 	}
-	// Newer nodes send the field and it survives a round trip.
+	// Newer nodes send the fields and they survive a round trip.
 	encoded, err := json.Marshal(protocol.LinkMeasurement{PeerID: "p", Up: true, ViaLAN: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(encoded) != `{"peer_id":"p","rtt_ms":0,"up":true,"via_lan":true}` {
+	if string(encoded) != `{"peer_id":"p","rtt_ms":0,"up":true,"loss":0,"via_lan":true}` {
 		t.Fatalf("unexpected wire format: %s", encoded)
 	}
 }

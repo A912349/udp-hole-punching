@@ -150,6 +150,7 @@ func TestNextHopBypassesDeadDirectNeighbor(t *testing.T) {
 	const selfID, destinationID, relayID = "self-0000", "dest-0000", "relay-00"
 	n := &node{
 		id:     &protocol.Identity{ID: selfID},
+		dir:    map[string]*peer{destinationID: {ID: destinationID}},
 		routes: map[string]string{destinationID: destinationID},
 		neighbors: map[string]*peer{
 			destinationID: {ID: destinationID},
@@ -185,9 +186,9 @@ func TestBuildRoutesDoesNotKeepDeadDirectNeighbor(t *testing.T) {
 			{A: relayID, B: destinationID, Cost: 1},
 		},
 	}
-	got := n.buildRoutes()
-	if got[destinationID] != relayID {
-		t.Fatalf("route = %q, want relay %q", got[destinationID], relayID)
+	routes, _ := n.computeRoutes()
+	if routes[destinationID] != relayID {
+		t.Fatalf("route = %q, want relay %q", routes[destinationID], relayID)
 	}
 }
 

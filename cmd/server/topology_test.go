@@ -1,9 +1,102 @@
 package main
 
 import "testing"
+import "math"
 import "net/netip"
 import "time"
 import "fmt"
+import "home-udp-mesh/internal/protocol"
+
+func almostEqualCost(a, b float64) bool {
+	d := math.Abs(a - b)
+	return d < 1e-9
+}
+
+func TestDecorateLinksCostModel(t *testing.T) {
+	now := time.Now()
+	up := func(rtt, loss float64) linkMetric {
+		return linkMetric{RTTMS: rtt, LossRate: loss, Up: true, Seen: now}
+	}
+	s := &server{metrics: map[string]linkMetric{
+		metricKey("a", "b"): up(20, 0), // healthy fast WAN
+		metricKey("b", "a"): up(20, 0),
+		metricKey("c", "d"): up(300, 0), // slow WAN
+		metricKey("d", "c"): up(300, 0),
+		metricKey("e", "f"): up(600000, 0), // absurd probe: must be capped
+		metricKey("f", "e"): up(600000, 0),
+		metricKey("g", "h"): up(20, 0.5), // lossy in one direction
+		metricKey("h", "g"): up(20, 0.1),
+		metricKey("i", "j"): {RTTMS: 20, Up: true, ViaLAN: true, Seen: now},
+		metricKey("j", "i"): {RTTMS: 20, Up: true, ViaLAN: true, Seen: now},
+		metricKey("k", "l"): {RTTMS: 20, Up: false, Seen: now}, // down
+		metricKey("l", "k"): up(20, 0),
+	}}
+	links := s.decorateLinks([]link{
+		{A: "a", B: "b", Cost: 1},
+		{A: "c", B: "d", Cost: 1},
+		{A: "e", B: "f", Cost: 1},
+		{A: "g", B: "h", Cost: 1},
+		{A: "i", B: "j", Cost: 1},
+		{A: "k", B: "l", Cost: 1},
+		{A: "m", B: "n", Cost: 1}, // no telemetry at all
+	})
+	byEdge := map[string]link{}
+	for _, l := range links {
+		byEdge[l.A+"-"+l.B] = l
+	}
+	cost := func(e string) float64 { return byEdge[e].Cost }
+	// 20 ms against a 100 ms reference: 1.2x, status up.
+	if !almostEqualCost(cost("a-b"), 1.2) || byEdge["a-b"].Status != "up" {
+		t.Fatalf("healthy WAN edge: cost=%v status=%s, want 1.2/up", cost("a-b"), byEdge["a-b"].Status)
+	}
+	// 300 ms: 4x — slow paths must lose ties against healthy alternates.
+	if !almostEqualCost(cost("c-d"), 4.0) {
+		t.Fatalf("slow WAN edge cost = %v, want 4", cost("c-d"))
+	}
+	// One absurd probe is capped at 6x instead of pricing the edge out.
+	if !almostEqualCost(cost("e-f"), 6.0) {
+		t.Fatalf("capped RTT cost = %v, want 6", cost("e-f"))
+	}
+	// Loss is ETX-style on the worse direction: 1.2 * 1/(1-0.5) = 2.4.
+	if !almostEqualCost(cost("g-h"), 2.4) || !almostEqualCost(byEdge["g-h"].Loss, 0.5) {
+		t.Fatalf("lossy edge: cost=%v loss=%v, want 2.4/0.5", cost("g-h"), byEdge["g-h"].Loss)
+	}
+	// Both-direction confirmed LAN path gets the bandwidth discount.
+	if !almostEqualCost(cost("i-j"), 0.6) || !byEdge["i-j"].ViaLAN {
+		t.Fatalf("LAN edge: cost=%v viaLAN=%v, want 0.6/true", cost("i-j"), byEdge["i-j"].ViaLAN)
+	}
+	// Down state: 1.2 * 4.
+	if !almostEqualCost(cost("k-l"), 4.8) || byEdge["k-l"].Status != "down" {
+		t.Fatalf("down edge: cost=%v status=%s, want 4.8/down", cost("k-l"), byEdge["k-l"].Status)
+	}
+	// Unknown state: base 2x and no invented RTT.
+	if !almostEqualCost(cost("m-n"), 2.0) || byEdge["m-n"].Status != "unknown" || byEdge["m-n"].RTTMS != 0 {
+		t.Fatalf("unknown edge: %+v, want cost 2/unknown/no rtt", byEdge["m-n"])
+	}
+}
+
+func TestUpdateLinkMetricsLossBands(t *testing.T) {
+	s := &server{metrics: map[string]linkMetric{}}
+	if !s.updateLinkMetrics("a", []protocol.LinkMeasurement{{PeerID: "b", Loss: 0.4}}) {
+		t.Fatal("first sighting of heavy loss must invalidate the topology cache")
+	}
+	if got := s.metrics[metricKey("a", "b")].LossRate; got != 0.4 {
+		t.Fatalf("loss rate = %v, want 0.4", got)
+	}
+	// Jitter around the stored value stays inside one band: no rebuild.
+	for i := 0; i < 3; i++ {
+		if s.updateLinkMetrics("a", []protocol.LinkMeasurement{{PeerID: "b", Loss: 0.45}}) {
+			t.Fatal("jitter inside a loss band must not invalidate the topology cache")
+		}
+	}
+	// Sustained recovery decays the estimate across a band boundary.
+	if !s.updateLinkMetrics("a", []protocol.LinkMeasurement{{PeerID: "b"}}) {
+		t.Fatal("decay across a loss band boundary must invalidate the topology cache")
+	}
+	if got := s.metrics[metricKey("a", "b")].LossRate; got >= 0.3 {
+		t.Fatalf("loss rate must decay, got %v", got)
+	}
+}
 
 func TestVirtualSubnetAllocationAvoidsDuplicatePhysicalLANs(t *testing.T) {
 	mesh := netip.MustParsePrefix("10.77.0.0/24")

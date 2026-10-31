@@ -36,6 +36,9 @@ type LinkMeasurement struct {
 	PeerID string  `json:"peer_id"`
 	RTTMS  float64 `json:"rtt_ms"`
 	Up     bool    `json:"up"`
+	// Loss is the node's smoothed estimate of keepalive probe loss on the
+	// direct link to the peer, in [0,1]. Zero means no loss observed.
+	Loss float64 `json:"loss"`
 	// ViaLAN reports that traffic was recently received from the peer's LAN
 	// address, i.e. the path is confirmed to stay inside the local network.
 	// It is an observation, not an IP-subnet guess. Optional: older nodes
@@ -44,7 +47,8 @@ type LinkMeasurement struct {
 }
 
 // B64Encode encodes bytes using the URL-safe, unpadded format used on the wire.
-func B64Encode(b []byte) string          { return base64.RawURLEncoding.EncodeToString(b) }
+func B64Encode(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
+
 // B64Decode decodes the URL-safe, unpadded representation used by B64Encode.
 func B64Decode(s string) ([]byte, error) { return base64.RawURLEncoding.DecodeString(s) }
 
@@ -82,6 +86,7 @@ func NewIdentity() (*Identity, error) {
 	}
 	return IdentityFromPrivate(p)
 }
+
 // IdentityFromPrivate derives the public identity fields from an existing key.
 func IdentityFromPrivate(p *ecdh.PrivateKey) (*Identity, error) {
 	pub, err := x509.MarshalPKIXPublicKey(p.PublicKey())
@@ -90,6 +95,7 @@ func IdentityFromPrivate(p *ecdh.PrivateKey) (*Identity, error) {
 	}
 	return &Identity{Private: p, PublicDER: pub, Public: B64Encode(pub), ID: NodeID(pub)}, nil
 }
+
 // ParsePrivateDER loads and validates a serialized X25519 private key.
 func ParsePrivateDER(b []byte) (*Identity, error) {
 	v, err := x509.ParsePKCS8PrivateKey(b)
@@ -142,6 +148,7 @@ func Seal(key, plaintext, aad []byte) (map[string]string, error) {
 	tagAt := len(out) - a.Overhead()
 	return map[string]string{"nonce": B64Encode(nonce), "ciphertext": B64Encode(out[:tagAt]), "tag": B64Encode(out[tagAt:])}, nil
 }
+
 // Open validates and decrypts the fields produced by Seal.
 func Open(key []byte, sealed map[string]string, aad []byte) ([]byte, error) {
 	n, e1 := B64Decode(sealed["nonce"])
@@ -307,6 +314,7 @@ func EncodePacket(p Packet, networkKey []byte) ([]byte, error) {
 	}
 	return out, err
 }
+
 // DecodePacket verifies the network MAC and validates a JSON packet envelope.
 func DecodePacket(data, networkKey []byte) (Packet, error) {
 	if len(data) > MaxDatagramSize {
