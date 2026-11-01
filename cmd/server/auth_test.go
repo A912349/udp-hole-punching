@@ -11,8 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
 	"home-udp-mesh/internal/protocol"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func testAuthServer(t *testing.T) *server {

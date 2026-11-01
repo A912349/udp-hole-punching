@@ -1,11 +1,13 @@
 package main
 
-import "testing"
-import "math"
-import "net/netip"
-import "time"
-import "fmt"
-import "home-udp-mesh/internal/protocol"
+import (
+	"fmt"
+	"home-udp-mesh/internal/protocol"
+	"math"
+	"net/netip"
+	"testing"
+	"time"
+)
 
 func almostEqualCost(a, b float64) bool {
 	d := math.Abs(a - b)

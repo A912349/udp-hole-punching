@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/websocket"
 	"home-udp-mesh/internal/protocol"
+
+	"golang.org/x/net/websocket"
 )
 
 // fullWSHandler mimics the real mux wiring including the invite-consuming handshake.

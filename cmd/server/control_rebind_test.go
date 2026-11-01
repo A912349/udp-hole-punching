@@ -9,8 +9,9 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/net/websocket"
 	"home-udp-mesh/internal/protocol"
+
+	"golang.org/x/net/websocket"
 )
 
 func dialControlWS(t *testing.T, srvURL, token string) *websocket.Conn {
