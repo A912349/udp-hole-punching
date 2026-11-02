@@ -13,8 +13,6 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
-	"os/exec"
-	"runtime"
 	"strings"
 
 		"golang.org/x/net/websocket"
@@ -236,20 +234,6 @@ func (n *node) pokeControlReconnect() {
 		n.logf("control reconnect after disconnect failed: %v", err)
 	}
 }
-func androidRuntime() bool {
-	if runtime.GOOS == "android" {
-		return true
-	}
-	// Android binaries are often built as linux/arm64 for Termux/Magisk.
-	// Detect the platform by the Android property service in that case.
-	if _, err := os.Stat("/system/bin/getprop"); err == nil {
-		return true
-	}
-	if _, err := exec.LookPath("getprop"); err == nil {
-		return true
-	}
-	return false
-}
 func (n *node) request(method, path string, in, out any) error {
 	var body json.RawMessage
 	if in != nil {
@@ -326,4 +310,31 @@ func (n *node) request(method, path string, in, out any) error {
 }
 func (n *node) refreshEndpointAfterControlReconnect() {
 	n.refreshEndpointAttempt(1)
+}
+func (n *node) monitorControl(ctx context.Context) {
+	ticker := time.NewTicker(controlCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		n.controlMu.Lock()
+		connected := n.control != nil
+		n.controlMu.Unlock()
+		if !connected {
+			continue
+		}
+		if time.Since(time.Unix(0, n.controlRxAt.Load())) < controlStaleTimeout {
+			continue
+		}
+		n.logf("control channel silent for %s; forcing reconnect", controlStaleTimeout)
+		n.controlMu.Lock()
+		if n.control != nil {
+			_ = n.control.Close()
+			n.control = nil
+		}
+		n.controlMu.Unlock()
+	}
 }

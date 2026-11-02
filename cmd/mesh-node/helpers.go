@@ -1,6 +1,9 @@
 package main
 
 import (
+	"runtime"
+	"os"
+	"os/exec"
 	"log"
 	"strings"
 	"net/url"
@@ -228,4 +231,35 @@ func (n *node) debugf(f string, a ...any) {
 	if n.c.debug {
 		n.logf(f, a...)
 	}
+}
+func (n *node) resolve(value string) (string, error) {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.dir[value] != nil {
+		return value, nil
+	}
+	var a []string
+	for id := range n.dir {
+		if strings.HasPrefix(id, value) {
+			a = append(a, id)
+		}
+	}
+	if len(a) == 1 {
+		return a[0], nil
+	}
+	return "", errors.New("unknown or ambiguous node ID")
+}
+func androidRuntime() bool {
+	if runtime.GOOS == "android" {
+		return true
+	}
+	// Android binaries are often built as linux/arm64 for Termux/Magisk.
+	// Detect the platform by the Android property service in that case.
+	if _, err := os.Stat("/system/bin/getprop"); err == nil {
+		return true
+	}
+	if _, err := exec.LookPath("getprop"); err == nil {
+		return true
+	}
+	return false
 }

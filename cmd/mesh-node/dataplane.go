@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -16,161 +19,6 @@ import (
 
 	"home-udp-mesh/internal/protocol"
 )
-
-func (n *node) resetSymmetricRelay(relayID string) {
-	primary := n.currentUDPConn()
-	var closeConn, promote *net.UDPConn
-	wasPrimary := false
-	n.symmetricConnMu.Lock()
-	if conn := n.symmetricConns[relayID]; conn != nil {
-		if conn == primary {
-			// The dead transport doubles as the primary socket. Move the node
-			// onto a replacement socket before closing it: closing the primary
-			// outright kills the whole mesh data path.
-			wasPrimary = true
-			for _, other := range n.symmetricConns {
-				promote = other
-				break
-			}
-		} else {
-			closeConn = conn
-		}
-	}
-	delete(n.symmetricConns, relayID)
-	n.symmetricConnMu.Unlock()
-
-	if wasPrimary && promote == nil {
-		// No surviving symmetric transport to promote: recreate a plain main
-		// socket so the node keeps a working primary. Created outside the
-		// symmetric lock; the stale primary is closed by replaceUDPConn.
-		if fresh, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)}); err == nil {
-			configureUDPSocket(fresh)
-			if iface := resolveBindIface(n.c.bindIface); iface != "" {
-				if err := bindUDPInterface(fresh, iface); err != nil {
-					n.logf("UDP bind to interface %s failed: %v (using wildcard socket)", iface, err)
-				}
-			}
-			promote = fresh
-		} else {
-			n.logf("primary socket reset failed: %v", err)
-		}
-	}
-	if promote != nil {
-		n.replaceUDPConn(promote) // closes the stale primary
-	}
-	if closeConn != nil {
-		_ = closeConn.Close()
-	}
-
-	n.symmetricMu.Lock()
-	if cancel := n.symmetricScans[relayID]; cancel != nil {
-		delete(n.symmetricScans, relayID)
-		close(cancel)
-	}
-	delete(n.symmetricSessions, relayID)
-	delete(n.symmetricConnected, relayID)
-	delete(n.symmetricBurstAt, relayID)
-	delete(n.symmetricBurstSess, relayID)
-	n.symmetricMu.Unlock()
-}
-func (n *node) symmetricEdgeNeedsRescan(id string) bool {
-	if n.relayLANLive(id) {
-		return false
-	}
-	n.mu.RLock()
-	p := n.neighbors[id]
-	n.mu.RUnlock()
-	return !n.usable(p)
-}
-func (n *node) retryDeadEdge(id string, snapshot peer) {
-	n.edgeRetryMu.Lock()
-	if n.edgeRetries == nil {
-		n.edgeRetries = map[string]bool{}
-	}
-	if n.edgeRetries[id] {
-		n.edgeRetryMu.Unlock()
-		return
-	}
-	n.edgeRetries[id] = true
-	n.edgeRetryMu.Unlock()
-
-	go func() {
-		defer func() {
-			n.edgeRetryMu.Lock()
-			delete(n.edgeRetries, id)
-			n.edgeRetryMu.Unlock()
-		}()
-
-		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
-			if !n.symmetricEdgeNeedsRescan(id) {
-				// A traffic-confirmed LAN path or fresh traffic keeps the edge
-				// alive; a public probe burst would only hairpin through the
-				// NAT and flood conntrack again.
-				return
-			}
-			// Space out scan rounds: on carrier NATs a burst is expensive
-			// (hundreds of UDP mappings) and repeating it every few seconds
-			// only floods conntrack. The per-relay backoff lives in
-			// symmetricBackoff; wait here so this goroutine fires its attempt
-			// exactly when it becomes due.
-			for {
-				wait := n.symmetricBackoffWait(id)
-				if wait <= 0 {
-					break
-				}
-				if wait > 10*time.Second {
-					wait = 10 * time.Second
-				}
-				time.Sleep(wait)
-				if !n.symmetricEdgeNeedsRescan(id) {
-					return
-				}
-			}
-			n.logf("symmetric edge %s is down; starting scan round", id[:8])
-			// Drop the stale transport before scanning: an installed-but-
-			// silent socket would make establishSymmetricTransportOnce return
-			// early and the edge would stay down forever.
-			n.resetSymmetricRelay(id)
-			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
-				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
-					return
-				}
-				if attempt < edgeRetryAttempts {
-					time.Sleep(edgeRetryDelay)
-				}
-			}
-			return
-		}
-
-		for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
-			n.mu.RLock()
-			current := n.neighbors[id]
-			if current != nil {
-				copy := *current
-				if n.usable(current) {
-					n.mu.RUnlock()
-					return
-				}
-				snapshot = copy
-			}
-			n.mu.RUnlock()
-			if current == nil {
-				return
-			}
-			if attempt == 1 {
-				n.logf("edge %s is down; retrying HELLO", id[:8])
-			}
-			// HELLO is deliberately sent on every retry, even when the cached
-			// observed address is stale: sendHello also tries the endpoint from
-			// the latest topology snapshot. This is what reopens a lost NAT
-			// mapping and causes the peer to refresh its address on both sides.
-			n.sendHello(snapshot)
-			if attempt < edgeRetryAttempts {
-				time.Sleep(edgeRetryDelay)
-			}
-		}
-	}()
-}
 func (n *node) sendHello(p peer) {
 	packet := protocol.NewPacket("HELLO", n.id.ID, p.ID, map[string]any{"public_key": n.id.Public})
 	if observed, ok := p.last.(*net.UDPAddr); ok {
@@ -183,80 +31,6 @@ func (n *node) sendHello(p peer) {
 	if address, err := net.ResolveUDPAddr("udp", p.Endpoint); err == nil {
 		n.sendToAddress(packet, address)
 	}
-}
-func (n *node) deferRecovery(err error, action string) {
-	n.recoveryFails++
-	backoff := recoveryMinBackoff
-	for i := 1; i < n.recoveryFails && backoff < recoveryMaxBackoff; i++ {
-		backoff *= 2
-	}
-	if backoff > recoveryMaxBackoff {
-		backoff = recoveryMaxBackoff
-	}
-	n.recoveryNext = time.Now().Add(backoff)
-	n.logf("%s: %v; retrying in %s", action, err, backoff)
-}
-func (n *node) recoverNetwork() {
-	n.mu.RLock()
-	stale := len(n.neighbors) > 0
-	for _, peer := range n.neighbors {
-		// A single offline neighbor is normal in a mesh. Recovery of the
-		// local NAT mapping is only justified when every observed neighbor is
-		// stale; otherwise an unrelated peer can repeatedly disrupt healthy
-		// traffic on this node.
-		if (!peer.lastRX.IsZero() && time.Since(peer.lastRX) < linkTimeout) ||
-			(peer.lastRX.IsZero() && time.Since(peer.discovered) < linkGrace) {
-			stale = false
-			break
-		}
-	}
-	n.mu.RUnlock()
-	if !stale || !n.recoveryMu.TryLock() {
-		return
-	}
-	defer n.recoveryMu.Unlock()
-	if time.Now().Before(n.recoveryNext) {
-		return
-	}
-	n.logf("network link stale; refreshing STUN endpoint and topology")
-	if err := n.rebindUDPConn(); err != nil {
-		n.deferRecovery(err, "UDP socket recovery failed")
-		return
-	}
-	n.resetTransportState()
-	if err := n.restoreTUNNetwork(); err != nil {
-		n.deferRecovery(err, "TUN network restore failed")
-		return
-	}
-	endpoint, nat, err := n.detectEndpoint()
-	if err != nil {
-		n.deferRecovery(err, "STUN recovery failed")
-		return
-	}
-	previousEndpoint := n.c.endpoint
-	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
-	n.c.endpoint = endpoint
-	if n.requestedNAT == "auto" {
-		n.c.nat = nat
-	}
-	if ipChanged {
-		if err := n.register(); err != nil {
-			n.deferRecovery(err, "re-register after network loss failed")
-			return
-		}
-		if err := n.bootstrap(); err != nil {
-			n.deferRecovery(err, "topology refresh after network loss failed")
-			return
-		}
-	}
-	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
-		n.deferRecovery(errors.New("symmetric handshake did not complete"), "symmetric transport recovery failed")
-		return
-	}
-	n.recoveryFails = 0
-	n.recoveryNext = time.Time{}
-	n.helloAll()
-	n.pingAll()
 }
 func (n *node) networkFingerprint() string {
 	ifaces, err := net.Interfaces()
@@ -347,88 +121,6 @@ func (n *node) handleNetworkChange() {
 		return
 	}
 	go n.roamRefresh(1)
-}
-func (n *node) roamRefresh(attempt int) {
-	if !n.recoveryMu.TryLock() {
-		// recoverNetwork or a newer roam pass is in flight; that pass already
-		// observes the new network.
-		return
-	}
-	defer n.recoveryMu.Unlock()
-	retry := func(stage string, err error) {
-		n.logf("network change: %s: %v", stage, err)
-		if attempt < endpointRefreshRetries {
-			time.AfterFunc(endpointRefreshRetryDelay, func() { n.roamRefresh(attempt + 1) })
-			return
-		}
-		n.logf("network change: giving up for now; keepalive recovery stays armed")
-	}
-	if err := n.rebindUDPConn(); err != nil {
-		retry("UDP rebind failed", err)
-		return
-	}
-	endpoint, nat, err := n.detectEndpoint()
-	if err != nil {
-		// DNS and STUN are often unusable for the first seconds after a radio
-		// transition; the retries below ride them out.
-		retry("STUN check failed", err)
-		return
-	}
-	if endpoint != n.c.endpoint {
-		n.logf("network change: UDP endpoint changed %s -> %s", n.c.endpoint, endpoint)
-		n.c.endpoint = endpoint
-	}
-	if n.requestedNAT == "auto" {
-		n.c.nat = nat
-	}
-	// Every peer.last entry and every per-superpeer socket belongs to the old
-	// NAT mapping. Drop them before rebuilding; keeping them made a Wi-Fi ->
-	// LTE transition keep stale symmetric state and never start a new scan.
-	n.resetTransportState()
-	if err := n.restoreTUNNetwork(); err != nil {
-		n.logf("network change: TUN network restore failed: %v", err)
-	}
-	// The heartbeat also publishes the fresh endpoint to the coordinator.
-	if err := n.register(); err != nil {
-		retry("re-register failed", err)
-		return
-	}
-	if err := n.bootstrap(); err != nil {
-		retry("topology refresh failed", err)
-		return
-	}
-	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
-		n.logf("network change: symmetric handshake did not complete; link health will retry")
-	}
-	n.helloAll()
-	n.pingAll()
-}
-func (n *node) monitorControl(ctx context.Context) {
-	ticker := time.NewTicker(controlCheckInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		n.controlMu.Lock()
-		connected := n.control != nil
-		n.controlMu.Unlock()
-		if !connected {
-			continue
-		}
-		if time.Since(time.Unix(0, n.controlRxAt.Load())) < controlStaleTimeout {
-			continue
-		}
-		n.logf("control channel silent for %s; forcing reconnect", controlStaleTimeout)
-		n.controlMu.Lock()
-		if n.control != nil {
-			_ = n.control.Close()
-			n.control = nil
-		}
-		n.controlMu.Unlock()
-	}
 }
 func (n *node) detectEndpoint() (string, string, error) {
 	n.udpReadMu.Lock()
@@ -901,4 +593,227 @@ func (n *node) receive(ctx context.Context) {
 	<-ctx.Done()
 	n.receiveWG.Wait()
 	close(n.fastQueue)
+}
+func (n *node) data(p protocol.Packet) {
+	if rawIP, ok := p.Payload["ip"].(map[string]any); ok {
+		sealed := make(map[string]string, len(rawIP))
+		for key, value := range rawIP {
+			if text, ok := value.(string); ok {
+				sealed[key] = text
+			}
+		}
+		n.handleLegacyIPFragment(p.Source, sealed)
+		return
+	}
+	k, _, e := n.peerKey(p.Source)
+	if e != nil {
+		return
+	}
+	x, ok := p.Payload["sealed"].(map[string]any)
+	if !ok {
+		return
+	}
+	s := map[string]string{}
+	for k, v := range x {
+		if z, ok := v.(string); ok {
+			s[k] = z
+		}
+	}
+	raw, e := protocol.Open(k, s, []byte(p.Source+":"+n.id.ID))
+	if e != nil {
+		return
+	}
+	var m struct {
+		Type string         `json:"type"`
+		Body map[string]any `json:"body"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return
+	}
+	switch m.Type {
+	case "SERVICE_REQUEST":
+		n.serviceRequest(p.Source, p.ID, m.Body)
+	case "SERVICE_RESPONSE":
+		rid, _ := m.Body["request_id"].(string)
+		n.mu.RLock()
+		ch := n.pending[rid]
+		n.mu.RUnlock()
+		if ch != nil {
+			r := serviceResult{}
+			r.Data, _ = m.Body["data"].(string)
+			r.Error, _ = m.Body["error"].(string)
+			select {
+			case ch <- r:
+			default:
+			}
+		}
+	case "TUNNEL_OPEN":
+		n.tunnelOpen(p.Source, m.Body)
+	case "TUNNEL_DATA":
+		n.tunnelData(p.Source, m.Body)
+	case "TUNNEL_CLOSE":
+		n.tunnelClose(p.Source, m.Body)
+	case "IP_PACKET":
+		encoded, _ := m.Body["data"].(string)
+		if payload, err := protocol.B64Decode(encoded); err == nil {
+			n.deliver(p.Source, payload)
+		}
+	}
+}
+func (n *node) serviceRequest(src, rid string, b map[string]any) {
+	name, _ := b["service"].(string)
+	if _, ok := n.services[name]; !ok || (!n.allow["*"] && !n.allow[src]) {
+		n.encrypted(src, "SERVICE_RESPONSE", map[string]any{"request_id": rid, "error": "service unavailable"}, "")
+		return
+	}
+	encoded, _ := b["data"].(string)
+	raw, e := protocol.B64Decode(encoded)
+	if e != nil || len(raw) > maxRequest {
+		n.encrypted(src, "SERVICE_RESPONSE", map[string]any{"request_id": rid, "error": "invalid request"}, "")
+		return
+	}
+	c, e := net.DialTimeout("tcp", n.services[name], 5*time.Second)
+	if e == nil {
+		c.SetDeadline(time.Now().Add(7 * time.Second))
+		_, e = c.Write(raw)
+		if e == nil {
+			raw, e = io.ReadAll(io.LimitReader(c, maxResponse+1))
+			if len(raw) > maxResponse {
+				e = errors.New("response too large")
+			}
+		}
+		c.Close()
+	}
+	out := map[string]any{"request_id": rid}
+	if e != nil {
+		out["error"] = e.Error()
+	} else {
+		out["data"] = protocol.B64Encode(raw)
+	}
+	n.encrypted(src, "SERVICE_RESPONSE", out, "")
+}
+func (n *node) call(dst, name string, data []byte) ([]byte, error) {
+	dst, e := n.resolve(dst)
+	if e != nil {
+		return nil, e
+	}
+	p := protocol.NewPacket("", "", "", nil)
+	id := p.ID
+	ch := make(chan serviceResult, 1)
+	n.mu.Lock()
+	n.pending[id] = ch
+	n.mu.Unlock()
+	defer func() { n.mu.Lock(); delete(n.pending, id); n.mu.Unlock() }()
+	if !n.encrypted(dst, "SERVICE_REQUEST", map[string]any{"service": name, "data": protocol.B64Encode(data)}, id) {
+		return nil, errors.New("could not send service request")
+	}
+	serviceTimer := time.NewTimer(30 * time.Second)
+	defer serviceTimer.Stop()
+	select {
+	case x := <-ch:
+		if x.Error != "" {
+			return nil, errors.New(x.Error)
+		}
+		return protocol.B64Decode(x.Data)
+	case <-serviceTimer.C:
+		return nil, errors.New("service response timed out")
+	}
+}
+func (n *node) close() {
+	n.closing.Store(true)
+	if n.stop != nil {
+		n.stop()
+	}
+	conn := n.currentUDPConn()
+	port := conn.LocalAddr().(*net.UDPAddr).Port
+	conn.Close()
+	n.symmetricConnMu.Lock()
+	for _, extra := range n.symmetricConns {
+		if extra != nil && extra != conn {
+			_ = extra.Close()
+		}
+	}
+	n.symmetricConns = map[string]*net.UDPConn{}
+	n.symmetricConnMu.Unlock()
+	if n.tun != nil {
+		cleanupTUN(n.c.tun, n.installedRoutes, n.tunLUID)
+	}
+	cleanupPlatformNetwork(port)
+	if n.tun != nil {
+		n.tun.Close()
+	}
+	if n.lanConn != nil {
+		_ = n.lanConn.Close()
+	}
+	n.controlMu.Lock()
+	if n.control != nil {
+		_ = n.control.Close()
+		n.control = nil
+	}
+	n.controlMu.Unlock()
+}
+func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
+	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
+		n.enqueueFast(datagram, address)
+		return
+	}
+	n.stats.controlRxPackets.Add(1)
+	n.stats.controlRxBytes.Add(uint64(len(datagram) + 28)) // IPv4 + UDP overhead.
+	var p protocol.Packet
+	var e error
+	if protocol.IsCompact(datagram) {
+		p, e = protocol.DecodeCompact(datagram, n.key)
+	} else {
+		p, e = protocol.DecodePacket(datagram, n.key)
+	}
+	if e != nil || !n.remember(p.ID) {
+		return
+	}
+	compact := protocol.IsCompact(datagram)
+	if compact {
+		switch p.Type {
+		case "PING", "PONG", "HELLO", "HELLO_ACK":
+			// The peer just proved it speaks the binary format, so compact
+			// HELLO/HELLO_ACK toward it is safe. Unknown senders are marked as
+			// soon as they appear in the neighbor table; the next compact PING
+			// (15 s away) covers the gap.
+			n.markCompactHello(p.Source)
+		}
+	}
+	if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
+		n.touch(p.Source, address)
+	}
+	if p.Destination != n.id.ID {
+		if n.c.role == "superpeer" {
+			if q, e := p.DecTTL(); e == nil {
+				n.send(q)
+			}
+		}
+		return
+	}
+	switch p.Type {
+	case "HELLO":
+		n.ensureNeighbor(p.Source)
+		n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{"session_id": payloadString(p, "session_id")}))
+	case "HELLO_ACK":
+		n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
+		n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
+	case "PING":
+		pong := protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID})
+		if compact {
+			// Reply in the format the PING used so mixed-version fleets stay
+			// interoperable during rolling upgrades.
+			n.sendCompact(pong, address)
+		} else {
+			n.sendToAddress(pong, address)
+		}
+	case "PONG":
+		n.handlePong(p)
+	case "SYMMETRIC_BURST":
+		n.ensureNeighbor(p.Source)
+		n.handleSymmetricBurst(p, address)
+	case "DATA":
+		n.ensureNeighbor(p.Source)
+		n.data(p)
+	}
 }

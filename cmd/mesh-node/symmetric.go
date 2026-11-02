@@ -541,3 +541,228 @@ func (n *node) symmetricBurstSucceeded(relayID string) {
 	delete(n.symmetricFailures, relayID)
 	delete(n.symmetricBackoff, relayID)
 }
+
+func (n *node) resetSymmetricRelay(relayID string) {
+	primary := n.currentUDPConn()
+	var closeConn, promote *net.UDPConn
+	wasPrimary := false
+	n.symmetricConnMu.Lock()
+	if conn := n.symmetricConns[relayID]; conn != nil {
+		if conn == primary {
+			// The dead transport doubles as the primary socket. Move the node
+			// onto a replacement socket before closing it: closing the primary
+			// outright kills the whole mesh data path.
+			wasPrimary = true
+			for _, other := range n.symmetricConns {
+				promote = other
+				break
+			}
+		} else {
+			closeConn = conn
+		}
+	}
+	delete(n.symmetricConns, relayID)
+	n.symmetricConnMu.Unlock()
+
+	if wasPrimary && promote == nil {
+		// No surviving symmetric transport to promote: recreate a plain main
+		// socket so the node keeps a working primary. Created outside the
+		// symmetric lock; the stale primary is closed by replaceUDPConn.
+		if fresh, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(n.c.bind)}); err == nil {
+			configureUDPSocket(fresh)
+			if iface := resolveBindIface(n.c.bindIface); iface != "" {
+				if err := bindUDPInterface(fresh, iface); err != nil {
+					n.logf("UDP bind to interface %s failed: %v (using wildcard socket)", iface, err)
+				}
+			}
+			promote = fresh
+		} else {
+			n.logf("primary socket reset failed: %v", err)
+		}
+	}
+	if promote != nil {
+		n.replaceUDPConn(promote) // closes the stale primary
+	}
+	if closeConn != nil {
+		_ = closeConn.Close()
+	}
+
+	n.symmetricMu.Lock()
+	if cancel := n.symmetricScans[relayID]; cancel != nil {
+		delete(n.symmetricScans, relayID)
+		close(cancel)
+	}
+	delete(n.symmetricSessions, relayID)
+	delete(n.symmetricConnected, relayID)
+	delete(n.symmetricBurstAt, relayID)
+	delete(n.symmetricBurstSess, relayID)
+	n.symmetricMu.Unlock()
+}
+func (n *node) symmetricEdgeNeedsRescan(id string) bool {
+	if n.relayLANLive(id) {
+		return false
+	}
+	n.mu.RLock()
+	p := n.neighbors[id]
+	n.mu.RUnlock()
+	return !n.usable(p)
+}
+func (n *node) retryDeadEdge(id string, snapshot peer) {
+	n.edgeRetryMu.Lock()
+	if n.edgeRetries == nil {
+		n.edgeRetries = map[string]bool{}
+	}
+	if n.edgeRetries[id] {
+		n.edgeRetryMu.Unlock()
+		return
+	}
+	n.edgeRetries[id] = true
+	n.edgeRetryMu.Unlock()
+
+	go func() {
+		defer func() {
+			n.edgeRetryMu.Lock()
+			delete(n.edgeRetries, id)
+			n.edgeRetryMu.Unlock()
+		}()
+
+		if n.c.nat == "symmetric" && snapshot.Role == "superpeer" {
+			if !n.symmetricEdgeNeedsRescan(id) {
+				// A traffic-confirmed LAN path or fresh traffic keeps the edge
+				// alive; a public probe burst would only hairpin through the
+				// NAT and flood conntrack again.
+				return
+			}
+			// Space out scan rounds: on carrier NATs a burst is expensive
+			// (hundreds of UDP mappings) and repeating it every few seconds
+			// only floods conntrack. The per-relay backoff lives in
+			// symmetricBackoff; wait here so this goroutine fires its attempt
+			// exactly when it becomes due.
+			for {
+				wait := n.symmetricBackoffWait(id)
+				if wait <= 0 {
+					break
+				}
+				if wait > 10*time.Second {
+					wait = 10 * time.Second
+				}
+				time.Sleep(wait)
+				if !n.symmetricEdgeNeedsRescan(id) {
+					return
+				}
+			}
+			n.logf("symmetric edge %s is down; starting scan round", id[:8])
+			// Drop the stale transport before scanning: an installed-but-
+			// silent socket would make establishSymmetricTransportOnce return
+			// early and the edge would stay down forever.
+			n.resetSymmetricRelay(id)
+			for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
+				if n.establishSymmetricTransportOnce(id, &snapshot, attempt) {
+					return
+				}
+				if attempt < edgeRetryAttempts {
+					time.Sleep(edgeRetryDelay)
+				}
+			}
+			return
+		}
+
+		for attempt := 1; attempt <= edgeRetryAttempts; attempt++ {
+			n.mu.RLock()
+			current := n.neighbors[id]
+			if current != nil {
+				copy := *current
+				if n.usable(current) {
+					n.mu.RUnlock()
+					return
+				}
+				snapshot = copy
+			}
+			n.mu.RUnlock()
+			if current == nil {
+				return
+			}
+			if attempt == 1 {
+				n.logf("edge %s is down; retrying HELLO", id[:8])
+			}
+			// HELLO is deliberately sent on every retry, even when the cached
+			// observed address is stale: sendHello also tries the endpoint from
+			// the latest topology snapshot. This is what reopens a lost NAT
+			// mapping and causes the peer to refresh its address on both sides.
+			n.sendHello(snapshot)
+			if attempt < edgeRetryAttempts {
+				time.Sleep(edgeRetryDelay)
+			}
+		}
+	}()
+}
+func (n *node) handleSymmetricBurst(packet protocol.Packet, observed *net.UDPAddr) {
+	if n.c.role != "superpeer" {
+		return
+	}
+	n.mu.RLock()
+	peer := n.neighbors[packet.Source]
+	n.mu.RUnlock()
+	if peer == nil || peer.NAT != "symmetric" {
+		return
+	}
+	sessionID := payloadString(packet, "session_id")
+	n.symmetricMu.Lock()
+	armedSession := n.symmetricSessions[packet.Source]
+	previous := n.symmetricBurstAt[packet.Source]
+	previousSession := n.symmetricBurstSess[packet.Source]
+	if armedSession != "" && sessionID != armedSession {
+		n.symmetricMu.Unlock()
+		return
+	}
+	if previousSession == sessionID && time.Since(previous) < 5*time.Second {
+		n.symmetricMu.Unlock()
+		return
+	}
+	n.symmetricBurstAt[packet.Source] = time.Now()
+	n.symmetricBurstSess[packet.Source] = sessionID
+	n.symmetricMu.Unlock()
+	// A burst is optional: the control-plane event already started the scan.
+	// When one arrives, use its observed mapping to refine the scan window.
+	endpoint := peer.Endpoint
+	if observed != nil {
+		endpoint = observed.String()
+	}
+	// The control-plane event normally started the scan already. Restart only
+	// when the burst supplies a different observed mapping that can refine it.
+	refine := observed != nil && observed.String() != peer.Endpoint
+	n.startSymmetricScan(packet.Source, endpoint, sessionID, refine)
+}
+func (n *node) handleSymmetricScanEvent(peerID, sessionID, endpoint string) {
+	if n.c.role != "superpeer" || peerID == "" || sessionID == "" || endpoint == "" {
+		return
+	}
+	n.mu.RLock()
+	peer := n.neighbors[peerID]
+	n.mu.RUnlock()
+	if peer == nil || peer.NAT != "symmetric" {
+		return
+	}
+	// The control-plane event is the rendezvous barrier: begin scanning before
+	// acknowledging it, so both peers scan concurrently. A later UDP burst can
+	// refine the window but must never be required to start the scan.
+	n.symmetricMu.Lock()
+	if existing := n.symmetricScans[peerID]; existing != nil {
+		delete(n.symmetricScans, peerID)
+		delete(n.symmetricSessions, peerID)
+		close(existing)
+	}
+	delete(n.symmetricConnected, peerID)
+	n.symmetricSessions[peerID] = sessionID
+	delete(n.symmetricBurstAt, peerID)
+	delete(n.symmetricBurstSess, peerID)
+	n.symmetricMu.Unlock()
+	n.startSymmetricScan(peerID, endpoint, sessionID, true)
+	err := n.request("POST", "/v1/symmetric-scan/ack", map[string]any{
+		"source_node_id": peerID,
+		"session_id":     sessionID,
+	}, &map[string]any{})
+	if err != nil {
+		n.logf("symmetric scan ACK for %s failed: %v", peerID[:8], err)
+	}
+}

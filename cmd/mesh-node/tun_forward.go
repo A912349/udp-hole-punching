@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"io"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -14,154 +14,6 @@ import (
 
 	"home-udp-mesh/internal/protocol"
 )
-
-func (n *node) transportConns() []*net.UDPConn {
-	seen := map[*net.UDPConn]struct{}{}
-	conns := make([]*net.UDPConn, 0, 1+n.symmetricTransportCount())
-	if conn := n.currentUDPConn(); conn != nil {
-		seen[conn] = struct{}{}
-		conns = append(conns, conn)
-	}
-	n.symmetricConnMu.RLock()
-	for _, conn := range n.symmetricConns {
-		if conn != nil {
-			if _, exists := seen[conn]; !exists {
-				seen[conn] = struct{}{}
-				conns = append(conns, conn)
-			}
-		}
-	}
-	n.symmetricConnMu.RUnlock()
-	return conns
-}
-func (n *node) addReceiveSocket(conn *net.UDPConn) {
-	if conn == nil {
-		return
-	}
-	n.receiveMu.Lock()
-	defer n.receiveMu.Unlock()
-	if !n.receiveStarted || n.receiveCtx == nil {
-		return
-	}
-	if _, exists := n.receiveSockets[conn]; exists {
-		return
-	}
-	if n.receiveCtx.Err() != nil {
-		return
-	}
-	n.receiveSockets[conn] = struct{}{}
-	n.receiveWG.Add(1)
-	go n.receiveSocket(n.receiveCtx, conn)
-}
-func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
-	defer n.receiveWG.Done()
-	defer func() {
-		n.receiveMu.Lock()
-		delete(n.receiveSockets, conn)
-		n.receiveMu.Unlock()
-	}()
-	reader := newUDPBatchReader(conn)
-	for {
-		n.udpReadMu.RLock()
-		// Every read must stay inside a bounded window. rebindUDPConn and STUN
-		// wait for the exclusive lock, and a reader parked forever in recvmsg on
-		// a socket that stopped receiving traffic (dead NAT mapping after an IP
-		// change) would block them permanently, so the endpoint refresh after a
-		// network change never completed and the node stayed on a dead endpoint.
-		_ = conn.SetReadDeadline(time.Now().Add(udpReadWindow))
-		datagrams, e := reader.read()
-		n.udpReadMu.RUnlock()
-		if e != nil {
-			// A socket replacement deliberately closes the old connection while
-			// the node context stays alive. ReadFromUDP then returns net.ErrClosed
-			// immediately forever; retrying it here used to leave one hot goroutine
-			// behind after every network recovery.
-			if ctx.Err() != nil || errors.Is(e, net.ErrClosed) {
-				return
-			}
-			if ne, ok := e.(net.Error); ok && ne.Timeout() {
-				continue
-			}
-			n.debugf("UDP receive failed: %v", e)
-			// Protect against platform-specific persistent socket errors as well.
-			// UDP has no useful work to do until the socket recovers or is replaced.
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(100 * time.Millisecond):
-			}
-			continue
-		}
-		for _, datagram := range datagrams {
-			n.handleDatagram(datagram.data, datagram.address)
-		}
-	}
-}
-func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
-	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
-		n.enqueueFast(datagram, address)
-		return
-	}
-	n.stats.controlRxPackets.Add(1)
-	n.stats.controlRxBytes.Add(uint64(len(datagram) + 28)) // IPv4 + UDP overhead.
-	var p protocol.Packet
-	var e error
-	if protocol.IsCompact(datagram) {
-		p, e = protocol.DecodeCompact(datagram, n.key)
-	} else {
-		p, e = protocol.DecodePacket(datagram, n.key)
-	}
-	if e != nil || !n.remember(p.ID) {
-		return
-	}
-	compact := protocol.IsCompact(datagram)
-	if compact {
-		switch p.Type {
-		case "PING", "PONG", "HELLO", "HELLO_ACK":
-			// The peer just proved it speaks the binary format, so compact
-			// HELLO/HELLO_ACK toward it is safe. Unknown senders are marked as
-			// soon as they appear in the neighbor table; the next compact PING
-			// (15 s away) covers the gap.
-			n.markCompactHello(p.Source)
-		}
-	}
-	if p.Destination == n.id.ID && confirmsDirectPath(p.Type, p.TTL) {
-		n.touch(p.Source, address)
-	}
-	if p.Destination != n.id.ID {
-		if n.c.role == "superpeer" {
-			if q, e := p.DecTTL(); e == nil {
-				n.send(q)
-			}
-		}
-		return
-	}
-	switch p.Type {
-	case "HELLO":
-		n.ensureNeighbor(p.Source)
-		n.send(protocol.NewPacket("HELLO_ACK", n.id.ID, p.Source, map[string]any{"session_id": payloadString(p, "session_id")}))
-	case "HELLO_ACK":
-		n.debugf("received HELLO_ACK from %s; completing symmetric scan", p.Source[:8])
-		n.completeSymmetricScan(p.Source, payloadString(p, "session_id"))
-	case "PING":
-		pong := protocol.NewPacket("PONG", n.id.ID, p.Source, map[string]any{"ping_id": p.ID})
-		if compact {
-			// Reply in the format the PING used so mixed-version fleets stay
-			// interoperable during rolling upgrades.
-			n.sendCompact(pong, address)
-		} else {
-			n.sendToAddress(pong, address)
-		}
-	case "PONG":
-		n.handlePong(p)
-	case "SYMMETRIC_BURST":
-		n.ensureNeighbor(p.Source)
-		n.handleSymmetricBurst(p, address)
-	case "DATA":
-		n.ensureNeighbor(p.Source)
-		n.data(p)
-	}
-}
 func (n *node) writeControlUDP(conn *net.UDPConn, data []byte, address *net.UDPAddr) (int, error) {
 	written, err := conn.WriteToUDP(data, address)
 	if err == nil {
@@ -566,4 +418,224 @@ func (n *node) linkHealth(ctx context.Context) {
 			}
 		}
 	}
+}
+func (n *node) tunLoop(ctx context.Context) {
+	n.logf("TUN reader started")
+	// Read a complete native packet before applying the overlay MTU policy.
+	// Windows/Wintun can otherwise return io.ErrShortBuffer for a normal
+	// 1500-byte host packet and permanently stop the TUN loop.
+	b := make([]byte, 64<<10)
+	for {
+		l, e := readTUN(n.tun, b)
+		if e != nil {
+			if errors.Is(e, io.ErrShortBuffer) {
+				n.debugf("drop oversized TUN frame")
+				continue
+			}
+			if ctx.Err() == nil {
+				n.logf("TUN read failed: %v", e)
+			}
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if l < 20 || l > maxTUN || b[0]>>4 != 4 {
+			n.debugf("drop TUN frame: invalid IPv4 or exceeds MTU (%d bytes)", l)
+			continue
+		}
+		srcAddr := netip.AddrFrom4([4]byte(b[12:16]))
+		dstAddr := netip.AddrFrom4([4]byte(b[16:20]))
+		if n.isTUNBroadcast(dstAddr) {
+			continue
+		}
+		// The TUN carries the whole mesh subnet, including this node's own
+		// address. Do not look up a peer for a packet addressed to ourselves:
+		// inject it back into the kernel so the local IP stack receives it.
+		if n.isLocalMeshIP(dstAddr) {
+			if !n.loopbackTUNPacket(b[:l]) && n.c.debug {
+				n.debugf("TUN IPv4 %s -> %s: loopback failed", srcAddr, dstAddr)
+			}
+			continue
+		}
+		dst := n.ownerOf(dstAddr)
+		if dst == "" {
+			if n.c.debug {
+				n.debugf("drop TUN frame: no node owns %s", dstAddr)
+			}
+			continue
+		}
+		if dst == n.id.ID {
+			// The local virtual route is also installed on the TUN. Translate
+			// it back to the physical LAN and inject it into the kernel.
+			if n.translateLocalPacket(b[:l], false) {
+				_, _ = n.tun.Write(b[:l])
+			}
+			continue
+		}
+		if !n.isLocalMeshIP(srcAddr) && !n.translateLocalPacket(b[:l], true) {
+			if n.c.debug {
+				n.debugf("drop TUN frame: source %s is not local mesh IP", srcAddr)
+			}
+			continue
+		}
+		if n.c.debug {
+			n.debugf("TUN IPv4 %s -> %s (%d bytes)", srcAddr, dstAddr, l)
+		}
+		if !n.sendIP(dst, b[:l]) {
+			if n.c.debug {
+				n.debugf("TUN IPv4 %s -> %s: send failed", srcAddr, dstAddr)
+			}
+		}
+	}
+}
+func (n *node) loopbackTUNPacket(packet []byte) bool {
+	if n.tun == nil {
+		return false
+	}
+	if _, err := writeTUN(n.tun, packet); err != nil {
+		n.debugf("TUN loopback failed: %v", err)
+		return false
+	}
+	return true
+}
+func (n *node) sendIP(dst string, p []byte) bool {
+	if len(p) > maxTUN {
+		return false
+	}
+	aead, nonces, aad, target, e := n.peerCipher(dst)
+	if e != nil {
+		n.debugf("IP send to %s: %v", dst[:8], e)
+		return false
+	}
+	var packetID [12]byte
+	if !n.nextPacketID(packetID[:]) {
+		n.debugf("IP send to %s: packet ID sequence exhausted", dst[:8])
+		return false
+	}
+
+	// Build header, nonce and plaintext in one backing array. Seal appends its
+	// output exactly over the plaintext region, which is an overlap supported by
+	// cipher.AEAD. The existing end-to-end tag binds the packet ID and peer
+	// IDs. TTL remains mutable so relays can decrement it without re-sealing.
+	nonceSize := aead.NonceSize()
+	plainAt := fastHeader + nonceSize
+	plainSize := 12 + len(p)
+	buffer := n.sendPool.Get().([]byte)
+	defer n.sendPool.Put(buffer[:maxFastFrame])
+	pkt := buffer[:plainAt+plainSize]
+	copy(pkt, fastMagic)
+	pkt[4] = protocol.DefaultTTL
+	copy(pkt[5:21], n.idBinary[:])
+	copy(pkt[21:37], target[:])
+	copy(pkt[37:49], packetID[:])
+	if e = nonces.NextInto(pkt[fastHeader:plainAt]); e != nil {
+		return false
+	}
+	// Fragment ID and index remain zero. Count=1 takes the receiver's optimized
+	// no-reassembly path, so a random fragment ID has no observable purpose.
+	clear(pkt[plainAt : plainAt+12])
+	binary.BigEndian.PutUint16(pkt[plainAt+10:plainAt+12], 1)
+	copy(pkt[plainAt+12:], p)
+	var aadBuffer [77]byte
+	pkt = aead.Seal(pkt[:plainAt], pkt[fastHeader:plainAt], pkt[plainAt:], fastAAD(aadBuffer[:0], aad, packetID[:]))
+	// Local TUN traffic can apply backpressure to the kernel rather than
+	// discard encrypted packets when the UDP sender momentarily falls behind.
+	// Relay traffic still uses the nonblocking sendFast path.
+	return n.sendFastMode(dst, pkt, true)
+}
+func (n *node) deliver(src string, p []byte) {
+	if n.tun == nil || len(p) < 20 || len(p) > maxTUN || p[0]>>4 != 4 {
+		n.debugf("drop IP packet from %s: invalid packet or TUN disabled", src[:8])
+		return
+	}
+	sourceIP, destinationIP := netip.AddrFrom4([4]byte(p[12:16])), netip.AddrFrom4([4]byte(p[16:20]))
+	if n.c.debug {
+		n.debugf("deliver candidate from %s: %s -> %s proto=%d", src[:8], sourceIP, destinationIP, p[9])
+	}
+	localDestination := n.isLocalMeshIP(destinationIP)
+	if !n.addressOwnedBy(src, sourceIP) || !(localDestination || n.addressOwnedBy(n.id.ID, destinationIP)) {
+		n.debugf("drop IP packet from %s: address ownership check failed", src[:8])
+		return
+	}
+	if localDestination {
+		// Coordinator-managed mesh firewall. Nil rules mean allow-all, so the
+		// default-mode cost is one atomic load per packet; whitelist mode adds
+		// a protocol check, a fragment-offset test and one small map lookup.
+		if fw := n.firewall.Load(); fw != nil && !fw.permits(p) {
+			n.debugf("firewall drop from %s: proto %d not permitted", src[:8], p[9])
+			return
+		}
+	}
+	if !localDestination && !n.translateLocalPacket(p, false) {
+		n.debugf("drop IP packet from %s: missing local translation", src[:8])
+		return
+	}
+	if n.c.debug {
+		n.debugf("deliver to TUN from %s: %s -> %s", src[:8], netip.AddrFrom4([4]byte(p[12:16])), netip.AddrFrom4([4]byte(p[16:20])))
+		ihl := int(p[0]&15) * 4
+		if ihl <= len(p) && packetChecksum(p[:ihl]) != 0 {
+			n.debugf("deliver warning: invalid IPv4 header checksum")
+		}
+	}
+	if _, err := writeTUN(n.tun, p); err != nil {
+		n.debugf("deliver IP packet from %s failed: %v", src[:8], err)
+		return
+	}
+	n.stats.deliveredPackets.Add(1)
+	n.stats.deliveredBytes.Add(uint64(len(p)))
+	n.debugf("TUN IPv4 delivered from %s (%d bytes)", src[:8], len(p))
+}
+func (n *node) translateLocalPacket(packet []byte, source bool) bool {
+	if len(packet) < 20 {
+		return false
+	}
+	at := 16
+	if source {
+		at = 12
+	}
+	ip := netip.AddrFrom4([4]byte(packet[at : at+4]))
+	n.mu.RLock()
+	var from, to netip.Prefix
+	for _, r := range n.subnetRoutes {
+		if r.Owner != n.id.ID {
+			continue
+		}
+		candidateFrom, candidateTo := r.Virtual, r.LAN
+		if source {
+			candidateFrom, candidateTo = r.LAN, r.Virtual
+		}
+		if candidateFrom.Contains(ip) {
+			from, to = candidateFrom, candidateTo
+			break
+		}
+	}
+	n.mu.RUnlock()
+	if !from.IsValid() {
+		return false
+	}
+	a := ip.As4()
+	b := from.Addr().As4()
+	c := to.Addr().As4()
+	offset := binary.BigEndian.Uint32(a[:]) - binary.BigEndian.Uint32(b[:])
+	var replacement [4]byte
+	binary.BigEndian.PutUint32(replacement[:], binary.BigEndian.Uint32(c[:])+offset)
+	old := [4]byte(packet[at : at+4])
+	copy(packet[at:at+4], replacement[:])
+	adjustAddressChecksum(packet[10:12], old, replacement)
+	ihl := int(packet[0]&15) * 4
+	if ihl > len(packet) || binary.BigEndian.Uint16(packet[6:8])&0x1fff != 0 {
+		return true
+	}
+	switch packet[9] {
+	case 6:
+		if ihl+18 <= len(packet) {
+			adjustAddressChecksum(packet[ihl+16:ihl+18], old, replacement)
+		}
+	case 17:
+		if ihl+8 <= len(packet) && binary.BigEndian.Uint16(packet[ihl+6:ihl+8]) != 0 {
+			adjustAddressChecksum(packet[ihl+6:ihl+8], old, replacement)
+		}
+	}
+	return true
 }

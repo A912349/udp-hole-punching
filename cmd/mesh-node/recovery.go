@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -291,4 +292,133 @@ func (n *node) forceTUNRouteSync() error {
 	n.installedRoutes = map[string]bool{}
 	n.routeMu.Unlock()
 	return n.syncTUNRoutes()
+}
+func (n *node) deferRecovery(err error, action string) {
+	n.recoveryFails++
+	backoff := recoveryMinBackoff
+	for i := 1; i < n.recoveryFails && backoff < recoveryMaxBackoff; i++ {
+		backoff *= 2
+	}
+	if backoff > recoveryMaxBackoff {
+		backoff = recoveryMaxBackoff
+	}
+	n.recoveryNext = time.Now().Add(backoff)
+	n.logf("%s: %v; retrying in %s", action, err, backoff)
+}
+func (n *node) recoverNetwork() {
+	n.mu.RLock()
+	stale := len(n.neighbors) > 0
+	for _, peer := range n.neighbors {
+		// A single offline neighbor is normal in a mesh. Recovery of the
+		// local NAT mapping is only justified when every observed neighbor is
+		// stale; otherwise an unrelated peer can repeatedly disrupt healthy
+		// traffic on this node.
+		if (!peer.lastRX.IsZero() && time.Since(peer.lastRX) < linkTimeout) ||
+			(peer.lastRX.IsZero() && time.Since(peer.discovered) < linkGrace) {
+			stale = false
+			break
+		}
+	}
+	n.mu.RUnlock()
+	if !stale || !n.recoveryMu.TryLock() {
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	if time.Now().Before(n.recoveryNext) {
+		return
+	}
+	n.logf("network link stale; refreshing STUN endpoint and topology")
+	if err := n.rebindUDPConn(); err != nil {
+		n.deferRecovery(err, "UDP socket recovery failed")
+		return
+	}
+	n.resetTransportState()
+	if err := n.restoreTUNNetwork(); err != nil {
+		n.deferRecovery(err, "TUN network restore failed")
+		return
+	}
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		n.deferRecovery(err, "STUN recovery failed")
+		return
+	}
+	previousEndpoint := n.c.endpoint
+	ipChanged := endpointIPChanged(previousEndpoint, endpoint)
+	n.c.endpoint = endpoint
+	if n.requestedNAT == "auto" {
+		n.c.nat = nat
+	}
+	if ipChanged {
+		if err := n.register(); err != nil {
+			n.deferRecovery(err, "re-register after network loss failed")
+			return
+		}
+		if err := n.bootstrap(); err != nil {
+			n.deferRecovery(err, "topology refresh after network loss failed")
+			return
+		}
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.deferRecovery(errors.New("symmetric handshake did not complete"), "symmetric transport recovery failed")
+		return
+	}
+	n.recoveryFails = 0
+	n.recoveryNext = time.Time{}
+	n.helloAll()
+	n.pingAll()
+}
+func (n *node) roamRefresh(attempt int) {
+	if !n.recoveryMu.TryLock() {
+		// recoverNetwork or a newer roam pass is in flight; that pass already
+		// observes the new network.
+		return
+	}
+	defer n.recoveryMu.Unlock()
+	retry := func(stage string, err error) {
+		n.logf("network change: %s: %v", stage, err)
+		if attempt < endpointRefreshRetries {
+			time.AfterFunc(endpointRefreshRetryDelay, func() { n.roamRefresh(attempt + 1) })
+			return
+		}
+		n.logf("network change: giving up for now; keepalive recovery stays armed")
+	}
+	if err := n.rebindUDPConn(); err != nil {
+		retry("UDP rebind failed", err)
+		return
+	}
+	endpoint, nat, err := n.detectEndpoint()
+	if err != nil {
+		// DNS and STUN are often unusable for the first seconds after a radio
+		// transition; the retries below ride them out.
+		retry("STUN check failed", err)
+		return
+	}
+	if endpoint != n.c.endpoint {
+		n.logf("network change: UDP endpoint changed %s -> %s", n.c.endpoint, endpoint)
+		n.c.endpoint = endpoint
+	}
+	if n.requestedNAT == "auto" {
+		n.c.nat = nat
+	}
+	// Every peer.last entry and every per-superpeer socket belongs to the old
+	// NAT mapping. Drop them before rebuilding; keeping them made a Wi-Fi ->
+	// LTE transition keep stale symmetric state and never start a new scan.
+	n.resetTransportState()
+	if err := n.restoreTUNNetwork(); err != nil {
+		n.logf("network change: TUN network restore failed: %v", err)
+	}
+	// The heartbeat also publishes the fresh endpoint to the coordinator.
+	if err := n.register(); err != nil {
+		retry("re-register failed", err)
+		return
+	}
+	if err := n.bootstrap(); err != nil {
+		retry("topology refresh failed", err)
+		return
+	}
+	if n.c.nat == "symmetric" && !n.establishSymmetricTransport() {
+		n.logf("network change: symmetric handshake did not complete; link health will retry")
+	}
+	n.helloAll()
+	n.pingAll()
 }

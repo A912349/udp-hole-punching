@@ -382,3 +382,37 @@ func (f *fwRules) permits(p []byte) bool {
 	_, ok := f.udp[port]
 	return ok
 }
+func (n *node) ownerOf(ip netip.Addr) string {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if id := n.meshNodes[ip]; id != "" {
+		return id
+	}
+	owner, bits := "", -1
+	for _, route := range n.subnetRoutes {
+		if route.Virtual.Contains(ip) && route.Virtual.Bits() > bits {
+			owner, bits = route.Owner, route.Virtual.Bits()
+		}
+	}
+	return owner
+}
+func (n *node) addressOwnedBy(owner string, ip netip.Addr) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	if n.meshNodes[ip] == owner {
+		return true
+	}
+	for _, route := range n.subnetRoutes {
+		if route.Owner == owner && route.Virtual.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+func (n *node) localMeshIP() netip.Addr {
+	value := n.meshIPv4.Load()
+	return netip.AddrFrom4([4]byte{byte(value >> 24), byte(value >> 16), byte(value >> 8), byte(value)})
+}
+func (n *node) isLocalMeshIP(ip netip.Addr) bool {
+	return n.meshIPv4.Load() != 0 && ip == n.localMeshIP()
+}

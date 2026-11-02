@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -234,4 +235,87 @@ func configureUDPSocket(conn *net.UDPConn) {
 	}
 	_ = conn.SetReadBuffer(udpSocketBufferSize)
 	_ = conn.SetWriteBuffer(udpSocketBufferSize)
+}
+
+func (n *node) transportConns() []*net.UDPConn {
+	seen := map[*net.UDPConn]struct{}{}
+	conns := make([]*net.UDPConn, 0, 1+n.symmetricTransportCount())
+	if conn := n.currentUDPConn(); conn != nil {
+		seen[conn] = struct{}{}
+		conns = append(conns, conn)
+	}
+	n.symmetricConnMu.RLock()
+	for _, conn := range n.symmetricConns {
+		if conn != nil {
+			if _, exists := seen[conn]; !exists {
+				seen[conn] = struct{}{}
+				conns = append(conns, conn)
+			}
+		}
+	}
+	n.symmetricConnMu.RUnlock()
+	return conns
+}
+func (n *node) addReceiveSocket(conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+	n.receiveMu.Lock()
+	defer n.receiveMu.Unlock()
+	if !n.receiveStarted || n.receiveCtx == nil {
+		return
+	}
+	if _, exists := n.receiveSockets[conn]; exists {
+		return
+	}
+	if n.receiveCtx.Err() != nil {
+		return
+	}
+	n.receiveSockets[conn] = struct{}{}
+	n.receiveWG.Add(1)
+	go n.receiveSocket(n.receiveCtx, conn)
+}
+func (n *node) receiveSocket(ctx context.Context, conn *net.UDPConn) {
+	defer n.receiveWG.Done()
+	defer func() {
+		n.receiveMu.Lock()
+		delete(n.receiveSockets, conn)
+		n.receiveMu.Unlock()
+	}()
+	reader := newUDPBatchReader(conn)
+	for {
+		n.udpReadMu.RLock()
+		// Every read must stay inside a bounded window. rebindUDPConn and STUN
+		// wait for the exclusive lock, and a reader parked forever in recvmsg on
+		// a socket that stopped receiving traffic (dead NAT mapping after an IP
+		// change) would block them permanently, so the endpoint refresh after a
+		// network change never completed and the node stayed on a dead endpoint.
+		_ = conn.SetReadDeadline(time.Now().Add(udpReadWindow))
+		datagrams, e := reader.read()
+		n.udpReadMu.RUnlock()
+		if e != nil {
+			// A socket replacement deliberately closes the old connection while
+			// the node context stays alive. ReadFromUDP then returns net.ErrClosed
+			// immediately forever; retrying it here used to leave one hot goroutine
+			// behind after every network recovery.
+			if ctx.Err() != nil || errors.Is(e, net.ErrClosed) {
+				return
+			}
+			if ne, ok := e.(net.Error); ok && ne.Timeout() {
+				continue
+			}
+			n.debugf("UDP receive failed: %v", e)
+			// Protect against platform-specific persistent socket errors as well.
+			// UDP has no useful work to do until the socket recovers or is replaced.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			continue
+		}
+		for _, datagram := range datagrams {
+			n.handleDatagram(datagram.data, datagram.address)
+		}
+	}
 }
