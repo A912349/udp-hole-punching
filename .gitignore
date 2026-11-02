@@ -12,3 +12,7 @@ state-*/
 /.gocache/
 /.gopath/
 cmd/mesh-node/wintun.dll
+# Refactoring helper scripts (not part of the Go project)
+cmd/mesh-node/split_main.py
+cmd/mesh-node/remove_all_dups.py
+cmd/mesh-node/main.go.orig
