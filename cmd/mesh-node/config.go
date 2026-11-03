@@ -28,7 +28,7 @@ func parse() config {
 	f.Var(&c.bootstrapDNS, "bootstrap-dns", "IPv4 DNS server for startup hostnames (repeatable, e.g. 1.1.1.1:53)")
 	f.StringVar(&c.token, "network-token", "", "shared network token")
 	f.StringVar(&c.inviteToken, "invite-token", "", "one-time coordinator invitation token")
-	f.StringVar(&c.role, "role", "auto", "auto, superpeer or client")
+	f.StringVar(&c.role, "role", "auto", "auto, iot, superpeer or client")
 	f.StringVar(&c.nat, "nat-type", "auto", "auto, cone or symmetric")
 	f.StringVar(&c.bind, "bind", "0.0.0.0", "UDP bind host")
 	f.StringVar(&c.bindIface, "bind-iface", "", "pin UDP sockets to this interface (Linux, root): name, \"auto\" = default-route interface, \"none\" = wildcard; empty = auto on Android, none elsewhere")
@@ -137,7 +137,7 @@ func parse() config {
 		f.Usage()
 		os.Exit(2)
 	}
-	if c.role != "auto" && c.role != "client" && c.role != "superpeer" {
+	if c.role != "auto" && c.role != "iot" && c.role != "client" && c.role != "superpeer" {
 		log.Fatal("invalid --role")
 	}
 	if c.statsInterval < 0 {
@@ -230,7 +230,7 @@ func askInteractiveConfig() config {
 	} else {
 		c.token = credential
 	}
-	c.role = ask("Role (auto/client/superpeer)", "auto")
+	c.role = ask("Role (auto/iot/client/superpeer)", "auto")
 	return c
 }
 func loadIdentity(dir string) (*protocol.Identity, error) {
@@ -340,6 +340,7 @@ func newNode(c config) (*node, error) {
 	}
 	configureUDPSocket(conn)
 	k := sha256.Sum256([]byte(c.token))
+	applyTimingsForRole(c.role)
 	n := &node{
 		c:               c,
 		requestedRole:   c.role,

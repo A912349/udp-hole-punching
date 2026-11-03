@@ -63,8 +63,8 @@ func (s *server) adminNodeRole(w http.ResponseWriter, r *http.Request) {
 	var input struct {
 		Role string `json:"role"`
 	}
-	if err := decodeJSON(w, r, &input); err != nil || (input.Role != "auto" && input.Role != "client" && input.Role != "superpeer") {
-		reply(w, 400, map[string]string{"error": "role must be auto, client or superpeer"})
+	if err := decodeJSON(w, r, &input); err != nil || (input.Role != "auto" && input.Role != "iot" && input.Role != "client" && input.Role != "superpeer") {
+		reply(w, 400, map[string]string{"error": "role must be auto, iot, client or superpeer"})
 		return
 	}
 	var nat string
@@ -124,6 +124,10 @@ func (s *server) assign(id, requested, nat string, relay bool, capacity int, now
 	s.configMu.RUnlock()
 	if requested == "superpeer" {
 		return "superpeer", nil
+	}
+	// "iot" nodes are leaves: never eligible as a relay/rendezvous superpeer.
+	if requested == "iot" {
+		return "client", nil
 	}
 	if requested == "client" || nat != "cone" || !relay {
 		return "client", nil
@@ -215,7 +219,7 @@ func (s *server) register(w http.ResponseWriter, r *http.Request) {
 		GoArch   string                     `json:"goarch"`
 		LANAddrs []string                   `json:"lan_addrs"`
 	}
-	if decodeJSON(w, r, &d) != nil || d.ID == "" || len(d.ID) > 128 || d.Public == "" || len(d.Public) > 256 || d.Endpoint == "" || len(d.Endpoint) > 256 || !(d.NAT == "cone" || d.NAT == "symmetric") || !(d.Role == "auto" || d.Role == "client" || d.Role == "superpeer") {
+	if decodeJSON(w, r, &d) != nil || d.ID == "" || len(d.ID) > 128 || d.Public == "" || len(d.Public) > 256 || d.Endpoint == "" || len(d.Endpoint) > 256 || !(d.NAT == "cone" || d.NAT == "symmetric") || !(d.Role == "auto" || d.Role == "iot" || d.Role == "client" || d.Role == "superpeer") {
 		reply(w, 400, map[string]any{"error": "missing or invalid required fields"})
 		return
 	}

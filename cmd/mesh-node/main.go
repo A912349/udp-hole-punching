@@ -22,21 +22,13 @@ import (
 )
 
 const (
-	// PING/PONG maintains liveness and learns a peer's current UDP endpoint.
-	// HELLO carries a public key and therefore only needs a slow background
-	// refresh after the immediate startup and topology-change handshakes.
-	pingInterval  = 15 * time.Second
-	helloInterval = 90 * time.Second
 	// compactHelloCapabilityTTL bounds how long a peer's demonstrated compact
 	// support is trusted for HELLO/HELLO_ACK. Live paths refresh it every ping
 	// interval; seven days covers week-long sleeps without relearning churn.
 	compactHelloCapabilityTTL = 7 * 24 * time.Hour
 	linkHealthInterval        = 5 * time.Second
 	refresh                   = 5 * time.Second
-	heartbeat                 = 20 * time.Second
-	telemetryInterval         = 15 * time.Second
 	recoveryCheck             = 5 * time.Second
-	topologyPoll              = 90 * time.Second
 	linkTimeout               = 30 * time.Second
 	// Upper bound for one blocking UDP receive. The receive loop renews the
 	// deadline each iteration; the brief unlock between reads lets rebind or
@@ -75,13 +67,12 @@ const (
 	// heartbeat request/reply cycle runs every heartbeat interval and the
 	// coordinator pushes topology events. Anything quieter than that means the
 	// TCP connection is half-open on a previous network.
-	controlStaleTimeout = 45 * time.Second
-	recoveryMinBackoff  = 10 * time.Second
-	recoveryMaxBackoff  = 5 * time.Minute
-	stunProbeTimeout    = 2 * time.Second
-	maxRequest          = 32000
-	maxResponse         = 48000
-	maxUDPPort          = 65535
+	recoveryMinBackoff = 10 * time.Second
+	recoveryMaxBackoff = 5 * time.Minute
+	stunProbeTimeout   = 2 * time.Second
+	maxRequest         = 32000
+	maxResponse        = 48000
+	maxUDPPort         = 65535
 
 	symmetricBurstSize       = 500
 	symmetricBurstTimeout    = 45 * time.Second
@@ -104,22 +95,83 @@ const (
 	udpSocketBufferSize      = 4 << 20
 	fastSeenCapacity         = 10000
 	lanDiscoveryPort         = 37777
-	fastSeenShards            = 64
+	fastSeenShards           = 64
 	// Fast-path anti-replay dedup is sharded by packetID so the fast workers
 	// each lock a different mutex instead of contending on one global lock.
 	// The total tracked window is preserved; each shard holds a slice of it.
-	fastSeenRingCap           = fastSeenCapacity / fastSeenShards
-	lanDiscoveryInterval     = time.Minute
-	lanDiscoveryBurstCount   = 5
-	lanHoldTimeout           = 30 * time.Second
-	lanProbeInterval         = 30 * time.Second // min spacing of unicast HELLO probes per peer
-	lanProbeMaxAddrs         = 4                // candidates tried per peer per probe round
-	lanAdvertiseMax          = 8                // LAN addresses reported to the coordinator
-	localSubnetsRefresh      = 30 * time.Second
-	initialTelemetryDelay    = 3 * time.Second
-	aeadTag                  = 16
-	maxFastFrame             = fastHeader + 12 + 12 + maxTUN + aeadTag
+	fastSeenRingCap        = fastSeenCapacity / fastSeenShards
+	lanDiscoveryBurstCount = 5
+	lanHoldTimeout         = 30 * time.Second
+	lanProbeMaxAddrs       = 4                // candidates tried per peer per probe round
+	lanAdvertiseMax        = 8                // LAN addresses reported to the coordinator
+	localSubnetsRefresh    = 30 * time.Second
+	initialTelemetryDelay  = 3 * time.Second
+	aeadTag                = 16
+	maxFastFrame           = fastHeader + 12 + 12 + maxTUN + aeadTag
 )
+
+// Cadence intervals that can be lengthened per role. Declared as vars (not
+// consts) so IoT mode can override them in one startup pass. Everything else
+// — link liveness, recovery, STUN, network/roam checks — stays at full speed,
+// so an IoT node keeps exactly the connectivity and topology freshness of a
+// normal node; the only thing that changes is how often it asks.
+//
+// IoT values are chosen to stay inside the timing budgets that would otherwise
+// break functionality:
+//   - pingInterval (25s) stays under linkTimeout (30s): a link is still seen as
+//     alive between probes, so no link flaps when probing slows down.
+//   - telemetryInterval (60s) stays under controlStaleTimeout (180s): the
+//     control channel stays warm from telemetry, so it never forces a needless
+//     reconnect that would cost a fresh register POST.
+//   - lanProbeInterval (30s) stays within lanHoldTimeout (30s): LAN discovery
+//     keeps working.
+//
+// An IoT node is a leaf behind a symmetric NAT: it keeps the same relay and
+// hole-punching transport as any node, it just runs the keepalive cadence more
+// slowly.
+var (
+	pingInterval         = 15 * time.Second
+	helloInterval        = 90 * time.Second
+	heartbeat            = 20 * time.Second
+	telemetryInterval    = 15 * time.Second
+	topologyPoll         = 90 * time.Second
+	lanDiscoveryInterval = time.Minute
+	lanProbeInterval     = 30 * time.Second
+	controlStaleTimeout  = 45 * time.Second
+)
+
+// iotTimings is the IoT cadence (see the var block above).
+var iotTimings = struct {
+	pingInterval, helloInterval, heartbeat, telemetryInterval,
+	lanDiscoveryInterval, lanProbeInterval, topologyPoll,
+	controlStaleTimeout time.Duration
+}{
+	pingInterval:         25 * time.Second,
+	helloInterval:        300 * time.Second,
+	heartbeat:            60 * time.Second,
+	telemetryInterval:    60 * time.Second,
+	lanDiscoveryInterval: 300 * time.Second,
+	lanProbeInterval:     30 * time.Second,
+	topologyPoll:         300 * time.Second,
+	controlStaleTimeout:  180 * time.Second,
+}
+
+// applyTimingsForRole overrides the cadence intervals for roles that run more
+// slowly. Only "iot" is currently supported; every other role leaves the
+// defaults untouched.
+func applyTimingsForRole(role string) {
+	if role != "iot" {
+		return
+	}
+	pingInterval = iotTimings.pingInterval
+	helloInterval = iotTimings.helloInterval
+	heartbeat = iotTimings.heartbeat
+	telemetryInterval = iotTimings.telemetryInterval
+	topologyPoll = iotTimings.topologyPoll
+	lanDiscoveryInterval = iotTimings.lanDiscoveryInterval
+	lanProbeInterval = iotTimings.lanProbeInterval
+	controlStaleTimeout = iotTimings.controlStaleTimeout
+}
 
 var fastMagicBytes = []byte(fastMagic)
 var ipv4LimitedBroadcast = netip.MustParseAddr("255.255.255.255")
@@ -233,6 +285,7 @@ type serviceResult struct {
 	Data  string `json:"data"`
 	Error string `json:"error"`
 }
+
 // hexCache caches pre-computed hex-encoded node IDs to avoid calling
 // hex.EncodeToString on every packet in the receive hot path.
 // Profiling showed this was allocating ~4 strings/packet at 520-byte throughput.
@@ -500,9 +553,7 @@ type savedConfig struct {
 	PrivateKey                                                                                      string `json:"private_key,omitempty"`
 }
 
-
 // loadIdentity loads the persistent node key, creating one on first use.
-
 
 // newNode initializes runtime state and network resources from configuration.
 
@@ -525,8 +576,6 @@ type controlFrame struct {
 // unavailable IPv6 loopback resolver (::1). It deliberately resolves only
 // IPv4 addresses because the mesh transport is IPv4/UDP based.
 
-
-
 // pokeControlReconnect rebuilds the control channel as soon as the reader
 // observes a dead connection. Without it a node stayed offline for up to a
 // heartbeat interval even though it had already lost the coordinator. The
@@ -535,7 +584,6 @@ type controlFrame struct {
 
 // androidRuntimeFn is a hook so tests can simulate Android detection.
 var androidRuntimeFn = androidRuntime
-
 
 // request sends compact JSON frames over one long-lived WebSocket. A failed
 // connection is recreated once, which also handles NAT or server restarts.
@@ -564,15 +612,11 @@ var androidRuntimeFn = androidRuntime
 // current transport; an IP change rebuilds it and re-registers immediately
 // so the coordinator stops advertising the dead mapping.
 
-
-
 // register announces this node and refreshes its coordinator lease.
 
 // bootstrap fetches the current peer list and forwarding topology.
 
 // applyTopology updates peer state and routes from a coordinator snapshot.
-
-
 
 // A cone relay must only scan after it has received a SYMMETRIC_BURST. Starting
 // from a topology push races ahead of the symmetric peer, while retaining a
@@ -584,7 +628,6 @@ type qitem struct {
 	cost float64
 }
 type pq []qitem
-
 
 // computeRoutes runs Dijkstra from this node over the current link set and
 // returns two next-hop tables: the primary cheapest-path hops, and fallback
@@ -615,8 +658,6 @@ type pq []qitem
 
 // someRelayLANLive reports whether at least one superpeer has a live LAN path.
 
-
-
 // symmetricBackoffWait reports how long a burst toward relayID must wait
 // before the next attempt. Zero means "go ahead".
 
@@ -625,18 +666,11 @@ type pq []qitem
 
 // symmetricBurstSucceeded clears the per-relay failure history.
 
-
-
 // symmetricRelay is kept as a deterministic compatibility helper for callers
 // that only need the preferred relay. Establishment itself uses all relays.
 
-
-
 // installSymmetricConn keeps the first successful socket as the node's
 // primary socket and retains every later socket for its own superpeer.
-
-
-
 
 // defaultRouteInterfaceFn is a hook so tests can simulate route lookup.
 var defaultRouteInterfaceFn = defaultRouteInterface
@@ -653,9 +687,6 @@ var defaultRouteInterfaceFn = defaultRouteInterface
 // the Wi-Fi Network after the default network changes to LTE; refreshing STUN
 // on that socket then keeps returning the dead mapping.
 
-
-
-
 // scanSymmetricNeighbor probes likely external ports until the peer responds.
 
 // symmetricScanPorts scans ports in sparse, offset passes.  A 200-port step
@@ -664,13 +695,6 @@ var defaultRouteInterfaceFn = defaultRouteInterface
 //
 // The advertised port is included at the end of its own pass, before the scan
 // shifts the pass center down by one.
-
-
-
-
-
-
-
 
 // encodePacketForPeer picks the wire format for one outbound UDP packet.
 // HELLO and HELLO_ACK ride the ~70-byte compact encoding when the destination
@@ -710,7 +734,6 @@ var defaultRouteInterfaceFn = defaultRouteInterface
 // candidate set is re-checked on a fixed schedule instead of waiting for a
 // topology push, so candidates also work in a fully stable network.
 
-
 // subnetBroadcastAddrs returns the directed broadcast address of every
 // physical local subnet. Unlike 255.255.255.255, a directed broadcast
 // follows the routing table and leaves through the interface that owns the
@@ -720,12 +743,9 @@ var defaultRouteInterfaceFn = defaultRouteInterface
 // the masked network address with all host bits set. /31 and /32 have no
 // broadcast address and /0 is the default route, so they report false.
 
-
-
 // restoreTUNNetwork repairs host-side state that a mobile network switch can
 // discard. The installed-route cache is cleared because routes may be gone in
 // the kernel even though they are still present in the cache.
-
 
 // resetSymmetricRelay drops only one superpeer mapping. It is used when a
 // single edge dies, so the remaining symmetric links stay usable while this
@@ -744,9 +764,6 @@ const (
 // must get a new probe burst. A merely installed transport socket does not
 // count as alive: it can linger after the relay stopped answering, which
 // used to block retries forever and left the edge permanently down.
-
-
-
 
 // recoverNetwork rebuilds local connectivity after all neighbor paths go stale.
 
@@ -778,8 +795,6 @@ const (
 // sending a RST: writes appear to succeed, no reply ever arrives, and without
 // this watchdog the node waits for a request timeout before even trying to
 // reconnect. Topology pushes and symmetric-scan events are lost meanwhile.
-
-
 
 type pingTarget struct {
 	id       string
@@ -828,18 +843,12 @@ const telemetryKeepalive = 40 * time.Second
 // probe round, so a 0.1 step means roughly one lost keepalive round and is
 // worth telling the coordinator; sub-step jitter stays silent.
 
-
 // nextHop selects a cached or newly computed route for a destination.
 
 // fallbackHop returns the precomputed alternate next hop for a destination:
 // the shortest path that leaves through a different neighbor than the primary
 // route. Traffic keeps flowing while the primary edge is down or being
 // re-measured instead of dropping until a recompute window opens.
-
-
-
-
-
 
 type fastStatsSnapshot struct {
 	receivedPackets, receivedBytes   uint64
@@ -852,27 +861,18 @@ type fastStatsSnapshot struct {
 	controlTxPackets, controlTxBytes uint64
 }
 
-
-
 // receive starts readers for every active UDP socket.
 
-
-
-
 // handleDatagram authenticates and dispatches one received UDP packet.
-
-
 
 // A relay preserves the original source but decrements TTL. Such a packet
 // proves that the routed path works, not that the UDP address it arrived from
 // belongs to the source peer. Treating it as direct poisons peer.last with the
 // relay address and makes a dead direct edge appear healthy again.
 
-
 // rememberFast keeps data-plane replay detection independent from the broad
 // topology mutex. A fixed-size FIFO gives predictable O(1) work per packet and
 // retains exactly the most recent fast packet IDs.
-
 
 // meshHasOtherNodes reports whether the mesh currently knows at least one
 // node other than this one. This is the only broadcast gate: requiring a
@@ -955,16 +955,9 @@ type fastStatsSnapshot struct {
 // address. Only a traffic-confirmed LAN path justifies skipping the public
 // endpoint; a merely discovered candidate never does.
 
-
-
-
-
-
 // handleLegacyIPFragment accepts the JSON-sealed fragment representation used
 // before the compact MIP1 data plane.  Keeping it makes rolling upgrades safe:
 // a Go destination can receive packets from an older mesh node.
-
-
 
 // fastAAD binds the immutable packet ID as well as the source and destination
 // to the existing end-to-end tag, without a second per-packet MAC.
@@ -974,9 +967,7 @@ type fastStatsSnapshot struct {
 // forward by changing the unauthenticated TTL. Frame layout: MIP1 | TTL | source |
 // destination | packet ID | nonce | ciphertext | AEAD tag.
 
-
 // tunLoop reads IP packets from the host and injects received packets back.
-
 
 // Broadcast is not an overlay unicast destination. Hosts commonly emit it
 // for discovery, and routing it through the mesh would only create repeated
@@ -984,17 +975,7 @@ type fastStatsSnapshot struct {
 
 // sendIP encrypts a TUN packet and forwards it toward its mesh destination.
 
-
-
-
-
-
 // translateLocalPacket performs a stateless 1:1 prefix translation. Host bits
 // are preserved, so identical physical LANs remain distinct inside the mesh.
 
-
-
 // stunEndpoint queries available STUN servers to discover the public UDP mapping.
-
-
-
