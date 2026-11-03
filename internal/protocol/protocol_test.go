@@ -93,7 +93,7 @@ func TestSealedPayloadRoundTrip(t *testing.T) {
 	if bytes.Equal(second[:12], callerOwned[:]) {
 		t.Fatal("NextInto reused a nonce")
 	}
-	sequence.counter.Store(^uint32(0))
+	sequence.counter.Store(^uint64(0))
 	if err := sequence.NextInto(callerOwned[:]); err == nil {
 		t.Fatal("exhausted nonce sequence was accepted")
 	}
