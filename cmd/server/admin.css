@@ -518,6 +518,10 @@ svg {
   fill: var(--accent)
 }
 
+.node.iot {
+  fill: var(--orange)
+}
+
 .sym {
   fill: none;
   stroke: var(--orange);
