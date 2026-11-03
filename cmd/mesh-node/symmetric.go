@@ -43,46 +43,65 @@ func (p pq) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
 func (p *pq) Push(x any)        { *p = append(*p, x.(qitem)) }
 func (p *pq) Pop() any          { x := (*p)[len(*p)-1]; *p = (*p)[:len(*p)-1]; return x }
 func (n *node) computeRoutes() (routes, fallbacks map[string]string) {
+	// Snapshot the link set and per-peer usable state under a short read lock,
+	// then run every Dijkstra pass on those local copies. Keeping the traversal
+	// off n.mu lets concurrent data-plane senders resolve hops without waiting on
+	// this full topology computation.
+	n.mu.RLock()
+	links := n.links
+	selfID := n.id.ID
+	dirIDs := make([]string, 0, len(n.dir))
+	for id := range n.dir {
+		dirIDs = append(dirIDs, id)
+	}
+	usableByID := make(map[string]bool, len(n.neighbors))
+	for id, p := range n.neighbors {
+		if n.usable(p) {
+			usableByID[id] = true
+		}
+	}
+	n.mu.RUnlock()
+
 	adjacency := map[string][]qitem{}
-	for _, edge := range n.links {
+	for _, edge := range links {
 		adjacency[edge.A] = append(adjacency[edge.A], qitem{edge.B, edge.Cost})
 		adjacency[edge.B] = append(adjacency[edge.B], qitem{edge.A, edge.Cost})
 	}
-	previous := n.firstHopTable(adjacency, "")
+	previous := n.firstHopTable(adjacency, "", selfID, usableByID)
 	routes = map[string]string{}
 	byPrimary := map[string][]string{}
-	for d := range n.dir {
-		if d == n.id.ID {
+	for _, id := range dirIDs {
+		if id == selfID {
 			continue
 		}
-		if p, ok := n.neighbors[d]; ok && n.usable(p) {
+		if usableByID[id] {
 			// A usable direct neighbor always wins over relaying: the packet
 			// leaves immediately instead of depending on intermediate nodes.
-			routes[d] = d
+			routes[id] = id
 			continue
 		}
-		if hop := firstHopFrom(previous, d, n.id.ID); hop != "" {
-			routes[d] = hop
-			byPrimary[hop] = append(byPrimary[hop], d)
+		if hop := firstHopFrom(previous, id, selfID); hop != "" {
+			routes[id] = hop
+			byPrimary[hop] = append(byPrimary[hop], id)
 		}
 	}
 	fallbacks = map[string]string{}
 	for hop, dests := range byPrimary {
 		// One extra Dijkstra per distinct first hop (at most this node's own
 		// degree), not per destination.
-		alt := n.firstHopTable(adjacency, hop)
-		for _, d := range dests {
-			if f := firstHopFrom(alt, d, n.id.ID); f != "" && f != hop {
-				fallbacks[d] = f
+		alt := n.firstHopTable(adjacency, hop, selfID, usableByID)
+		for _, id := range dests {
+			if f := firstHopFrom(alt, id, selfID); f != "" && f != hop {
+				fallbacks[id] = f
 			}
 		}
 	}
 	return routes, fallbacks
 }
-func (n *node) firstHopTable(adjacency map[string][]qitem, exclude string) map[string]string {
-	costs := map[string]float64{n.id.ID: 0}
+func (n *node) firstHopTable(adjacency map[string][]qitem, exclude, self string, usableByID map[string]bool) map[string]string {
+	costs := map[string]float64{self: 0}
 	previous := map[string]string{}
-	queue := &pq{{n.id.ID, 0}}
+	queue := &pq{{self, 0}}
 	heap.Init(queue)
 	for queue.Len() > 0 {
 		current := heap.Pop(queue).(qitem)
@@ -90,11 +109,11 @@ func (n *node) firstHopTable(adjacency map[string][]qitem, exclude string) map[s
 			continue
 		}
 		for _, candidate := range adjacency[current.id] {
-			if current.id == n.id.ID {
+			if current.id == self {
 				if candidate.id == exclude {
 					continue
 				}
-				if !n.usable(n.neighbors[candidate.id]) {
+				if !usableByID[candidate.id] {
 					continue
 				}
 			}

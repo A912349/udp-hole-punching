@@ -405,8 +405,10 @@ func (n *node) linkHealth(ctx context.Context) {
 			}
 			n.mu.Unlock()
 			if stateChanged {
+				routes, fallbacks := n.computeRoutes()
 				n.mu.Lock()
-				n.routes, n.altRoutes = n.computeRoutes()
+				n.routes = routes
+				n.altRoutes = fallbacks
 				n.mu.Unlock()
 			}
 			for _, peer := range deadEdges {

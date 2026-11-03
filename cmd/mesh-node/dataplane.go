@@ -354,26 +354,32 @@ func (n *node) nextHop(destination string) (string, *peer) {
 		n.mu.RUnlock()
 		return hop, peer
 	}
-	// Without a usable cached hop every data packet would re-run Dijkstra
-	// here. During an outage with traffic flowing that is a CPU storm on a
-	// mutex-held path; bound full recomputations to a few per second.
-	if last := n.routeRecompute.Load(); time.Since(time.Unix(0, last)) < 250*time.Millisecond {
-		n.mu.RUnlock()
-		return "", nil
-	}
-	n.routeRecompute.Store(time.Now().UnixNano())
-	routes, fallbacks := n.computeRoutes()
-	hop = routes[destination]
-	peer = n.neighbors[hop]
-	usable := n.usable(peer)
+	// Without a usable cached hop every data packet would re-run Dijkstra here.
+	// During an outage with traffic flowing that is a CPU storm on a mutex-held
+	// path; bound full recomputations to a few per second. Release the read lock
+	// before computing so a concurrent writer (topology refresh, link-health tick)
+	// parking on n.mu does not hold this traversal hostage — every send on the
+	// failed hop would otherwise serialize behind one Dijkstra run.
 	n.mu.RUnlock()
-	if !usable {
+	last := n.routeRecompute.Load()
+	if time.Since(time.Unix(0, last)) < 250*time.Millisecond {
 		return "", nil
 	}
+	// Claim the recompute window atomically so only one worker runs Dijkstra per
+	// window instead of every sender recomputing the same table.
+	if !n.routeRecompute.CompareAndSwap(last, time.Now().UnixNano()) {
+		return "", nil
+	}
+	routes, fallbacks := n.computeRoutes()
 	n.mu.Lock()
 	n.routes = routes
 	n.altRoutes = fallbacks
 	n.mu.Unlock()
+	hop = routes[destination]
+	peer = n.neighbors[hop]
+	if !n.usable(peer) {
+		return "", nil
+	}
 	if previousHop != hop {
 		n.logf("route failover %s -> %s", destination[:8], hop[:8])
 	}

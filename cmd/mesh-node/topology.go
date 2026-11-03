@@ -165,7 +165,13 @@ func (n *node) applyTopology(t topology) {
 	n.links = t.Links
 	n.firewall.Store(parseFirewallRules(t.Firewall))
 	n.topologyVersion = t.Version
-	n.routes, n.altRoutes = n.computeRoutes()
+	n.mu.Unlock()
+	// computeRoutes snapshots links/neighbors under its own brief read lock;
+	// run it outside the write lock so it cannot deadlock on that RLock.
+	routes, fallbacks := n.computeRoutes()
+	n.mu.Lock()
+	n.routes = routes
+	n.altRoutes = fallbacks
 	n.mu.Unlock()
 	for _, hello := range lanHellos {
 		n.logf("LAN endpoint candidate for %s: %s", hello.id[:8], hello.addr)
