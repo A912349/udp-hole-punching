@@ -235,11 +235,6 @@ type hexCache struct {
 	selfHex string // full 32-char hex of self.id.ID, used when encoding dest
 	peerHex string // full 32-char hex of peer id, used for map lookups in fast path
 }
-// peerRawIdx provides a lock-free index into sharedKeys by raw 16-byte node ID.
-// It lets the data-plane receiver look up AEAD + AAD without converting bytes to
-// hex-encoded strings first — eliminating per-packet heap allocations in the hot path.
-type peerRawIndex map[[16]byte]*cachedKey
-
 type cachedKey struct {
 	public   string
 	key      []byte
@@ -394,7 +389,6 @@ type node struct {
 	topologyRefreshNext time.Time
 
 	sharedKeys     map[string]cachedKey
-	partnerKeyRaw  peerRawIndex // raw-byte index for lock-free fast path lookups
 	reassembly     map[string]*reassembly
 	routeRecompute atomic.Int64
 
