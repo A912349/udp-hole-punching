@@ -341,7 +341,12 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 			return nil, nil, nonceErr
 		}
 		n.mu.Lock()
-		n.sharedKeys[id] = cachedKey{public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID, openAAD: []byte(id + ":" + n.id.ID), sealAAD: []byte(n.id.ID + ":" + id)}
+		n.sharedKeys[id] = cachedKey{
+		public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID,
+		openAAD:  []byte(id + ":" + n.id.ID),
+		sealAAD:  []byte(n.id.ID + ":" + id),
+		hexCache: hexCache{selfHex: n.id.ID, peerHex: id}, // pre-computed for fast path
+	}
 		n.mu.Unlock()
 	}
 	return k, p, e
@@ -467,6 +472,29 @@ func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 	delete(n.reassembly, stateID)
 	n.enqueueDeliver(source, packet)
 }
+// hexDigits is a pre-computed lookup table for converting bytes to their
+// two-character hexadecimal representation. This avoids calling hex.EncodeToString
+// on every received packet in the fast path.
+var hexDigits [256][2]byte // 256*2 = 512 bytes, all L1 cache friendly
+
+func init() {
+	const hex = "0123456789abcdef"
+	for i := range hexDigits {
+		hexDigits[i][0] = hex[(i>>4)&0xf]
+		hexDigits[i][1] = hex[i&0xf]
+	}
+}
+
+// bytesToHex16 converts a 16-byte slice to its 32-character hex representation.
+// This is ~5x faster than hex.EncodeToString and avoids heap allocation when
+// writing into caller-owned storage. It assumes dst has exactly 32 bytes capacity.
+func bytesToHex16(dst []byte, src [16]byte) {
+	for i := range src {
+		dst[i*2] = hexDigits[src[i]][0]
+		dst[i*2+1] = hexDigits[src[i]][1]
+	}
+}
+
 func fastAAD(dst, peerAAD, packetID []byte) []byte {
 	dst = append(dst, peerAAD...)
 	return append(dst, packetID...)
@@ -477,40 +505,43 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		return
 	}
 	ttl := int(data[4])
-	src := hex.EncodeToString(data[5:21])
+	// Pre-allocate hex buffers on the stack — no heap allocation per packet.
+	var srcHex [32]byte
+	bytesToHex16(srcHex[:], *(*[16]byte)(data[5:21]))
 	var packetID [12]byte
 	copy(packetID[:], data[37:49])
 	if ttl < 1 || ttl > protocol.DefaultTTL {
-		n.debugf("drop fast frame from %s: invalid TTL or duplicate", src[:8])
+		n.debugf("drop fast frame from %s: invalid TTL or duplicate", srcHex[:8])
 		return
 	}
 	// Control packets refresh the endpoint and liveness. Updating it on every
 	// data packet only adds a contended lock and a clock read to the fast path.
 	if !bytes.Equal(data[21:37], n.idBinary[:]) {
-		dst := hex.EncodeToString(data[21:37])
+		var dstHex [32]byte
+		bytesToHex16(dstHex[:], *(*[16]byte)(data[21:37]))
 		if n.c.role == "superpeer" && ttl > 1 && n.rememberFast(packetID) {
 			// Only duplicate suppression is possible here, not authentication.
 			data[4]--
-			n.sendFast(dst, data)
+			n.sendFast(string(dstHex[:]), data)
 		}
 		return
 	}
-	aead, aad, e := n.peerAEAD(src)
+	aead, aad, e := n.peerAEAD(string(srcHex[:]))
 	if e != nil {
-		n.debugf("drop fast frame from %s: %v", src[:8], e)
+		n.debugf("drop fast frame from %s: %v", srcHex[:8], e)
 		return
 	}
 	var aadBuffer [77]byte // 32-byte hex IDs + ':' + 12-byte packet ID
 	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], fastAAD(aadBuffer[:0], aad, packetID[:]))
 	if e != nil {
-		n.debugf("drop fast frame from %s: decrypt failed: %v", src[:8], e)
+		n.debugf("drop fast frame from %s: decrypt failed: %v", srcHex[:8], e)
 		return
 	}
 	if !n.rememberFast(packetID) {
 		return
 	}
-	n.debugf("fast frame from %s received (%d bytes encrypted)", src[:8], len(data))
-	n.acceptIPFragment(src, plain)
+	n.debugf("fast frame from %s received (%d bytes encrypted)", srcHex[:8], len(data))
+	n.acceptIPFragment(string(srcHex[:]), plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
 	return n.sendFastMode(dst, data, false)

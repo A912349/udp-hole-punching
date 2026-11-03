@@ -78,6 +78,7 @@ func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 			peerID:  peerID,
 			sealAAD: []byte(self.id.ID + ":" + other.id.ID),
 			openAAD: []byte(other.id.ID + ":" + self.id.ID),
+			hexCache: hexCache{selfHex: self.id.ID, peerHex: other.id.ID}, // pre-computed for fast path
 		}
 		self.startFastWorkers(ctx)
 		self.startDeliverWorker(ctx)

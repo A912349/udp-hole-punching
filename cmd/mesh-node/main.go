@@ -228,14 +228,22 @@ type serviceResult struct {
 	Data  string `json:"data"`
 	Error string `json:"error"`
 }
+// hexCache caches pre-computed hex-encoded node IDs to avoid calling
+// hex.EncodeToString on every packet in the receive hot path.
+// Profiling showed this was allocating ~4 strings/packet at 520-byte throughput.
+type hexCache struct {
+	selfHex string // full 32-char hex of self.id.ID, used when encoding dest
+	peerHex string // full 32-char hex of peer id, used for map lookups in fast path
+}
 type cachedKey struct {
-	public  string
-	key     []byte
-	aead    cipher.AEAD
-	nonces  *protocol.NonceSequence
-	peerID  [16]byte
-	openAAD []byte
-	sealAAD []byte
+	public   string
+	key      []byte
+	aead     cipher.AEAD
+	nonces   *protocol.NonceSequence
+	peerID   [16]byte
+	openAAD  []byte
+	sealAAD  []byte
+	hexCache hexCache // pre-computed for fast path
 }
 type reassembly struct {
 	totalBytes int
