@@ -342,15 +342,31 @@ func (n *node) peerKey(id string) ([]byte, *peer, error) {
 		}
 		n.mu.Lock()
 		n.sharedKeys[id] = cachedKey{
-		public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID,
-		openAAD:  []byte(id + ":" + n.id.ID),
-		sealAAD:  []byte(n.id.ID + ":" + id),
-		hexCache: hexCache{selfHex: n.id.ID, peerHex: id}, // pre-computed for fast path
-	}
+			public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID,
+			openAAD:  []byte(id + ":" + n.id.ID),
+			sealAAD:  []byte(n.id.ID + ":" + id),
+			hexCache: hexCache{selfHex: n.id.ID, peerHex: id}, // pre-computed for fast path
+		}
+		// Also populate the raw-byte index so the data-plane can look up
+		// AEAD + AAD without converting bytes to hex strings on every packet.
+		n.partnerKeyRaw[peerID] = &cachedKey{
+			aead: aead, openAAD: []byte(id + ":" + n.id.ID), peerID: peerID,
+		}
 		n.mu.Unlock()
 	}
 	return k, p, e
 }
+// peerAEADFast provides a lock-free fast path for the data-plane receiver.
+// It uses partnerKeyRaw indexed by raw 16-byte node ID so that hot-path code
+// can look up AEAD + AAD without converting to hex-encoded strings first.
+// Returns (nil, nil, false) on cache miss — caller drops the packet silently.
+func (n *node) peerAEADFast(peerID [16]byte) (cipher.AEAD, []byte, bool) {
+	if cached, ok := n.partnerKeyRaw[peerID]; ok && cached != nil && cached.aead != nil {
+		return cached.aead, cached.openAAD, true
+	}
+	return nil, nil, false
+}
+
 func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
 	if _, _, err := n.peerKey(id); err != nil {
 		return nil, nil, err
@@ -526,9 +542,12 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		}
 		return
 	}
-	aead, aad, e := n.peerAEAD(string(srcHex[:]))
-	if e != nil {
-		n.debugf("drop fast frame from %s: %v", srcHex[:8], e)
+	// Use raw [16]byte key directly — avoids string conversion for map lookup.
+	var peerID [16]byte
+	copy(peerID[:], data[5:21])
+	aead, aad, ok := n.peerAEADFast(peerID)
+	if !ok {
+		n.debugf("drop fast frame from %s: no shared key", srcHex[:8])
 		return
 	}
 	var aadBuffer [77]byte // 32-byte hex IDs + ':' + 12-byte packet ID

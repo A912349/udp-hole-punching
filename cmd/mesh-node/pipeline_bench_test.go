@@ -45,6 +45,7 @@ func newBenchNode(id *protocol.Identity, tun *benchTUN, meshIP netip.Addr, conn 
 		fastSeen:     make(map[[12]byte]struct{}, fastSeenCapacity),
 		fastSeenRing: make([][12]byte, 0, fastSeenCapacity),
 		sharedKeys:   map[string]cachedKey{},
+		partnerKeyRaw: make(peerRawIndex, 4),
 		tun:          tun,
 		startedAt:    time.Now(),
 	}
@@ -79,6 +80,10 @@ func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 			sealAAD: []byte(self.id.ID + ":" + other.id.ID),
 			openAAD: []byte(other.id.ID + ":" + self.id.ID),
 			hexCache: hexCache{selfHex: self.id.ID, peerHex: other.id.ID}, // pre-computed for fast path
+		}
+		// Populate the raw-byte index for lock-free fast path lookups.
+		self.partnerKeyRaw[peerID] = &cachedKey{
+			aead: aead, openAAD: []byte(other.id.ID + ":" + self.id.ID), peerID: peerID,
 		}
 		self.startFastWorkers(ctx)
 		self.startDeliverWorker(ctx)
