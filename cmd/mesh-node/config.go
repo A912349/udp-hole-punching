@@ -1,22 +1,22 @@
 package main
 
 import (
-	"time"
-	"net/netip"
-	"net"
-	"crypto/rand"
-	"encoding/hex"
-	"crypto/sha256"
 	"bufio"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	_ "net/http/pprof"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"home-udp-mesh/internal/protocol"
 )
@@ -310,7 +310,6 @@ func createUnifiedIdentity(path string) (*protocol.Identity, error) {
 	return i, os.WriteFile(path, encoded, 0600)
 }
 
-
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 func newNode(c config) (*node, error) {
@@ -342,25 +341,25 @@ func newNode(c config) (*node, error) {
 	configureUDPSocket(conn)
 	k := sha256.Sum256([]byte(c.token))
 	n := &node{
-		c:                      c,
-		requestedRole:          c.role,
-		requestedNAT:           c.nat,
-		id:                     id,
-		idBinary:               idBinary,
-		key:                    k[:],
-		conn:                   conn,
-		symmetricConns:         make(map[string]*net.UDPConn, 4),
-		receiveSockets:         make(map[*net.UDPConn]struct{}, 4),
-		dir:                    make(map[string]*peer, 8),
-		pendingLAN:             make(map[string]*net.UDPAddr, 4),
-		neighbors:              make(map[string]*peer, 8),
-		routes:                 make(map[string]string, 8),
-		altRoutes:              make(map[string]string, 8),
-		meshNodes:              make(map[netip.Addr]string, 16),
-		installedRoutes:        make(map[string]bool, 8),
-		seen:                   make(map[string]struct{}, 256),
-		fastSeen:               make(map[[12]byte]struct{}, fastSeenCapacity),
-		fastSeenRing:           make([][12]byte, 0, fastSeenCapacity),
+		c:               c,
+		requestedRole:   c.role,
+		requestedNAT:    c.nat,
+		id:              id,
+		idBinary:        idBinary,
+		key:             k[:],
+		conn:            conn,
+		symmetricConns:  make(map[string]*net.UDPConn, 4),
+		receiveSockets:  make(map[*net.UDPConn]struct{}, 4),
+		dir:             make(map[string]*peer, 8),
+		pendingLAN:      make(map[string]*net.UDPAddr, 4),
+		neighbors:       make(map[string]*peer, 8),
+		routes:          make(map[string]string, 8),
+		altRoutes:       make(map[string]string, 8),
+		meshNodes:       make(map[netip.Addr]string, 16),
+		installedRoutes: make(map[string]bool, 8),
+		seen:            make(map[string]struct{}, 256),
+		// fastSeen/fastSeenRing are lazily allocated per shard on the first packet
+		// routed there (see rememberFast), so no per-node eager init is needed.
 		pending:                map[string]chan serviceResult{},
 		services:               make(map[string]string, 4),
 		allow:                  map[string]bool{"*": true},

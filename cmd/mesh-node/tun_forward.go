@@ -1,10 +1,10 @@
 package main
 
 import (
-	"io"
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	_ "net/http/pprof"
 	"net/netip"
@@ -14,6 +14,7 @@ import (
 
 	"home-udp-mesh/internal/protocol"
 )
+
 func (n *node) writeControlUDP(conn *net.UDPConn, data []byte, address *net.UDPAddr) (int, error) {
 	written, err := conn.WriteToUDP(data, address)
 	if err == nil {
@@ -77,23 +78,62 @@ func (n *node) remember(id string) bool {
 	}
 	return true
 }
-func (n *node) rememberFast(id [12]byte) bool {
-	n.fastSeenMu.Lock()
-	defer n.fastSeenMu.Unlock()
-	if _, ok := n.fastSeen[id]; ok {
-		return false
+func fastShard(id [12]byte) int {
+	// FNV-1a over the packet ID spreads IDs uniformly across shards. A duplicate
+	// frame is byte-identical, so it always lands in the same shard as its
+	// original: dedup is exact, the window is simply partitioned.
+	var h uint32 = 2166136261
+	for _, b := range id {
+		h ^= uint32(b)
+		h *= 16777619
 	}
-	if len(n.fastSeenRing) < fastSeenCapacity {
-		n.fastSeenRing = append(n.fastSeenRing, id)
-	} else {
-		delete(n.fastSeen, n.fastSeenRing[n.fastSeenNext])
-		n.fastSeenRing[n.fastSeenNext] = id
-		n.fastSeenNext++
-		if n.fastSeenNext == fastSeenCapacity {
-			n.fastSeenNext = 0
+	return int(h % fastSeenShards)
+}
+
+// fastSeenCount sums the per-shard duplicate sets. Tests and callers that care
+// about total occupancy use it; the per-shard lock keeps concurrent workers off
+// each other's maps.
+func (n *node) fastSeenCount() int {
+	total := 0
+	for i := range n.fastSeen {
+		if n.fastSeen[i] != nil {
+			total += len(n.fastSeen[i])
 		}
 	}
-	n.fastSeen[id] = struct{}{}
+	return total
+}
+
+// rememberFast records a packet ID for duplicate suppression under the shard
+// chosen by its ID. Because the global lock is gone, every fast worker locks a
+// distinct mutex, so N workers no longer serialize on anti-replay bookkeeping.
+func (n *node) rememberFast(id [12]byte) bool {
+	si := fastShard(id)
+	mu := &n.fastSeenMu[si]
+	mu.Lock()
+	defer mu.Unlock()
+	if n.fastSeen[si] == nil {
+		// Lazily allocate the shard's set on the first packet routed here so the
+		// zero-value node is safe without a per-packet allocation.
+		n.fastSeen[si] = make(map[[12]byte]struct{}, fastSeenRingCap)
+	}
+	if _, ok := n.fastSeen[si][id]; ok {
+		return false
+	}
+	// Sliding window per shard: once the shard's ring is full, evict the oldest
+	// entry and recycle its slot. This bounds memory to fastSeenRingCap per
+	// shard instead of unbounded map growth.
+	ring := n.fastSeenRing[si]
+	if len(ring) < fastSeenRingCap {
+		n.fastSeenRing[si] = append(ring, id)
+	} else {
+		delete(n.fastSeen[si], n.fastSeenRing[si][n.fastSeenNext[si]])
+		n.fastSeenRing[si][n.fastSeenNext[si]] = id
+		n.fastSeenNext[si]++
+		if n.fastSeenNext[si] == fastSeenRingCap {
+			n.fastSeenNext[si] = 0
+		}
+	}
+	n.fastSeen[si][id] = struct{}{}
 	return true
 }
 func (n *node) nextPacketID(dst []byte) bool {

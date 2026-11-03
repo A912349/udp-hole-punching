@@ -104,6 +104,11 @@ const (
 	udpSocketBufferSize      = 4 << 20
 	fastSeenCapacity         = 10000
 	lanDiscoveryPort         = 37777
+	fastSeenShards            = 64
+	// Fast-path anti-replay dedup is sharded by packetID so the fast workers
+	// each lock a different mutex instead of contending on one global lock.
+	// The total tracked window is preserved; each shard holds a slice of it.
+	fastSeenRingCap           = fastSeenCapacity / fastSeenShards
 	lanDiscoveryInterval     = time.Minute
 	lanDiscoveryBurstCount   = 5
 	lanHoldTimeout           = 30 * time.Second
@@ -358,10 +363,10 @@ type node struct {
 	subnetRoutes       []subnetRoute
 	installedRoutes    map[string]bool
 	seen               map[string]struct{}
-	fastSeenMu         sync.Mutex
-	fastSeen           map[[12]byte]struct{}
-	fastSeenRing       [][12]byte
-	fastSeenNext       int
+	fastSeenMu         [fastSeenShards]sync.Mutex
+	fastSeen           [fastSeenShards]map[[12]byte]struct{}
+	fastSeenRing       [fastSeenShards][][12]byte
+	fastSeenNext       [fastSeenShards]int
 	pending            map[string]chan serviceResult
 	services           map[string]string
 	allow              map[string]bool

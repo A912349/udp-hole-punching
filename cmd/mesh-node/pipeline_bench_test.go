@@ -33,20 +33,19 @@ func newBenchNode(id *protocol.Identity, tun *benchTUN, meshIP netip.Addr, conn 
 	var idBinary [16]byte
 	copy(idBinary[:], decoded)
 	n := &node{
-		c:            config{role: "client", bind: "127.0.0.1"},
-		id:           id,
-		idBinary:     idBinary,
-		key:          make([]byte, 32),
-		conn:         conn,
-		dir:          map[string]*peer{},
-		neighbors:    map[string]*peer{},
-		routes:       map[string]string{},
-		meshNodes:    map[netip.Addr]string{},
-		fastSeen:     make(map[[12]byte]struct{}, fastSeenCapacity),
-		fastSeenRing: make([][12]byte, 0, fastSeenCapacity),
-		sharedKeys:   map[string]cachedKey{},
-		tun:          tun,
-		startedAt:    time.Now(),
+		c:         config{role: "client", bind: "127.0.0.1"},
+		id:        id,
+		idBinary:  idBinary,
+		key:       make([]byte, 32),
+		conn:      conn,
+		dir:       map[string]*peer{},
+		neighbors: map[string]*peer{},
+		routes:    map[string]string{},
+		meshNodes: map[netip.Addr]string{},
+		// fastSeen/fastSeenRing are lazily allocated per shard on first use.
+		sharedKeys: map[string]cachedKey{},
+		tun:        tun,
+		startedAt:  time.Now(),
 	}
 	var as4 [4]byte = meshIP.As4()
 	n.meshIPv4.Store(binary.BigEndian.Uint32(as4[:]))
@@ -71,13 +70,13 @@ func wireNodes(ctx context.Context, a, b *node, addrA, addrB *net.UDPAddr) {
 		self.meshNodes[benchMeshIP(self)] = self.id.ID
 		self.meshNodes[benchMeshIP(other)] = other.id.ID
 		self.sharedKeys[other.id.ID] = cachedKey{
-			public:  other.id.Public,
-			key:     key,
-			aead:    aead,
-			nonces:  nonces,
-			peerID:  peerID,
-			sealAAD: []byte(self.id.ID + ":" + other.id.ID),
-			openAAD: []byte(other.id.ID + ":" + self.id.ID),
+			public:   other.id.Public,
+			key:      key,
+			aead:     aead,
+			nonces:   nonces,
+			peerID:   peerID,
+			sealAAD:  []byte(self.id.ID + ":" + other.id.ID),
+			openAAD:  []byte(other.id.ID + ":" + self.id.ID),
 			hexCache: hexCache{selfHex: self.id.ID, peerHex: other.id.ID}, // pre-computed for fast path
 		}
 		self.startFastWorkers(ctx)

@@ -312,69 +312,78 @@ func symmetricScanPorts(center, step int, visit func(port int) bool) {
 	}
 }
 func (n *node) peerKey(id string) ([]byte, *peer, error) {
+	cached, p, e := n.peerCrypto(id)
+	return cached.key, p, e
+}
+
+// peerCrypto returns the cached AEAD material for a peer under a single read
+// lock. The common fast path -- an entry that still matches the peer's current
+// public key -- holds n.mu.RLock() exactly once; the symmetric-key derivation
+// and write-lock only happen on a cache miss. This collapses the two RLocks that
+// peerAEAD/peerCipher previously took (one inside peerKey to read the key, one
+// again to read the entry) into one lookup per packet.
+func (n *node) peerCrypto(id string) (cachedKey, *peer, error) {
 	n.mu.RLock()
 	p := n.dir[id]
-	if p != nil {
-		if cached, ok := n.sharedKeys[id]; ok && cached.public == p.Public {
-			n.mu.RUnlock()
-			return cached.key, p, nil
-		}
+	if cached, ok := n.sharedKeys[id]; ok && cached.public == p.Public {
+		n.mu.RUnlock()
+		return cached, p, nil
 	}
 	n.mu.RUnlock()
+	var cached cachedKey
 	if p == nil {
-		return nil, nil, errors.New("unknown peer")
+		return cached, nil, errors.New("unknown peer")
 	}
 	k, e := protocol.SharedKey(n.id.Private, p.Public)
 	if e == nil {
 		decodedID, decodeErr := hex.DecodeString(id)
 		if decodeErr != nil || len(decodedID) != 16 {
-			return nil, nil, errors.New("peer has an invalid node ID")
+			return cached, nil, errors.New("peer has an invalid node ID")
 		}
 		var peerID [16]byte
 		copy(peerID[:], decodedID)
 		aead, cipherErr := protocol.NewAEAD(k)
 		if cipherErr != nil {
-			return nil, nil, cipherErr
+			return cached, nil, cipherErr
 		}
 		nonces, nonceErr := protocol.NewNonceSequence()
 		if nonceErr != nil {
-			return nil, nil, nonceErr
+			return cached, nil, nonceErr
 		}
 		n.mu.Lock()
+
 		n.sharedKeys[id] = cachedKey{
-		public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID,
-		openAAD:  []byte(id + ":" + n.id.ID),
-		sealAAD:  []byte(n.id.ID + ":" + id),
-		hexCache: hexCache{selfHex: n.id.ID, peerHex: id}, // pre-computed for fast path
-	}
+			public: p.Public, key: k, aead: aead, nonces: nonces, peerID: peerID,
+			openAAD:  []byte(id + ":" + n.id.ID),
+			sealAAD:  []byte(n.id.ID + ":" + id),
+			hexCache: hexCache{selfHex: n.id.ID, peerHex: id}, // pre-computed for fast path
+		}
+		cached = n.sharedKeys[id]
 		n.mu.Unlock()
 	}
-	return k, p, e
+	return cached, p, e
 }
 func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
-	if _, _, err := n.peerKey(id); err != nil {
-		return nil, nil, err
+	cached, _, e := n.peerCrypto(id)
+	if e != nil {
+		return nil, nil, e
 	}
-	n.mu.RLock()
-	cached, ok := n.sharedKeys[id]
-	n.mu.RUnlock()
-	if !ok || cached.aead == nil {
+	if cached.aead == nil {
 		return nil, nil, errors.New("missing peer cipher")
 	}
 	return cached.aead, cached.openAAD, nil
 }
 func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, [16]byte, error) {
-	if _, _, err := n.peerKey(id); err != nil {
-		return nil, nil, nil, [16]byte{}, err
+	cached, _, e := n.peerCrypto(id)
+	if e != nil {
+		return nil, nil, nil, [16]byte{}, e
 	}
-	n.mu.RLock()
-	cached, ok := n.sharedKeys[id]
-	n.mu.RUnlock()
-	if !ok || cached.aead == nil || cached.nonces == nil {
+	if cached.aead == nil || cached.nonces == nil {
 		return nil, nil, nil, [16]byte{}, errors.New("missing peer cipher")
 	}
 	return cached.aead, cached.nonces, cached.sealAAD, cached.peerID, nil
 }
+
 func (n *node) encrypted(dst, typ string, body map[string]any, id string) bool {
 	k, _, e := n.peerKey(dst)
 	if e != nil {
@@ -472,6 +481,7 @@ func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 	delete(n.reassembly, stateID)
 	n.enqueueDeliver(source, packet)
 }
+
 // hexDigits is a pre-computed lookup table for converting bytes to their
 // two-character hexadecimal representation. This avoids calling hex.EncodeToString
 // on every received packet in the fast path.

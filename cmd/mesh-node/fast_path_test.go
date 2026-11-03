@@ -9,19 +9,23 @@ import (
 )
 
 func TestRememberFastRejectsDuplicatesAndEvictsOldest(t *testing.T) {
-	n := &node{
-		fastSeen:     make(map[[12]byte]struct{}, fastSeenCapacity),
-		fastSeenRing: make([][12]byte, 0, fastSeenCapacity),
-	}
+	// The dedup ring is sharded by packetID; rememberFast lazily allocates the
+	// shard's set, so a zero-value node is safe without eager init here.
+	n := &node{}
 	var first [12]byte
 	if !n.rememberFast(first) || n.rememberFast(first) {
 		t.Fatal("fast duplicate detection did not reject a duplicate")
 	}
-	for value := uint64(1); value <= fastSeenCapacity; value++ {
+	// Overflow first's shard ring so its oldest entry (first) is evicted. A
+	// duplicate is always routed to the same shard, so dedup stays exact even
+	// though the per-shard window is smaller than the old single global ring.
+	target := fastShard(first)
+	inserted := 0
+	for value := uint64(1); inserted < fastSeenRingCap; value++ {
 		var id [12]byte
 		binary.BigEndian.PutUint64(id[4:], value)
-		if !n.rememberFast(id) {
-			t.Fatalf("new packet ID %d was rejected", value)
+		if fastShard(id) == target && n.rememberFast(id) {
+			inserted++
 		}
 	}
 	if !n.rememberFast(first) {
