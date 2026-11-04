@@ -295,13 +295,100 @@ func (n *node) advertisedLanAddrs() []string {
 	}
 	return out
 }
-func (n *node) localSource(ip net.IP) bool {
+// lanAddrListMatchesIP reports whether an address equals the IP part of
+// one of a node's published LAN addresses ("ip:port" entries from
+// advertisedLanAddrs). A source arriving from one of these really came
+// from where the node lives, which is the strongest LAN evidence: it
+// covers same-LAN traffic and cross-router LAN alike, regardless of how
+// deep the private range of the receiving node's subnet is.
+func lanAddrListMatchesIP(lans []string, other netip.Addr) bool {
+	other = other.Unmap()
+	for _, raw := range lans {
+		lan, e := net.ResolveUDPAddr("udp4", raw)
+		if e != nil || lan.IP == nil {
+			continue
+		}
+		published, ok := netip.AddrFromSlice(lan.IP)
+		if ok && published.Unmap() == other {
+			return true
+		}
+	}
+	return false
+}
+// endpointIPMatches reports whether a published NAT endpoint ("ip:port"
+// or host:port as returned by STUN) resolves to addr. A NAT endpoint is
+// external by definition, so a datagram received from that IP crossed the
+// mapping even when the NAT presents itself inside a private (RFC1918)
+// range: that is exactly what a provider UDP hole does (the network-side
+// address of a hole punched by the ISP, e.g. 192.168.1.54 inside
+// 192.168.1.0/24), and it must not be mistaken for LAN traffic.
+func endpointIPMatches(endpoint string, other netip.Addr) bool {
+	if endpoint == "" {
+		return false
+	}
+	resolved, err := netip.ParseAddr(endpointIP(endpoint))
+	if err != nil {
+		// endpointIP lowercases hostnames when the endpoint has none: a
+		// hostname endpoint can never match a numeric candidate.
+		return false
+	}
+	return resolved.Unmap() == other.Unmap()
+}
+// lanCandidateBlockedIP reports whether a LAN candidate address is in
+// fact a published NAT endpoint of this node (a probe would round-trip
+// through its own hole) or of the candidate peer (the send walks a hole
+// rather than an on-link LAN path). Probing those costs a ping over the
+// provider mapping every probe round and can confirm a NAT path as if it
+// were LAN; they are not candidates.
+func lanCandidateBlockedIP(ip net.IP, endpoints ...string) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	addr = addr.Unmap()
+	if !ok || !addr.Is4() {
+		return false
+	}
+	for _, endpoint := range endpoints {
+		if endpointIPMatches(endpoint, addr) {
+			return true
+		}
+	}
+	return false
+}
+// localSource classifies the source of a received datagram: did the
+// traffic stay local or cross a NAT. NAT rewrites the source of received
+// packets to the endpoint published for the mapping used, so the source
+// address identifies the path taken. A provider UDP hole is itself such
+// a NAT, and its published endpoint can fall inside a private (RFC1918)
+// range that the receiving node calls local, so "private means LAN"
+// alone mislabels hole traffic as LAN: the admin UI shows the link as
+// LAN while every datagram actually walks the provider mapping (ping and
+// bandwidth symptoms). Identity evidence settles it:
+// 1. source IP is a LAN address published by the source node: LAN;
+// 2. source IP is the NAT endpoint published by the source node, or
+//    this node's own NAT endpoint (reply back through its own hole):
+//    internet, even when the address looks private;
+// 3. otherwise fall back to the range heuristic for entries whose
+//    published addresses are not (yet) available.
+func (n *node) localSource(id string, ip net.IP) bool {
 	addr, ok := netip.AddrFromSlice(ip)
 	if !ok {
 		return false
 	}
 	addr = addr.Unmap()
 	if !addr.Is4() {
+		return false
+	}
+	n.mu.RLock()
+	published, external := false, false
+	if entry := n.neighbors[id]; entry != nil {
+		published = lanAddrListMatchesIP(entry.LANAddrs, addr)
+		external = endpointIPMatches(entry.Endpoint, addr)
+	}
+	selfHole := endpointIPMatches(n.c.endpoint, addr)
+	n.mu.RUnlock()
+	if published {
+		return true
+	}
+	if external || selfHole {
 		return false
 	}
 	if addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLoopback() {
@@ -358,7 +445,7 @@ func (n *node) touch(id string, a net.Addr) {
 	lanSource := false
 	address, isUDP := a.(*net.UDPAddr)
 	if isUDP {
-		lanSource = n.localSource(address.IP)
+		lanSource = n.localSource(id, address.IP)
 	}
 	now := time.Now()
 	n.mu.Lock()

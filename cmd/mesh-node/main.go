@@ -921,12 +921,21 @@ type fastStatsSnapshot struct {
 // HELLO probes to them, which finds neighbors across cascaded routers where
 // broadcast LAN discovery cannot reach.
 
-// localSource reports whether a received datagram's source address means the
-// traffic did not cross the internet: the address is private/link-local (NAT
-// rewrites the source to a public address on any path that leaves the LAN)
-// or belongs to a subnet of a local interface (exotic public ranges used as
-// an unNATted LAN). CGNAT (100.64.0.0/10) and everything else is the
-// internet: the packet came through the provider's network.
+// localSource classifies a received datagram's source address: did the
+// traffic stay inside the local networks or cross the internet. NAT
+// rewrites the source of received packets to the endpoint published for
+// the mapping used, so the source address identifies the path taken:
+// 1. equal to a LAN address published by the source node: LAN — that is
+//    where the node lives (same network or cascaded routers);
+// 2. equal to the NAT endpoint published by the source node, or by this
+//    node (a reply returning through its own hole): the internet — even
+//    when the endpoint carries a private address, which is exactly what
+//    a provider UDP hole punch does; the "private means LAN" range
+//    heuristic below alone would mislabel those as LAN and the admin UI
+//    would show a provider-hole link as a LAN connection;
+// 3. otherwise the range heuristic: private/link-local or a subnet of a
+//    local interface is LAN, CGNAT (100.64.0.0/10) and everything else
+//    public is the provider's network.
 
 // wwanInterfaceName reports whether the interface belongs to a mobile-data
 // modem (Android rmnet*/ccmni*, iOS pdp*, generic wwan*). Addresses of such
@@ -940,7 +949,11 @@ type fastStatsSnapshot struct {
 // node's own subnets (exotic public LAN ranges). Private candidates on a
 // mobile-data-only node fail the first check: without a local LAN there is
 // no way a 192.168.x address is reachable, and probing would leak packets
-// into the carrier's network.
+// into the carrier's network. Candidates that equal a published NAT
+// endpoint (this node's own hole or the candidate peer's) are rejected in
+// addition by lanCandidateBlockedIP at the probe sites: a NAT endpoint is
+// off-link by definition, and unicating toward a hole punch walks the
+// provider mapping every probe round at the cost of ping and bandwidth.
 
 // sameNAT reports whether the peer's published external endpoint shares this
 // node's external IP — a hint that both nodes sit behind one router, where a

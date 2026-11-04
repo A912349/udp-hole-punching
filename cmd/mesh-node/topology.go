@@ -142,6 +142,17 @@ func (n *node) applyTopology(t topology) {
 					if !n.lanCandidateUsable(addr.IP) {
 						continue
 					}
+					// A LAN candidate that equals a published NAT endpoint (this
+					// node's own hole or the candidate peer's) is not on-link:
+					// unicating HELLO toward a hole punch walks the provider
+					// mapping (ping and shared-bandwidth cost every probe round)
+					// and what comes back confirms the NAT itself, not a LAN
+					// path. A LANAd can BE a hole address when a provider
+					// punched a hole at a private-looking address, so
+					// lanCandidateUsable alone does not reject those.
+					if lanCandidateBlockedIP(addr.IP, n.c.endpoint, p.Endpoint) {
+						continue
+					}
 					// Candidates equal to lastLAN are re-probed deliberately:
 					// a peer that moved away and came back on the same address
 					// must be re-found, and the interval above keeps the
@@ -153,6 +164,13 @@ func (n *node) applyTopology(t topology) {
 		}
 		if candidate := n.pendingLAN[p.ID]; candidate != nil {
 			delete(n.pendingLAN, p.ID)
+			// The same endpoint rules apply to candidates buffered from LAN
+			// discovery: one that equals a published NAT endpoint (own or
+			// the peer's) is a hole punch, not a LAN route, and must not
+			// become the send or probe target.
+			if candidate.IP == nil || lanCandidateBlockedIP(candidate.IP, n.c.endpoint, p.Endpoint) {
+				continue
+				}
 			// Candidate only: lastLANRX is confirmed by touch() once traffic
 			// really arrives from the LAN address.
 			p.lastLAN = candidate

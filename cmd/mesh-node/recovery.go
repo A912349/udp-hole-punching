@@ -120,6 +120,17 @@ func (n *node) probeLanCandidates() {
 			if err != nil || addr.IP == nil || !n.lanCandidateUsable(addr.IP) {
 				continue
 			}
+			// A LAN candidate that equals a published NAT endpoint (this
+			// node's own hole, or the candidate peer's) is not on-link:
+			// unicating HELLO toward a hole punch walks the provider
+			// mapping (ping and shared-bandwidth cost every probe round) and
+			// whatever comes back confirms the NAT itself, not a LAN path.
+			// lanCandidateUsable above only checks that the address looks
+			// like LAN, so holes punched inside a private range still pass
+			// through it and must be rejected here.
+			if lanCandidateBlockedIP(addr.IP, n.c.endpoint, p.Endpoint) {
+				continue
+			}
 			p.lastLAN = copyUDPAddr(addr)
 			probes = append(probes, probe{id: id, addr: copyUDPAddr(addr)})
 		}
@@ -216,7 +227,12 @@ func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 		candidate := copyUDPAddr(&net.UDPAddr{IP: address.IP, Port: payload.Port})
 		n.mu.Lock()
 		peer := n.neighbors[packet.Source]
-		if peer != nil {
+		if peer != nil && lanCandidateBlockedIP(address.IP, n.c.endpoint, peer.Endpoint) {
+			// LAN-discovery traffic that arrived at a published NAT endpoint
+			// walked a hole punch (provider NAT): the candidate is the NAT
+			// itself, so it must not be adopted as a LAN route and probing it
+			// would walk the provider mapping every round.
+			} else if peer != nil {
 			// Candidate only: lastLANRX is set by touch() once traffic actually
 			// arrives from this address, so an unreachable candidate (LAN
 			// segmentation, AP isolation) never suppresses the public path.
