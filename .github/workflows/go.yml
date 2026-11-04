@@ -28,6 +28,9 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
+      - name: Run tests
+        run: go test ./cmd/server ./cmd/mesh-node ./internal/protocol
+
       - name: Minify embedded admin assets
         run: |
           npx --yes terser@5 cmd/server/admin.js --compress --mangle --output cmd/server/admin.js
