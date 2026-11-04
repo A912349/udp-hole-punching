@@ -335,10 +335,10 @@ function overviewGraph() {
   svg.innerHTML = links.map(e => {
     let a = p[e.a],
       b = p[e.b];
-    return a && b ? `<line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/>` : ''
+    return a && b ? `<line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"><title>${esc(`${peerLabel(nodes.find(x => x.node_id === e.a) || {node_id: e.a})} ↔ ${peerLabel(nodes.find(x => x.node_id === e.b) || {node_id: e.b})} · ${e.status||'unknown'}`)}</title></line>` : ''
   }).join('') + nodes.map(n => {
     let q = p[n.node_id];
-    return `<g data-peer="${esc(n.node_id)}"><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" x="${q.x}" y="${q.y+51}">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" x="${q.x}" y="${q.y+64}">${esc(peerSub(n))}</text></g>`
+    return `<g data-peer="${esc(n.node_id)}"><title>${esc(`${peerLabel(n)} · ${n.role} · ${peerSub(n)}`)}</title><circle class="node ${esc(n.role)}" cx="${q.x}" cy="${q.y}" r="19"/><text class="svgLabel" text-anchor="middle" x="${q.x}" y="${q.y+38}">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" x="${q.x}" y="${q.y+51}">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" x="${q.x}" y="${q.y+64}">${esc(peerSub(n))}</text></g>`
   }).join('');
   svg.querySelectorAll('[data-peer]').forEach(g => g.onclick = () => {
     page('topology');
@@ -386,10 +386,11 @@ function drawInteractive(force = false) {
       rtt = e.rtt_ms ? `ping ${Math.round(e.rtt_ms)} ms` : 'ping —',
       path = e.via_lan ? 'LAN' : 'internet',
       label = `${path} · ${rtt} · ${cost}`,
+      tip = `${peerLabel(nodes.find(x => x.node_id === e.a) || {node_id: e.a})} ↔ ${peerLabel(nodes.find(x => x.node_id === e.b) || {node_id: e.b})} · ${label} · ${e.status||'unknown'}`,
       classes = ['edgeGroup'];
     if (graphUI.selectedEdge === key) classes.push('selected');
     if (graphUI.selectedNode && (e.a === graphUI.selectedNode || e.b === graphUI.selectedNode)) classes.push('adjacent');
-    return `<g class="${classes.join(' ')}" data-edge="${esc(key)}"><line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
+    return `<g class="${classes.join(' ')}" data-edge="${esc(key)}"><title>${esc(tip)}</title><line class="edge ${esc(e.status||'unknown')}${e.via_lan?' lan':''}" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><line class="edgeHit" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}"/><text class="svgLabel" text-anchor="middle" x="${(a.x+b.x)/2}" y="${(a.y+b.y)/2-8}">${esc(label)}</text></g>`
   }).join('');
   let peerMarkup = nodes.map(n => {
     let q = graphUI.positions[n.node_id],
@@ -397,7 +398,7 @@ function drawInteractive(force = false) {
     if (graphUI.selectedNode === n.node_id) classes.push('selected');
     if (graphUI.source === n.node_id) classes.push('linkSource');
     let ring = n.nat_type === 'symmetric' ? '<circle class="sym" r="26"/>' : '';
-    return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})">${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" y="53">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="66">${esc(peerSub(n))}</text></g>`
+    return `<g class="${classes.join(' ')}" data-peer="${esc(n.node_id)}" transform="translate(${q.x} ${q.y})"><title>${esc(`${peerLabel(n)} · ${n.role} ${n.nat_type === 'symmetric' ? ' symmetric' : ''} · ${peerSub(n)} · ${peerID(n)}`)}</title>${ring}<circle class="node ${esc(n.role)}" r="20"/><text class="svgLabel" text-anchor="middle" y="40">${esc(peerLabel(n))}</text><text class="svgLabel nodeID" text-anchor="middle" y="53">${esc(peerID(n))}</text><text class="svgLabel nodeUptime" text-anchor="middle" y="66">${esc(peerSub(n))}</text></g>`
   }).join('');
   svg.innerHTML = `<g id="graphViewport">${edges}${peerMarkup}</g>`;
   svg.querySelectorAll('[data-edge]').forEach(g => g.onclick = e => {
