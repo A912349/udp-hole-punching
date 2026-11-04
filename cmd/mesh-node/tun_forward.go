@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"strconv"
 	"strings"

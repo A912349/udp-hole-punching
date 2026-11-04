@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"strings"

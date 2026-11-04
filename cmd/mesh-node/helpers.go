@@ -14,7 +14,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	_ "net/http/pprof"
 	"strconv"
 	"time"
 

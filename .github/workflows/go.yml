@@ -105,8 +105,13 @@ jobs:
       # MIPS32r2, little-endian, no FPU -> mipsle + softfloat.
       # The coordinator (server) is not built for mipsle because
       # modernc.org/sqlite does not support that platform.
+      # OpenWrt (MIPS) flavor: swap pprof.go for the pprof-openwrt.go.inactive
+      # stub so net/http/pprof is not linked into the router binary (README:
+      # openwrt/mesh-node.init). Earlier mesh-node builds in this job already ran.
       - name: Build mesh-node (linux mipsle, OpenWrt)
         run: |
+          mv cmd/mesh-node/pprof.go cmd/mesh-node/pprof.go.off
+          mv cmd/mesh-node/pprof-openwrt.go.inactive cmd/mesh-node/pprof-openwrt.go
           CGO_ENABLED=0 \
           GOOS=linux \
           GOARCH=mipsle \

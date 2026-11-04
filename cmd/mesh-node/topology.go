@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"strconv"
 	"strings"

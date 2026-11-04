@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"runtime"
 	"strings"

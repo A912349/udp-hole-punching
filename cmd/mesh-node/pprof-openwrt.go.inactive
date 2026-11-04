@@ -1,0 +1,16 @@
+package main
+
+// pprof-openwrt.go.inactive is the OpenWrt (MIPS) build flavor of pprof.go:
+// checked in under a name go build ignores, activated by the mips target
+// (Makefile mesh-node-pprof-off / CI) before cross-compiling. It defines the
+// same startPprof method without touching net/http/pprof, so the profiler
+// machinery, its HTTP routes and their template strings stay out of the
+// router binary. The flag is accepted but reported, keeping node startup
+// usable on routers that pass --pprof-listen by habit.
+func (n *node) startPprof() error {
+	if n.c.pprofListen == "" {
+		return nil
+	}
+	n.logf("--pprof-listen ignored: net/http/pprof is compiled out of OpenWrt (MIPS) builds")
+	return nil
+}

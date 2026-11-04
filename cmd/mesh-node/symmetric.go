@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	_ "net/http/pprof"
 	"runtime"
 	"strings"
 	"time"

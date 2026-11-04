@@ -6,11 +6,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"math"
 	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"runtime"
 	"sort"
 	"strconv"
@@ -488,30 +485,6 @@ func (n *node) deliverQueueUsage() (length, capacity int) {
 		capacity += cap(queue)
 	}
 	return
-}
-func (n *node) startPprof() error {
-	if n.c.pprofListen == "" {
-		return nil
-	}
-	// Enable contention profiles only for diagnostic runs. These profiles are
-	// empty by default and are intentionally not enabled in normal operation.
-	runtime.SetBlockProfileRate(1)
-	runtime.SetMutexProfileFraction(1)
-	host, _, err := net.SplitHostPort(n.c.pprofListen)
-	if err != nil {
-		return fmt.Errorf("invalid --pprof-listen: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return errors.New("--pprof-listen must use localhost or a loopback IP")
-	}
-	go func() {
-		n.logf("pprof available at http://%s/debug/pprof/", n.c.pprofListen)
-		if err := http.ListenAndServe(n.c.pprofListen, nil); err != nil {
-			n.logf("pprof listener stopped: %v", err)
-		}
-	}()
-	return nil
 }
 func (n *node) statsLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)

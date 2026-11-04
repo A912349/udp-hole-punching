@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"log"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"path/filepath"

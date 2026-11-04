@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"time"
 

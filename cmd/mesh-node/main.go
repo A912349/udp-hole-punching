@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	_ "net/http/pprof"
 	"net/netip"
 	"os"
 	"strings"

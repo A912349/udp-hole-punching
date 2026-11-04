@@ -2,7 +2,6 @@ package main
 
 import (
 	"net"
-	_ "net/http/pprof"
 	"time"
 
 	"home-udp-mesh/internal/protocol"
