@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -162,22 +161,22 @@ func (s *server) adminPage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, adminPageHTML)
+	// The page itself is a static shell per binary; all dynamic data comes
+	// from the no-store JSON endpoints, so the HTML can be gzipped and
+	// revalidated with an ETag instead of refetched raw on every reload.
+	writeAsset(w, r, "/admin", adminPageHTML, "text/html; charset=utf-8")
 }
 func (s *server) adminAsset(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate")
+	// Assets are embedded at compile time and never change while a server
+	// binary runs, so they get content ETags (conditional GET answers 304)
+	// and pre-gzipped bodies. See writeAsset in admin_assets.go.
 	switch r.URL.Path {
 	case "/admin.css":
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		_, _ = io.WriteString(w, adminCSS)
+		writeAsset(w, r, "/admin.css", adminCSS, "text/css; charset=utf-8")
 	case "/admin-interactive.css":
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-		_, _ = io.WriteString(w, adminInteractiveCSS)
+		writeAsset(w, r, "/admin-interactive.css", adminInteractiveCSS, "text/css; charset=utf-8")
 	case "/admin.js":
-		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-		_, _ = io.WriteString(w, adminJS)
+		writeAsset(w, r, "/admin.js", adminJS, "application/javascript; charset=utf-8")
 	default:
 		http.NotFound(w, r)
 	}
