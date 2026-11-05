@@ -438,7 +438,23 @@ func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 			delete(n.reassembly, id)
 		}
 	}
-	stateID := source + ":" + hex.EncodeToString(fragmentID)
+	// The reassembly key is a hex node ID, ':' and a hex fragment ID: 49
+	// characters. Building it in stack storage removes the hex.EncodeToString
+	// and the two concatenations that allocated a string per fragment before.
+	// Anything longer than a node ID keeps the allocating builder.
+	var stateID string
+	if len(source) <= 32 {
+		var keyBuf [49]byte
+		copy(keyBuf[:], source)
+		keyBuf[32] = ':'
+		for i, b := range fragmentID {
+			keyBuf[33+i*2], keyBuf[34+i*2] = hexDigits[b][0], hexDigits[b][1]
+		}
+		stateID = string(keyBuf[:])
+	} else {
+		// source + ":" + hex(fragmentID)
+		stateID = source + ":" + hex.EncodeToString(fragmentID)
+	}
 	state := n.reassembly[stateID]
 	if state == nil {
 		if len(n.reassembly) >= 128 {
@@ -469,16 +485,22 @@ func (n *node) acceptIPFragmentAt(source string, plain []byte, now time.Time) {
 	if len(state.chunks) != int(count) {
 		return
 	}
-	packet := make([]byte, 0, state.totalBytes)
+	// Assemble into a buffer the node keeps instead of allocating one per
+	// datagram: this runs under n.mu, so reuse is safe, and enqueueDeliver
+	// copies out of it into its own deliverPool buffer.
+	if n.reassemblyScratch == nil {
+		n.reassemblyScratch = make([]byte, 0, maxTUN)
+	}
+	scratch := n.reassemblyScratch[:0]
 	for part := uint16(0); part < count; part++ {
 		chunk, ok := state.chunks[part]
 		if !ok {
 			return
 		}
-		packet = append(packet, chunk...)
+		scratch = append(scratch, chunk...)
 	}
 	delete(n.reassembly, stateID)
-	n.enqueueDeliver(source, packet)
+	n.enqueueDeliver(source, scratch)
 }
 
 // hexDigits is a pre-computed lookup table for converting bytes to their
@@ -541,7 +563,13 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		return
 	}
 	var aadBuffer [77]byte // 32-byte hex IDs + ':' + 12-byte packet ID
-	plain, e := protocol.OpenBytesWithAEAD(aead, data[fastHeader:], fastAAD(aadBuffer[:0], aad, packetID[:]))
+	// Decrypt straight over the ciphertext: the plaintext is 16 bytes shorter
+	// than the sealed ciphertext+tag region this worker's buffer already owns,
+	// so an empty slice taken at the ciphertext start has exactly enough room
+	// for cipher.AEAD to overwrite it in place and the receive path takes no
+	// fresh allocation per packet (the buffer goes back to fastPool at return).
+	plainAt := fastHeader + aead.NonceSize()
+	plain, e := protocol.OpenBytesInto(data[plainAt:plainAt], aead, data[fastHeader:], fastAAD(aadBuffer[:0], aad, packetID[:]))
 	if e != nil {
 		n.debugf("drop fast frame from %s: decrypt failed: %v", srcHex[:8], e)
 		return

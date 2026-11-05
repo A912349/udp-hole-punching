@@ -445,9 +445,10 @@ type node struct {
 	topologyRefreshMu   sync.Mutex
 	topologyRefreshNext time.Time
 
-	sharedKeys     map[string]cachedKey
-	reassembly     map[string]*reassembly
-	routeRecompute atomic.Int64
+	sharedKeys        map[string]cachedKey
+	reassembly        map[string]*reassembly
+	reassemblyScratch []byte // assembly buffer reused under n.mu
+	routeRecompute    atomic.Int64
 
 	symmetricMu         sync.Mutex
 	symmetricReady      bool

@@ -271,6 +271,24 @@ func OpenBytesWithAEAD(a cipher.AEAD, sealed, aad []byte) ([]byte, error) {
 	return a.Open(nil, sealed[:a.NonceSize()], sealed[a.NonceSize():], aad)
 }
 
+// OpenBytesInto decrypts into caller-owned storage instead of allocating the
+// plaintext. Hot callers pass an empty slice of the buffer that already holds
+// the sealed frame: the plaintext is shorter than the ciphertext, so the
+// appended region lands exactly over the ciphertext, an overlap cipher.AEAD
+// allows (only partial overlap is rejected).
+func OpenBytesInto(dst []byte, a cipher.AEAD, sealed, aad []byte) ([]byte, error) {
+	if len(sealed) < a.NonceSize()+a.Overhead() {
+		return nil, fmt.Errorf("%w: truncated encrypted payload", ErrProtocol)
+	}
+	need := len(sealed) - (a.NonceSize() + a.Overhead())
+	if len(dst) != 0 || cap(dst) < need {
+		// Fall back for callers that cannot guarantee the region, keeping the
+		// function total rather than panicking inside cipher.AEAD.
+		return OpenBytesWithAEAD(a, sealed, aad)
+	}
+	return a.Open(dst, sealed[:a.NonceSize()], sealed[a.NonceSize():], aad)
+}
+
 func NewAEAD(key []byte) (cipher.AEAD, error) { return chacha20poly1305.New(key) }
 
 // Packet is the common control-message representation used by the overlay.
