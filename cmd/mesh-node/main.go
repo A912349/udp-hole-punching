@@ -440,6 +440,7 @@ type node struct {
 	sendPool           sync.Pool
 	deliverQueues      []chan deliverFrame
 	deliverPool        sync.Pool
+	macPool            sync.Pool // reusable HMAC states for compact keepalive
 	stats              fastStats
 
 	topologyRefreshMu   sync.Mutex

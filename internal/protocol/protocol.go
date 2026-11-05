@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"sync/atomic"
 	"time"
 
@@ -425,10 +426,23 @@ func IsCompact(data []byte) bool {
 	return len(data) >= 2 && data[0] == compactMagic
 }
 
-// EncodeCompact serializes a PING, PONG, HELLO or HELLO_ACK packet into the
-// binary keepalive format. Any other packet type fails; callers fall back to
-// EncodePacket.
-func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
+// PooledMAC carries one HMAC state so a caller that repeats a network key can
+// reuse it instead of rebuilding the state per packet: after the first Reset,
+// crypto/hmac restores the key halves it pre-computed (FIPS 198-1 treats those
+// halves as key material), so a reused state pays one digest per packet rather
+// than two hash rounds plus the churn of a new state. One wrapper per borrower
+// - the state inside is not safe to share between threads.
+type PooledMAC struct {
+	mac hash.Hash
+}
+
+func NewPooledMAC(networkKey []byte) *PooledMAC {
+	return &PooledMAC{mac: hmac.New(sha256.New, networkKey)}
+}
+
+// CompactBody builds the authenticated part of a compact frame; CompactFramed
+// appends the tag. Any packet type outside PING/PONG/HELLO/HELLO_ACK fails.
+func CompactBody(p Packet) ([]byte, error) {
 	var typ byte
 	switch p.Type {
 	case "PING":
@@ -479,16 +493,50 @@ func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
 			return nil, fmt.Errorf("%w: compact HELLO/HELLO_ACK cannot carry a session_id", ErrProtocol)
 		}
 	}
-	mac := hmac.New(sha256.New, networkKey)
-	mac.Write(body)
+	return body, nil
+}
+
+// CompactFramed appends the holder's truncated HMAC tag to body, rewinding the
+// holder's state to its keyed start first so the same holder can frame as many
+// bodies as the caller wants.
+func CompactFramed(holder *PooledMAC, body []byte) ([]byte, error) {
+	holder.mac.Reset()
+	holder.mac.Write(body)
 	// Sum appends the 32-byte digest; keep only the truncated prefix.
-	return mac.Sum(body)[:len(body)+compactHMACSize], nil
+	sum := holder.mac.Sum(body)
+	return sum[:len(body)+compactHMACSize], nil
+}
+
+// EncodeCompact serializes a PING, PONG, HELLO or HELLO_ACK packet into the
+// binary keepalive format with a freshly built HMAC state. Any other packet
+// type fails; callers fall back to EncodePacket. Nodes that repeat this call
+// with one network key use EncodeCompactReuse with a PooledMAC of their own.
+func EncodeCompact(p Packet, networkKey []byte) ([]byte, error) {
+	return EncodeCompactReuse(p, NewPooledMAC(networkKey))
+}
+
+// EncodeCompactReuse frames a compact packet with a caller's PooledMAC, which
+// is why the network key is not an argument here: the key lives in the state.
+func EncodeCompactReuse(p Packet, holder *PooledMAC) ([]byte, error) {
+	body, e := CompactBody(p)
+	if e != nil {
+		return nil, e
+	}
+	return CompactFramed(holder, body)
 }
 
 // DecodeCompact parses the binary keepalive format back into the common
 // Packet shape so keepalive bookkeeping (replay cache, RTT probes) works
-// without caring about the wire format.
+// without caring about the wire format. It builds a fresh HMAC state; nodes
+// that repeat it with one network key use DecodeCompactReuse with a
+// PooledMAC they own.
 func DecodeCompact(data, networkKey []byte) (Packet, error) {
+	return DecodeCompactReuse(data, NewPooledMAC(networkKey))
+}
+
+// DecodeCompactReuse authenticates a compact frame with a caller's PooledMAC,
+// so the state's keyed start is restored before the body is hashed.
+func DecodeCompactReuse(data []byte, holder *PooledMAC) (Packet, error) {
 	if !IsCompact(data) {
 		return Packet{}, fmt.Errorf("%w: not a compact packet", ErrProtocol)
 	}
@@ -509,9 +557,13 @@ func DecodeCompact(data, networkKey []byte) (Packet, error) {
 	if len(data) != want {
 		return Packet{}, fmt.Errorf("%w: compact packet has %d bytes, want %d", ErrProtocol, len(data), want)
 	}
-	mac := hmac.New(sha256.New, networkKey)
-	mac.Write(data[:len(data)-compactHMACSize])
-	sum := mac.Sum(nil)
+	holder.mac.Reset()
+	holder.mac.Write(data[:len(data)-compactHMACSize])
+	// The full SHA-256 digest lands in a stack buffer; only its truncated
+	// prefix is a wire tag, and keeping it off the heap matters because
+	// every received datagram that is not a fast frame authenticates here.
+	var scratch [sha256.Size]byte
+	sum := holder.mac.Sum(scratch[:0])
 	if !hmac.Equal(sum[:compactHMACSize], data[len(data)-compactHMACSize:]) {
 		return Packet{}, fmt.Errorf("%w: compact authentication failed", ErrProtocol)
 	}

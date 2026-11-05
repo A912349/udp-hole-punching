@@ -225,7 +225,7 @@ func (n *node) sendDirect(packet protocol.Packet, endpoint string, observed *net
 	}
 	// Keepalives use the ~70-byte binary format; anything else (or a compact
 	// encoding failure) falls back to the JSON envelope.
-	encoded, err := protocol.EncodeCompact(packet, n.key)
+	encoded, err := n.encodeCompact(packet)
 	if err != nil {
 		if encoded, err = protocol.EncodePacket(packet, n.key); err != nil {
 			return false
@@ -731,6 +731,41 @@ func (n *node) close() {
 	}
 	n.controlMu.Unlock()
 }
+// Compact keepalive frames reuse one network key, so the node keeps HMAC
+// states in macPool and hands one per frame to the compact codecs instead of
+// rebuilding a state, which costs about as much as the digest over the frame
+// itself. borrowMAC returns nil for nodes built by hand in tests, where there
+// is no factory to draw from; those callers pay a fresh state per frame.
+func (n *node) borrowMAC() *protocol.PooledMAC {
+	if n.macPool.New == nil {
+		return nil
+	}
+	box := n.macPool.Get()
+	holder, ok := box.(*protocol.PooledMAC)
+	if !ok {
+		return nil
+	}
+	return holder
+}
+
+func (n *node) encodeCompact(p protocol.Packet) ([]byte, error) {
+	holder := n.borrowMAC()
+	if holder == nil {
+		return protocol.EncodeCompactReuse(p, protocol.NewPooledMAC(n.key))
+	}
+	defer n.macPool.Put(holder)
+	return protocol.EncodeCompactReuse(p, holder)
+}
+
+func (n *node) decodeCompact(data []byte) (protocol.Packet, error) {
+	holder := n.borrowMAC()
+	if holder == nil {
+		return protocol.DecodeCompactReuse(data, protocol.NewPooledMAC(n.key))
+	}
+	defer n.macPool.Put(holder)
+	return protocol.DecodeCompactReuse(data, holder)
+}
+
 func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
 		n.enqueueFast(datagram, address)
@@ -741,7 +776,7 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	var p protocol.Packet
 	var e error
 	if protocol.IsCompact(datagram) {
-		p, e = protocol.DecodeCompact(datagram, n.key)
+		p, e = n.decodeCompact(datagram)
 	} else {
 		p, e = protocol.DecodePacket(datagram, n.key)
 	}

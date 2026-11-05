@@ -225,3 +225,50 @@ func TestHelloCompactCapability(t *testing.T) {
 		t.Fatalf("compact helloAll HELLO decode=%v packet=%+v", err, sent)
 	}
 }
+
+// encodeCompact and decodeCompact reuse HMAC states from the node's macPool
+// rather than building one per frame, so frames sent back to back must still
+// round-trip: a pooled state that kept an earlier frame's keyed halves would
+// break the tag on the second frame.
+func TestCompactReuseAcrossFrames(t *testing.T) {
+	idA, err := protocol.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := protocol.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	connA, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connA.Close()
+	connB, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer connB.Close()
+	a := newBenchNode(idA, &benchTUN{}, netip.MustParseAddr("10.77.0.5"), connA)
+	b := newBenchNode(idB, &benchTUN{}, netip.MustParseAddr("10.77.0.6"), connB)
+	a.macPool.New = func() any { return protocol.NewPooledMAC(a.key) }
+	stamps := []int64{1, 2, 3}
+	for _, stamp := range stamps {
+		ping := protocol.NewPacket("PING", a.id.ID, b.id.ID, map[string]any{})
+		ping.Timestamp = stamp
+		encoded, e := a.encodeCompact(ping)
+		if e != nil {
+			t.Fatal("encodeCompact: ", e)
+		}
+		back, e := a.decodeCompact(encoded)
+		if e != nil {
+			t.Fatalf("decodeCompact after stamp %d: %v packet=%+v", stamp, e, back)
+		}
+		if back.Type != "PING" || back.Source != a.id.ID || back.Destination != b.id.ID {
+			t.Fatalf("round trip lost packet identity: %+v", back)
+		}
+		if back.ID != ping.ID {
+			t.Fatalf("round trip changed the packet ID: want %s got %s", ping.ID, back.ID)
+		}
+	}
+}

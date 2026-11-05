@@ -84,7 +84,7 @@ func (n *node) encodePacketForPeer(packet protocol.Packet) ([]byte, error) {
 		(packet.Type == "HELLO" || packet.Type == "HELLO_ACK") &&
 		payloadString(packet, "session_id") == "" &&
 		n.speaksCompactHello(packet.Destination) {
-		if encoded, err := protocol.EncodeCompact(packet, n.key); err == nil {
+		if encoded, err := n.encodeCompact(packet); err == nil {
 			return encoded, nil
 		}
 	}

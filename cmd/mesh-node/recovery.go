@@ -20,7 +20,7 @@ func (n *node) speaksCompactHello(id string) bool {
 	return peer != nil && time.Now().Before(peer.compactHelloUntil)
 }
 func (n *node) sendCompact(packet protocol.Packet, address *net.UDPAddr) {
-	encoded, err := protocol.EncodeCompact(packet, n.key)
+	encoded, err := n.encodeCompact(packet)
 	if err != nil {
 		n.sendToAddress(packet, address)
 		return

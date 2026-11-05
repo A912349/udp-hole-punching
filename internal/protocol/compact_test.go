@@ -172,3 +172,54 @@ func TestCompactEncodeRejectsOtherTypes(t *testing.T) {
 		t.Fatal("compact magic collides with the fast-path magic")
 	}
 }
+
+// One PooledMAC reused over consecutive frames must keep producing the tags a
+// freshly built state produces. A state that failed to rewind would leak the
+// previous frame into the next tag.
+func TestCompactMACReuseAcrossFrames(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i)
+	}
+	src := strings.Repeat("a", 32)
+	dst := strings.Repeat("b", 32)
+	ping := NewPacket("PING", src, dst, map[string]any{})
+	ping.Timestamp = 1000
+	held, err := EncodeCompact(ping, key)
+	if err != nil {
+		t.Fatal("EncodeCompact: ", err)
+	}
+	var reused *PooledMAC
+	reused = NewPooledMAC(key)
+	first, err := EncodeCompactReuse(ping, reused)
+	if err != nil {
+		t.Fatal("EncodeCompactReuse: ", err)
+	}
+	if !bytes.Equal(first, held) {
+		t.Fatal("a reused state disagrees with a fresh one on the same frame")
+	}
+	next := NewPacket("PING", strings.Repeat("c", 32), strings.Repeat("d", 32), map[string]any{})
+	next.Timestamp = 2000
+	expected, err := EncodeCompact(next, key)
+	if err != nil {
+		t.Fatal("EncodeCompact: ", err)
+	}
+	actual, err := EncodeCompactReuse(next, reused)
+	if err != nil {
+		t.Fatal("EncodeCompactReuse: ", err)
+	}
+	if !bytes.Equal(actual, expected) {
+		t.Fatal("reusing the state leaked the earlier frame into the next tag")
+	}
+	if bytes.Equal(actual, first) {
+		t.Fatal("the second frame repeated the first frame's tag")
+	}
+	// Decoding through the same holder sees the keyed state, not leftovers.
+	decoded, err := DecodeCompactReuse(first, reused)
+	if err != nil {
+		t.Fatal("DecodeCompactReuse: ", err)
+	}
+	if decoded.Type != "PING" || decoded.Source != src || decoded.Destination != dst {
+		t.Fatal("DecodeCompactReuse restored the wrong packet")
+	}
+}

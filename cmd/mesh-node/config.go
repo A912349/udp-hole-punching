@@ -387,6 +387,9 @@ func newNode(c config) (*node, error) {
 		return nil, fmt.Errorf("initialize packet ID sequence: %w", e)
 	}
 	n.sendPool.New = func() any { return make([]byte, maxFastFrame) }
+	// Compact keepalive frames reuse HMAC states (see encodeCompact), and the
+	// factory builds states that already know this node's network key.
+	n.macPool.New = func() any { return protocol.NewPooledMAC(n.key) }
 	for _, v := range c.allows {
 		if v != "" {
 			if len(n.allow) == 1 {
