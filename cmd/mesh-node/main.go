@@ -302,6 +302,21 @@ type cachedKey struct {
 	sealAAD  []byte
 	hexCache hexCache // pre-computed for fast path
 }
+// peerSnap caches one peer's open-side cipher for the receive hot path. A
+// burst toward one superpeer carries dozens to hundreds of datagrams that all
+// name the same source, so the snapshot turns the shared-key lookup into work
+// the burst pays once: hexBytes is compared against the wire's source field
+// without slicing either buffer, and hex is the interned string the rest of
+// the receive path wants, so the hot datagram allocates no key string either.
+// Nothing rotates a mesh node's static key while keeping its node ID, and n.dir
+// never drops a peer, so replacing the snapshot on the next locked lookup is
+// enough to follow any identity change.
+type peerSnap struct {
+	hexBytes [32]byte // peer node ID as hex bytes, for an allocation-free compare
+	hex      string   // same ID as a string, interned on the snapshot miss
+	aead     cipher.AEAD
+	openAAD  []byte // associated data for datagrams sealed by that peer
+}
 type reassembly struct {
 	totalBytes int
 	count      uint16
@@ -441,6 +456,7 @@ type node struct {
 	deliverQueues      []chan deliverFrame
 	deliverPool        sync.Pool
 	macPool            sync.Pool // reusable HMAC states for compact keepalive
+	fastPeerSnap       atomic.Pointer[peerSnap] // one-entry open-side cipher cache
 	stats              fastStats
 
 	topologyRefreshMu   sync.Mutex

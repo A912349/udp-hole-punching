@@ -372,6 +372,45 @@ func (n *node) peerAEAD(id string) (cipher.AEAD, []byte, error) {
 	}
 	return cached.aead, cached.openAAD, nil
 }
+
+// matchPeerHex compares two hex peer IDs element-wise. Slicing either buffer
+// for a compare would take its address, which pushes the caller's stack array
+// of wire hex to the heap on every datagram.
+func matchPeerHex(a [32]byte, b [32]byte) bool {
+	for i := 0; i < 32; i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// fastPeerAEAD resolves the cipher for the source named by peerHex. The first
+// datagram of a burst pays the locked shared-key lookup and leaves a snapshot
+// behind; the rest of the burst reads that snapshot atomically, so a hot
+// datagram neither takes n.mu.RLock() nor hashes two map keys nor copies the
+// cached-key struct nor allocates the peer's hex string. Workers may race to
+// publish a snapshot for the same peer, and either publish is equivalent.
+func (n *node) fastPeerAEAD(peerHex [32]byte) (cipher.AEAD, []byte, string, error) {
+	snap := n.fastPeerSnap.Load()
+	if snap != nil && matchPeerHex(snap.hexBytes, peerHex) {
+		if snap.aead == nil {
+			return nil, nil, "", errors.New("missing peer cipher")
+		}
+		return snap.aead, snap.openAAD, snap.hex, nil
+	}
+	var hex = string(peerHex[:])
+	var cached cachedKey
+	cached, _, e := n.peerCrypto(hex)
+	if e != nil {
+		return nil, nil, "", e
+	}
+	if cached.aead == nil {
+		return nil, nil, "", errors.New("missing peer cipher")
+	}
+	n.fastPeerSnap.Store(&peerSnap{hexBytes: peerHex, hex: hex, aead: cached.aead, openAAD: cached.openAAD})
+	return cached.aead, cached.openAAD, hex, nil
+}
 func (n *node) peerCipher(id string) (cipher.AEAD, *protocol.NonceSequence, []byte, [16]byte, error) {
 	cached, _, e := n.peerCrypto(id)
 	if e != nil {
@@ -557,7 +596,7 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		}
 		return
 	}
-	aead, aad, e := n.peerAEAD(string(srcHex[:]))
+	aead, aad, srcID, e := n.fastPeerAEAD(srcHex)
 	if e != nil {
 		n.debugf("drop fast frame from %s: %v", srcHex[:8], e)
 		return
@@ -578,7 +617,7 @@ func (n *node) fast(data []byte, a *net.UDPAddr) {
 		return
 	}
 	n.debugf("fast frame from %s received (%d bytes encrypted)", srcHex[:8], len(data))
-	n.acceptIPFragment(string(srcHex[:]), plain)
+	n.acceptIPFragment(srcID, plain)
 }
 func (n *node) sendFast(dst string, data []byte) bool {
 	return n.sendFastMode(dst, data, false)

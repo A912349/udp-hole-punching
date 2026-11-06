@@ -144,3 +144,86 @@ func TestPeerCryptoDerivesOnCacheMiss(t *testing.T) {
 		t.Fatal("tampered frame was accepted")
 	}
 }
+
+// TestFastPeerAESnapshotSwitchesBetweenPeers locks the single-entry cipher
+// snapshot: it must serve the same peer across datagrams, must not leak that
+// peer's cipher to a different peer, and must not be replaced when the looked-up
+// hex names no known peer.
+func TestFastPeerAESnapshotSwitchesBetweenPeers(t *testing.T) {
+	idA, err := protocol.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idB, err := protocol.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	idC, err := protocol.NewIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := newBenchNode(idA, &benchTUN{}, netip.MustParseAddr("10.77.0.6"), nil)
+	n.dir[idB.ID] = &peer{ID: idB.ID, Public: idB.Public}
+	n.dir[idC.ID] = &peer{ID: idC.ID, Public: idC.Public}
+
+	derivedB, _, e := n.peerCrypto(idB.ID)
+	if e != nil {
+		t.Fatalf("peerCrypto for peer B failed: %v", e)
+	}
+	derivedC, _, e := n.peerCrypto(idC.ID)
+	if e != nil {
+		t.Fatalf("peerCrypto for peer C failed: %v", e)
+	}
+
+	var hexB [32]byte
+	copy(hexB[:], []byte(idB.ID))
+	var hexC [32]byte
+	copy(hexC[:], []byte(idC.ID))
+
+	// First lookup misses the snapshot and publishes it; the cipher must be the
+	// one the shared-key cache already derived, not a freshly derived one.
+	aead, aad, hex, e := n.fastPeerAEAD(hexB)
+	if e != nil || aead != derivedB.aead || hex != idB.ID {
+		t.Fatalf("snapshot miss returned the wrong cipher or ID: %v", e)
+	}
+	if !bytes.Equal(aad, derivedB.openAAD) {
+		t.Fatalf("snapshot miss returned the wrong open AAD: %q", aad)
+	}
+
+	// The next datagram of the same burst hits the snapshot. The returned ID
+	// string is the interned one, which is what the receive path needs without
+	// allocating a hex string per datagram.
+	second, aad2, hex2, e := n.fastPeerAEAD(hexB)
+	if e != nil || second != derivedB.aead || hex2 != idB.ID {
+		t.Fatalf("snapshot hit returned the wrong cipher or ID: %v", e)
+	}
+	if !bytes.Equal(aad2, derivedB.openAAD) {
+		t.Fatalf("snapshot hit returned the wrong open AAD: %q", aad2)
+	}
+
+	// A different peer must not be served peer B's snapshot, and it must
+	// republish so a later burst for B sees B again rather than a stale entry.
+	peerC, aadC, hexCOut, e := n.fastPeerAEAD(hexC)
+	if e != nil || peerC != derivedC.aead || hexCOut != idC.ID {
+		t.Fatalf("snapshot leaked peer B's cipher to peer C: %v", e)
+	}
+	if !bytes.Equal(aadC, derivedC.openAAD) {
+		t.Fatalf("peer C open AAD mismatch: %q", aadC)
+	}
+	backB, _, hexBack, e := n.fastPeerAEAD(hexB)
+	if e != nil || backB != derivedB.aead || hexBack != idB.ID {
+		t.Fatalf("snapshot did not switch back to peer B: %v", e)
+	}
+
+	// Unknown hex of the right shape must error and leave the last snapshot
+	// alone, so a bogus burst cannot poison the cache.
+	var bogus [32]byte
+	copy(bogus[:], []byte("ffffffffffffffffffffffffffffffff"))
+	if _, _, hexBogus, e := n.fastPeerAEAD(bogus); e == nil || hexBogus != "" {
+		t.Fatal("unknown peer hex was accepted by the snapshot path")
+	}
+	reseenB, _, hexRe, e := n.fastPeerAEAD(hexB)
+	if e != nil || reseenB != derivedB.aead || hexRe != idB.ID {
+		t.Fatalf("poisoned snapshot served the wrong peer: %v", e)
+	}
+}
