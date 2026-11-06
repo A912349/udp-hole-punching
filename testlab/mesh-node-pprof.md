@@ -80,31 +80,105 @@ plus Poly1305 tag) is the generic Go implementation.
   It is not on the mesh-node data plane, so it does not affect mesh
   throughput.
 
-## How to get the router-side number (the one that decides)
+## Router profile (measured): where a router's time actually goes
 
-The router profile is the number that matters for the router fleet; the host
-profile above is not representative of it. On the router the
-pprof endpoint has to be compiled in, so build the pprof-linked MIPS flavor
-(`make mesh-node-pprof-on` keeps it) instead of the shrunken OpenWrt flavor:
+Measured on the OpenWrt router in the fleet (Linux 6.6.86, mips32r2 little
+endian, no FPU, ~116 MB of RAM with ~28 MB free, `/tmp` a 58 MB tmpfs). The
+bench binary is the cross-compiled *test* build (`make mips` equivalent),
+run in `/tmp`; kernel UDP worked there, so the bench exercises the same
+data plane as the shipped binary.
 
-    make mips GO=/usr/local/go/bin/go          # mipsle softfloat binary
-    # then run the node binary with --pprof-listen localhost:9999
+Measured rates on the router (1279-byte payload, four worker threads):
 
-On the router (busybox `wget` works against the loopback endpoint):
+    BenchmarkHotPathCrypto/HMAC-SHA256-per-packet    256317 ns   4.99 MB/s
+    BenchmarkHotPathCrypto/ChaCha20-Poly1305-Seal    283040 ns   4.52 MB/s
+    BenchmarkTwoNodeDataPlane/520                    506365 ns   1976 delivered-pps
+    BenchmarkTwoNodeDataPlane/1279                   695945 ns   1437 delivered-pps
 
-    wget -q -O /tmp/node.pb 'http://localhost:9999/debug/pprof/profile?seconds=60'
+The same primitives on an x86 host measured 401 MB/s for the Seal, 12 637 ns
+for the 520-byte packet and 17 311 ns for the 1279-byte packet. The router's
+AEAD runs about eighty times slower than the host's assembly path, and a
+router packet costs about forty times the host's packet cost at either size.
 
-Pull it back to the host and read it with the same tooling:
+Self-time and cumulative shares of the router data-plane profile (13.44 s of
+samples over 7.24 s of wall on four hardware threads):
 
-    go tool pprof -top -cum /tmp/node.pb
+    golang.org/x/crypto chacha20poly1305 Seal (cum)          23.36%
+    golang.org/x/crypto chacha20poly1305 Open (cum)          17.56%
+    golang.org/x/crypto chacha20 xorKeyStreamBlocks (cum)    21.65%
+    golang.org/x/crypto chacha20 quarterRound (self)          6.85%
+    golang.org/x/crypto poly1305 writeWithPadding (incl)     16.4%
+    math/bits.Mul64 (self)                                    6.62%
+    math/bits.RotateLeft32, math/bits.Add64 (self)            3.79, 3.35%
+    internal/runtime/syscall.Syscall6 (self)                 16.00%
+      of which sendto 1.81 s and recvfrom 0.30 s of 1.98 s RawSyscall6
+    runtime._LostSIGPROFDuringAtomic64 (self)                 9.75%
+    runtime GC, memmove, select, atomics                      a few % each
 
-Read it for two numbers: the share of samples inside
-`chacha20poly1305.chacha20poly1305_generic` (the Go AEAD path) and the share
-inside the `syscall` glue. If the generic AEAD is more than a couple of tenths
-of the node's samples, the asm lever for the router architecture is worth its
-cost; if it is not, the lever is the syscall batching instead. The project's
-own test vectors (`internal/protocol` tests, RFC 8439 vectors in x/crypto)
-cover the crypto's correctness independent of which path is compiled in.
+Reading:
+
+* The AEAD pair (Seal on the sending side, Open on the receiving side) is
+  **40.9% of the router's samples**, and it is entirely the generic Go path:
+  `chacha20poly1305_noasm.go`, `chacha20.xorKeyStreamBlocksGeneric`,
+  `poly1305.updateGeneric`. About a third is the ChaCha20 keystream
+  (`quarterRound` is not inlined and `RotateLeft32` is a separate call frame),
+  about a sixth is the Poly1305 tag (`writeWithPadding` plus `Mul64`).
+* Kernel time is 16.00% and it is *send*: the bench's send path spends 1.81 s
+  in `sendto` against 0.30 s in `recvfrom`, so batching on the mesh's own
+  send path (`WriteBatch`, batch size 32) is where most of that 16% lives.
+* `_LostSIGPROFDuringAtomic64` is the profiler's own bookkeeping for samples
+  it could not take while an atomic64 sequence was running; it is not extra
+  router cost, so subtract its 9.75% when judging anything else.
+
+What a crypto rewrite can buy on the router, from these numbers:
+
+* The AEAD is 40.9% of samples. A realistic overall AEAD speedup on mips32r2
+  is 2 to 3 times, which takes 40.9% down to 14 to 20% and lifts router
+  throughput by about 1.4 to 1.7 times. That is a real lever, and it is
+  bounded: the other 43% (kernel send and receive, Go networking, GC, atomics)
+  does not shrink.
+* The portable first step is a vendored Go rewrite of the AEAD hot loop: one
+  inlined quarter round instead of a call frame per round, several blocks in
+  flight with the state kept in locals, rotations without the per-word
+  `RotateLeft32` call, and the Poly1305 multiply in 32-bit limbs. It compiles
+  for every architecture, so it helps every router at once, and its output can
+  be checked against the RFC 8439 vectors and the project's own tests before
+  shipping. Hand mips32r2 assembly is what adds the rest on top of it.
+* A C/Rust shim is not a lever on x86 hosts: their crypto is already assembly,
+  and the shim pays per-packet call overhead across an FFI boundary. On the
+  router a shim would buy what assembly buys, but the OpenWrt lane cannot link
+  or pack it (see the section below).
+
+## How the router profile was taken (and how to repeat it)
+
+Cross-compile the *test* binary for the router (same flags as `make mips`),
+ship it over the LAN, run the benches there with a CPU profile, pull the
+profile back, and read it with the same pprof tooling used for the host:
+
+    CGO_ENABLED=0 GOOS=linux GOARCH=mipsle GOMIPS=softfloat \
+      $(GO) test -c -trimpath -buildvcs=false -ldflags='-s -w -buildid=' \
+      -o mesh-node-mips.test ./cmd/mesh-node
+    # busybox on the router has no sftp-server: use scp -O (the old protocol)
+    scp -O mesh-node-mips.test root@<router>:/tmp/
+    ssh root@<router> "/tmp/mesh-node-mips.test -test.run='^\$' \
+      -test.bench='TwoNodeDataPlane|HotPathCrypto' -test.benchtime=2s \
+      -test.cpuprofile=/tmp/r.pb"
+    scp -O root@<router>:/tmp/r.pb /tmp/ && gunzip -c /tmp/r.pb > r.pb.off
+    $(GO) tool pprof -top -cum r.pb.off
+
+Things worth keeping in the recipe rather than rediscovering: the router's
+shell is busybox `ash` (no `nproc`, no `od`, no `wget -V`), its `scp` needs
+`-O` because there is no sftp-server, the profile the test binary writes is
+gzip-compressed (hence the `gunzip`), and the binary has to run out of `/tmp`
+because `/tmp` is the only writable mount with room (a 9 MB binary against
+58 MB of tmpfs, which leaves about 16 MB of RAM for the runtime).
+
+The pprof-HTTP route (running the *program* with `--pprof-listen` and pulling
+`/debug/pprof/profile`) stays available for a live router that is already
+participating in a mesh, and it needs the pprof-linked MIPS flavor
+(`make mesh-node-pprof-on`) because the shipped router binary has the endpoint
+compiled out; that flavor is about 1.5 MB bigger, which matters on a router
+with ~28 MB free.
 
 ## Caveats
 
