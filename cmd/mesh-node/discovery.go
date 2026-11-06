@@ -88,7 +88,7 @@ func (n *node) encodePacketForPeer(packet protocol.Packet) ([]byte, error) {
 			return encoded, nil
 		}
 	}
-	return protocol.EncodePacket(packet, n.key)
+	return n.encodePacket(packet)
 }
 func (n *node) markCompactHello(id string) {
 	n.mu.Lock()

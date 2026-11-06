@@ -109,3 +109,50 @@ func BenchmarkCompactEnvelopePooled(b *testing.B) {
 		panic("sink")
 	}
 }
+// BenchmarkJSONEnvelopeFresh measures the JSON envelope a provider wire sends
+// for anything the compact format cannot carry, with an HMAC state built for
+// every call, which is what a node does when it has nowhere to keep one.
+func BenchmarkJSONEnvelopeFresh(b *testing.B) {
+	key := make([]byte, 32)
+	ping := protocol.NewPacket("PING", benchCompactDest, benchCompactDest, map[string]any{"session": "0123456789abcdef0123456789abcdef"})
+	var sink int
+	for i := range b.N {
+		ping.Timestamp = 1000 + int64(i)
+		buf, e := protocol.EncodePacket(ping, key)
+		if e != nil {
+			panic(e)
+		}
+		packet, e := protocol.DecodePacket(buf, key)
+		if e != nil {
+			panic(e)
+		}
+		sink += len(packet.Type) + len(buf)
+	}
+	if sink == 0 {
+		panic("sink")
+	}
+}
+
+// BenchmarkJSONEnvelopePooled measures the same pair through one reused state,
+// which is what the node's encodePacket and decodePacket helpers do.
+func BenchmarkJSONEnvelopePooled(b *testing.B) {
+	key := make([]byte, 32)
+	holder := protocol.NewPooledMAC(key)
+	ping := protocol.NewPacket("PING", benchCompactDest, benchCompactDest, map[string]any{"session": "0123456789abcdef0123456789abcdef"})
+	var sink int
+	for i := range b.N {
+		ping.Timestamp = 1000 + int64(i)
+		buf, e := protocol.EncodePacketReuse(ping, holder)
+		if e != nil {
+			panic(e)
+		}
+		packet, e := protocol.DecodePacketReuse(buf, holder)
+		if e != nil {
+			panic(e)
+		}
+		sink += len(packet.Type) + len(buf)
+	}
+	if sink == 0 {
+		panic("sink")
+	}
+}

@@ -213,7 +213,7 @@ func (n *node) awaitSymmetricHello(conn *net.UDPConn, relayID, sessionID string,
 	if err != nil {
 		return
 	}
-	packet, err := protocol.DecodePacket(buffer[:length], n.key)
+	packet, err := n.decodePacket(buffer[:length])
 	if err != nil || packet.Type != "HELLO" || packet.Source != relayID || packet.Destination != n.id.ID || payloadString(packet, "session_id") != sessionID {
 		return
 	}

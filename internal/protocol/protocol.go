@@ -319,24 +319,55 @@ func (p Packet) DecTTL() (Packet, error) {
 func (p Packet) envelope() map[string]any {
 	return map[string]any{"v": Version, "type": p.Type, "id": p.ID, "src": p.Source, "dst": p.Destination, "ttl": p.TTL, "ts": p.Timestamp, "payload": p.Payload}
 }
+// EncodePacket seals a packet as the JSON envelope every provider wire has
+// used. The MAC covers the canonical envelope without the mac key, so sealing
+// means serialising that authenticated form once and appending the mac pair
+// after it: DecodePacket drops the mac key and re-canonicalises whatever order
+// the wire put the keys in, so a peer accepts the pair in canonical position
+// (as senders on either encoder emit it) or appended at the end. Repeating one
+// network key pays a rebuilt HMAC state per call that EncodePacketReuse avoids.
 func EncodePacket(p Packet, networkKey []byte) ([]byte, error) {
-	e := p.envelope()
-	data, err := CanonicalJSON(e)
-	if err != nil {
-		return nil, err
+	return EncodePacketReuse(p, NewPooledMAC(networkKey))
+}
+
+// EncodePacketReuse seals with a caller's PooledMAC, whose state already holds
+// the network key. The authenticated bytes keep their place in the datagram
+// buffer, so the MAC a peer recomputes over the canonical envelope still covers
+// them; only the mac pair is added, which is a text splice instead of the
+// second map walk and buffer the old encoder paid.
+func EncodePacketReuse(p Packet, holder *PooledMAC) ([]byte, error) {
+	var envelope = p.envelope()
+	data, e := CanonicalJSON(envelope)
+	if e != nil {
+		return nil, e
 	}
-	m := hmac.New(sha256.New, networkKey)
-	m.Write(data)
-	e["mac"] = B64Encode(m.Sum(nil))
-	out, err := CanonicalJSON(e)
-	if err == nil && len(out) > MaxDatagramSize {
-		err = fmt.Errorf("%w: packet exceeds limit", ErrProtocol)
+	var scratch [sha256.Size]byte
+	holder.mac.Reset()
+	holder.mac.Write(data)
+	tag := holder.mac.Sum(scratch[:0])
+	var macBytes = B64Encode(tag)
+	var macOpen = []byte(",\"mac\":\"")
+	out := make([]byte, 0, len(data)+len(macBytes)+len(macOpen)+2)
+	out = append(out, data[:len(data)-1]...)
+	out = append(out, macOpen...)
+	out = append(out, macBytes...)
+	out = append(out, '"', '}')
+	if len(out) > MaxDatagramSize {
+		e = fmt.Errorf("%w: packet exceeds limit", ErrProtocol)
 	}
-	return out, err
+	return out, e
 }
 
 // DecodePacket verifies the network MAC and validates a JSON packet envelope.
+// It builds a fresh HMAC state; nodes that repeat this with one network key
+// use their own PooledMAC through DecodePacketReuse instead.
 func DecodePacket(data, networkKey []byte) (Packet, error) {
+	return DecodePacketReuse(data, NewPooledMAC(networkKey))
+}
+
+// DecodePacketReuse authenticates a JSON envelope with a caller's PooledMAC,
+// restoring the state's keyed start before the canonical envelope is hashed.
+func DecodePacketReuse(data []byte, holder *PooledMAC) (Packet, error) {
 	if len(data) > MaxDatagramSize {
 		return Packet{}, fmt.Errorf("%w: packet exceeds limit", ErrProtocol)
 	}
@@ -357,9 +388,13 @@ func DecodePacket(data, networkKey []byte) (Packet, error) {
 	if err != nil {
 		return Packet{}, err
 	}
-	m := hmac.New(sha256.New, networkKey)
-	m.Write(canon)
-	if !hmac.Equal(got, m.Sum(nil)) {
+	holder.mac.Reset()
+	holder.mac.Write(canon)
+	// The full digest lands in a stack buffer rather than a fresh heap slice,
+	// which is the churn every received datagram that is not a fast frame pays.
+	var scratch [sha256.Size]byte
+	tag := holder.mac.Sum(scratch[:0])
+	if !hmac.Equal(tag, got) {
 		return Packet{}, fmt.Errorf("%w: authentication failed", ErrProtocol)
 	}
 	str := func(k string) (string, bool) { v, o := e[k].(string); return v, o }

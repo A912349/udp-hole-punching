@@ -227,7 +227,7 @@ func (n *node) sendDirect(packet protocol.Packet, endpoint string, observed *net
 	// encoding failure) falls back to the JSON envelope.
 	encoded, err := n.encodeCompact(packet)
 	if err != nil {
-		if encoded, err = protocol.EncodePacket(packet, n.key); err != nil {
+		if encoded, err = n.encodePacket(packet); err != nil {
 			return false
 		}
 	}
@@ -766,6 +766,27 @@ func (n *node) decodeCompact(data []byte) (protocol.Packet, error) {
 	return protocol.DecodeCompactReuse(data, holder)
 }
 
+// encodePacket and decodePacket put the JSON envelope's HMAC state on the same
+// macPool the compact helpers use: a provider wire repeats one network key,
+// so rebuilding the keyed state per packet is the cost this path avoids.
+func (n *node) encodePacket(p protocol.Packet) ([]byte, error) {
+	holder := n.borrowMAC()
+	if holder == nil {
+		return protocol.EncodePacketReuse(p, protocol.NewPooledMAC(n.key))
+	}
+	defer n.macPool.Put(holder)
+	return protocol.EncodePacketReuse(p, holder)
+}
+
+func (n *node) decodePacket(datagram []byte) (protocol.Packet, error) {
+	holder := n.borrowMAC()
+	if holder == nil {
+		return protocol.DecodePacketReuse(datagram, protocol.NewPooledMAC(n.key))
+	}
+	defer n.macPool.Put(holder)
+	return protocol.DecodePacketReuse(datagram, holder)
+}
+
 func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	if len(datagram) >= len(fastMagicBytes) && bytes.Equal(datagram[:len(fastMagicBytes)], fastMagicBytes) {
 		n.enqueueFast(datagram, address)
@@ -778,7 +799,7 @@ func (n *node) handleDatagram(datagram []byte, address *net.UDPAddr) {
 	if protocol.IsCompact(datagram) {
 		p, e = n.decodeCompact(datagram)
 	} else {
-		p, e = protocol.DecodePacket(datagram, n.key)
+		p, e = n.decodePacket(datagram)
 	}
 	if e != nil || !n.remember(p.ID) {
 		return

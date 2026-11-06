@@ -156,7 +156,7 @@ func (n *node) broadcastLANDiscovery() {
 	}
 	port := n.currentUDPConn().LocalAddr().(*net.UDPAddr).Port
 	p := protocol.NewPacket("LAN_DISCOVERY", n.id.ID, "", map[string]any{"udp_port": port})
-	b, err := protocol.EncodePacket(p, n.key)
+	b, err := n.encodePacket(p)
 	if err != nil {
 		return
 	}
@@ -213,7 +213,7 @@ func (n *node) lanDiscoveryLoop(ctx context.Context, conn *net.UDPConn) {
 			n.debugf("LAN discovery receive failed: %v", err)
 			continue
 		}
-		packet, err := protocol.DecodePacket(buffer[:length], n.key)
+		packet, err := n.decodePacket(buffer[:length])
 		if err != nil || packet.Type != "LAN_DISCOVERY" || packet.Source == n.id.ID {
 			continue
 		}

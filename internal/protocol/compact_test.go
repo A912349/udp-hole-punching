@@ -2,6 +2,9 @@ package protocol
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -222,4 +225,67 @@ func TestCompactMACReuseAcrossFrames(t *testing.T) {
 	if decoded.Type != "PING" || decoded.Source != src || decoded.Destination != dst {
 		t.Fatal("DecodeCompactReuse restored the wrong packet")
 	}
+}
+
+// TestJSONEnvelopeMacPairPosition locks the provider wire format across mesh
+// versions. The MAC covers the canonical envelope without the mac key, so the
+// pair may sit anywhere in the emitted object: EncodePacket appends it after the
+// authenticated bytes, while a sender predating that splice inserted it into the
+// map and canonicalised the whole envelope, landing the pair in sorted position.
+// Both forms must verify, must carry one and the same tag, and must survive an
+// envelope whose payload needs JSON escaping.
+func TestJSONEnvelopeMacPairPosition(t *testing.T) {
+	key := make([]byte, 32)
+	src := strings.Repeat("a", 32)
+	dst := strings.Repeat("b", 32)
+	body := map[string]any{"note": "a \"quote\" and ünï", "nested": map[string]any{"k": 1}}
+	p := NewPacket("PING", src, dst, body)
+	p.Timestamp = time.Now().Unix()
+
+	// The authenticated bytes are the canonical envelope without the mac key,
+	// computed with a state of its own so the expected tag is independent of
+	// whichever encoder produced the wire.
+	canonical, err := CanonicalJSON(p.envelope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(canonical)
+	want := B64Encode(mac.Sum(nil))
+
+	appended, err := EncodePacket(p, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The old shape: the pair inserted into the map, then canonicalised whole.
+	legacy := p.envelope()
+	legacy["mac"] = want
+	sorted, err := CanonicalJSON(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(label string, wire []byte) {
+		decoded, e := DecodePacket(wire, key)
+		if e != nil {
+			t.Fatalf("%s wire rejected: %v", label, e)
+		}
+		if decoded.Type != "PING" || decoded.Source != src || decoded.Destination != dst ||
+			decoded.ID != p.ID || decoded.Timestamp != p.Timestamp {
+			t.Fatalf("%s envelope fields lost: %+v", label, decoded)
+		}
+		if note, _ := decoded.Payload["note"].(string); note != "a \"quote\" and ünï" {
+			t.Fatalf("%s payload note mangled: %s", label, note)
+		}
+		var parsed map[string]any
+		if err2 := json.Unmarshal(wire, &parsed); err2 != nil {
+			t.Fatalf("%s wire unparsable: %v", label, err2)
+		}
+		tag, _ := parsed["mac"].(string)
+		if tag != want {
+			t.Fatalf("%s tag differs from the canonical envelope's MAC", label)
+		}
+	}
+	check("appended", appended)
+	check("sorted", sorted)
 }
